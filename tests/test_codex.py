@@ -5,12 +5,199 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import tomllib
 import unittest
+from unittest.mock import AsyncMock
 
-from octopus.codex import ActiveTurnError, AppServerClient
+from octopus.codex import ActiveTurnError, AppServerClient, readonly_thread_config
 from octopus.contracts import CodexEvent
 
 FIXTURE = Path(__file__).parent / "fixtures" / "fake_codex.py"
+
+
+class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
+    cwd = "/test/project/.data/codex-readonly/workspace"
+
+    def config(self):
+        policy = json.loads((Path(__file__).parents[1] / "config" / "codex-readonly.json").read_text())
+        config = tomllib.loads("\n".join(key + "=" + json.dumps(value) for key, value in policy.items()))
+        config["permissions"]["octopus-readonly"]["filesystem"][self.cwd] = "read"
+        config["permissions"]["octopus-readonly"]["filesystem"]["glob_scan_max_depth"] = None
+        return config
+
+    def client(self, handler=None):
+        client = AppServerClient(read_only=True, tool_specs=[{
+            "type": "function", "name": "code_search", "description": "Search allowed source code",
+            "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}},
+        }], tool_handler=handler)
+        client._transport = object()
+        client._ready = True
+        client._read_only_home = self.cwd.removesuffix("workspace") + "home"
+        client._write = AsyncMock()
+        client._request = AsyncMock(return_value={"config": self.config()})
+        return client
+
+    def thread_response(self):
+        return {"thread": {"id": "thread-safe", "status": {"type": "idle"}},
+                "approvalPolicy": "never", "cwd": self.cwd, "runtimeWorkspaceRoots": [],
+                "instructionSources": [], "activePermissionProfile": {"id": "octopus-readonly"},
+                "sandbox": {"type": "readOnly", "networkAccess": False}}
+
+    async def test_readonly_host_attestation_and_every_thread_turn_overrides(self):
+        client = self.client()
+        await client._attest_read_only()
+        client._request.return_value = self.thread_response()
+        self.assertEqual(await client.create_thread(self.cwd), "thread-safe")
+        params = client._request.call_args.args[1]
+        self.assertEqual(params["environments"], [])
+        self.assertEqual(params["dynamicTools"], client.tool_specs)
+        self.assertNotIn("sandbox", params)
+        self.assertEqual(params["approvalPolicy"], "never")
+        self.assertEqual(params["permissions"], "octopus-readonly")
+        self.assertEqual(params["config"], readonly_thread_config())
+        await client.resume_thread("thread-safe", self.cwd)
+        resume = client._request.call_args.args[1]
+        self.assertNotIn("sandbox", resume)
+        self.assertEqual(resume["config"], readonly_thread_config())
+        with self.assertRaises(ValueError):
+            await client.create_thread("/personal/source")
+        client.active_turn = AsyncMock(return_value=None)
+        client._request.return_value = {"turn": {"id": "turn-safe"}}
+        await client.start_turn("thread-safe", "query")
+        turn = client._request.call_args.args[1]
+        self.assertEqual(turn["environments"], [])
+        self.assertEqual(turn["permissions"], "octopus-readonly")
+
+    async def test_drifted_host_fails_closed_before_any_thread_starts(self):
+        mutations = [
+            lambda c: c["features"].update(shell_tool=True),
+            lambda c: c["features"].update(code_mode_host=False),
+            lambda c: c["features"].pop("stable_environment_tools"),
+            lambda c: c.update(approval_policy="on-request"),
+            lambda c: c.update(mcp_servers={"unexpected": {"command": "private"}}),
+            lambda c: c.update(plugins={"unexpected": {"enabled": True}}),
+            lambda c: c["permissions"]["octopus-readonly"]["filesystem"].update({"/personal": "read"}),
+            lambda c: c["permissions"]["octopus-readonly"]["filesystem"].update({":root": "read"}),
+            lambda c: c["permissions"]["octopus-readonly"]["network"].update(enabled=True),
+            lambda c: c["permissions"]["octopus-readonly"].update(extends=":workspace"),
+        ]
+        for mutation in mutations:
+            client = self.client()
+            config = self.config()
+            mutation(config)
+            client._request.return_value = {"config": config}
+            with self.assertRaises(RuntimeError):
+                await client._attest_read_only()
+            self.assertIsNone(client._read_only_cwd)
+
+    async def test_thread_response_must_confirm_actual_restrictions(self):
+        client = self.client()
+        await client._attest_read_only()
+        for changes in ({"approvalPolicy": "on-request"}, {"instructionSources": ["/private/AGENTS.md"]},
+                        {"sandbox": {"type": "readOnly", "networkAccess": True}},
+                        {"activePermissionProfile": {"id": ":read-only"}}, {"runtimeWorkspaceRoots": ["/"]}):
+            client._request.return_value = {**self.thread_response(), **changes}
+            with self.assertRaises(RuntimeError):
+                await client.create_thread(self.cwd)
+            with self.assertRaises(RuntimeError):
+                await client.resume_thread("thread-safe", self.cwd)
+
+    async def test_dynamic_tool_does_not_block_protocol_reader(self):
+        gate = asyncio.Event()
+        async def handler(thread, turn, name, args):
+            await gate.wait()
+            return {"matches": ["safe evidence"]}
+        client = self.client(AsyncMock(side_effect=handler))
+        params = {"threadId": "t", "turnId": "u", "namespace": None,
+                  "tool": "code_search", "arguments": {"query": "business"}}
+        await asyncio.wait_for(client._server_request(1, "item/tool/call", params), .1)
+        await client._server_request(2, "item/permissions/requestApproval", {})
+        self.assertEqual(client._write.call_args.args[0]["result"], {"permissions": {}, "scope": "turn"})
+        await client._server_request(1, "item/tool/call", params)
+        gate.set()
+        await asyncio.gather(*list(client._tool_tasks.values()))
+        client.tool_handler.assert_awaited_once_with("t", "u", "code_search", {"query": "business"})
+        result = client._write.call_args.args[0]["result"]
+        self.assertTrue(result["success"])
+        self.assertEqual(result["contentItems"][0]["type"], "inputText")
+        self.assertIn("safe evidence", result["contentItems"][0]["text"])
+
+    async def test_unknown_tools_malformed_arguments_and_errors_are_sanitized(self):
+        handler = AsyncMock(side_effect=ValueError("SECRET_TOKEN_DO_NOT_ECHO"))
+        client = self.client(handler)
+        valid = {"threadId": "t", "turnId": "u", "tool": "code_search", "arguments": {}}
+        for change in ({"tool": "exec_command"}, {"arguments": []}, {"namespace": {}}, {"threadId": ""}):
+            await client._dynamic_tool(1, {**valid, **change})
+            self.assertFalse(client._write.call_args.args[0]["result"]["success"])
+        handler.assert_not_called()
+        await client._dynamic_tool(1, valid)
+        self.assertNotIn("SECRET_TOKEN", json.dumps(client._write.call_args.args[0]))
+        self.assertFalse(client._write.call_args.args[0]["result"]["success"])
+        handler.side_effect = None
+        handler.return_value = {"content": "x" * 128_001}
+        await client._dynamic_tool(2, valid)
+        self.assertFalse(client._write.call_args.args[0]["result"]["success"])
+
+    async def test_readonly_denies_command_file_and_permission_approvals_without_cards(self):
+        client = self.client()
+        events = []
+        client.on_event(events.append)
+        for method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
+            await client._server_request(1, method, {"threadId": "t", "turnId": "u", "command": "private command"})
+            self.assertEqual(client._write.call_args.args[0]["result"], {"decision": "decline"})
+        self.assertEqual(events, [])
+        with self.assertRaises(ValueError):
+            await client.respond_approval(1, "accept")
+
+    async def test_dynamic_tool_roundtrip_over_authenticated_websocket(self):
+        from websockets.asyncio.server import serve
+        completed = asyncio.Event()
+        replies = []
+        async def peer(socket):
+            self.assertEqual(socket.request.headers.get("Authorization"), "Bearer synthetic-token")
+            async for payload in socket:
+                message = json.loads(payload)
+                method = message.get("method")
+                request_id = message.get("id")
+                result = None
+                if method == "initialize":
+                    result = {"userAgent": "test/0.163.0", "codexHome": self.cwd.removesuffix("workspace") + "home"}
+                elif method == "config/read":
+                    result = {"config": self.config()}
+                elif method in {"thread/start", "thread/resume"}:
+                    result = self.thread_response()
+                elif method == "thread/read":
+                    result = {"thread": {"status": {"type": "idle"}}}
+                elif method == "turn/start":
+                    await socket.send(json.dumps({"id": request_id, "result": {"turn": {"id": "turn-safe"}}}))
+                    await socket.send(json.dumps({"id": "query-rpc", "method": "item/tool/call", "params": {
+                        "threadId": "thread-safe", "turnId": "turn-safe", "callId": "call-1",
+                        "namespace": None, "tool": "code_search", "arguments": {"query": "test"}}}))
+                elif request_id == "query-rpc":
+                    replies.append(message)
+                    completed.set()
+                if result is not None:
+                    await socket.send(json.dumps({"id": request_id, "result": result}))
+        server = await serve(peer, "127.0.0.1", 0)
+        client = None
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                token = Path(directory) / "token"
+                token.write_text("synthetic-token")
+                handler = AsyncMock(return_value={"ok": True, "matches": []})
+                client = AppServerClient(url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
+                    token_file=str(token), read_only=True, tool_specs=self.client().tool_specs, tool_handler=handler)
+                await client.start()
+                thread = await client.create_thread(self.cwd)
+                await client.start_turn(thread, "query")
+                await asyncio.wait_for(completed.wait(), 2)
+                handler.assert_awaited_once_with("thread-safe", "turn-safe", "code_search", {"query": "test"})
+                self.assertEqual(replies[0]["result"], {"contentItems": [{"type": "inputText", "text": '{"ok": true, "matches": []}'}], "success": True})
+        finally:
+            if client:
+                await client.close()
+            server.close()
+            await server.wait_closed()
 
 
 class AppServerClientTests(unittest.IsolatedAsyncioTestCase):

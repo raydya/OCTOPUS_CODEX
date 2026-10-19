@@ -1,9 +1,9 @@
 # OCTOPUS CODEX
 
-使用一个独立的飞书企业自建应用，持续对话并操作宿主机上的 Codex。
+使用一个独立的飞书企业自建应用，持续与宿主机上的只读 Codex 对话，回答业务和排障问题。
 
 ```text
-飞书私聊 / 群聊 @机器人
+飞书私聊（成员名单）
           │ 官方 Python SDK 长连接
           ▼
 Docker Compose
@@ -11,31 +11,33 @@ Docker Compose
           │ 带 Bearer 认证的 WebSocket
           ▼
 宿主机独立 Codex app-server
-          └── 本机项目、Codex 登录、工具和 skills
+          └── 动态查询工具 → 宿主机认证查询接口（127.0.0.1:4501）
+                              ├── TLS / Grafana / 飞书文档（现有查询账号）
+                              └── ~/Projects/rere（受限源码读取）
 ```
 
-飞书应用的凭证只从本项目配置读取，不访问或更改 `lark-cli` 的配置。
+机器人应用凭证只从本项目读取；文档查询复用宿主机 `lark-cli` 的现有身份。
 每个「聊天 + 发送人」对应独立 Codex 会话，不接管桌面端已打开的对话。
 Python 和 PostgreSQL 各一个容器；Codex 在宿主机执行。
 
 ## 已实现
 
 - 多轮文本对话、会话持久化、同会话任务排队和重启恢复。
-- 飞书进度卡、完整结果分段发送、发送失败后 `/last` 补取。
-- 操作确认卡和文本确认；问题回答；停止任务。
+- 原消息「稍等」表情回应、完整结果分段发送、发送失败后 `/last` 补取。
+- 只读工具白名单、问题回答、停止任务；禁止命令/文件/扩展权限审批升级。
+- 管理员/成员启停、按用户的任务预算、审计和独立数据库运行账号。
 - 新应用用户配对、消息去重、审批一次性使用及操作者校验。
 - PostgreSQL advisory lock 防止两个桥接同时消费同一份队列。
 - 控制命令也持久入队；重启后保留未处理命令，对执行状态未知的命令提示重新发送。
 - 执行状态未知时暂停会话，避免重启后重复操作项目。
 - 飞书连接状态/心跳监测、容器健康检查、异常退出自动重启。
 
-当前输入支持文本。图片、文件、语音消息暂不处理。群聊默认关闭。
-Codex 命令/文件审批和普通问题已接入；尚未接入的扩展权限请求会拒绝，不会默认放行。
+当前支持文本私聊。共同查询模式禁止群聊，避免向未授权群成员公开结果。图片、文件、语音暂不处理。
 
 ## 1. 准备配置
 
-宿主机需要 Docker Desktop、Docker Compose、Python 3.9+（启动脚本只用标准库）和已登录的 Codex CLI。
-本项目已按 `codex-cli 0.163.0` 核对协议。app-server 的 WebSocket 接口仍为实验性接口，升级 Codex 后应先验证连接和协议。
+宿主机需要 Docker Desktop、Docker Compose、Python 3.12+（宿主机脚本只用标准库）和已登录的 Codex CLI。
+本项目已按 `codex-cli 0.163.0` 核对协议。app-server 的 WebSocket 接口仍为实验性接口，只读启动器锁定此已验证版本，升级后需重新验证工具注册与权限策略。
 
 ```bash
 bash scripts/bootstrap.sh
@@ -46,7 +48,9 @@ bash scripts/bootstrap.sh
 - `.env`：App ID、宿主机工作目录、端口等普通配置。
 - `.secrets/feishu_app_secret`：填写**新飞书应用**的 App Secret，单行纯文本。
 - `.secrets/codex_token`：自动生成的宿主机连接认证令牌。
-- `.secrets/postgres_password`：自动生成的数据库密码。
+- `.secrets/query_token`：自动生成的查询接口认证令牌。
+- `.secrets/postgres_password`：数据库维护账号密码，仅维护容器使用。
+- `.secrets/postgres_runtime_password`：bridge 的受限运行账号密码。
 
 `.env`、`.secrets` 都不会进入 Git 或 Docker 构建上下文。
 `.secrets` 目录权限为 0700，文件为 0600；容器以只读 secret 挂载并将运行时副本放在私有 tmpfs。
@@ -55,27 +59,28 @@ bash scripts/bootstrap.sh
 
 ```dotenv
 FEISHU_APP_ID=你的新应用AppID
-CODEX_WORKSPACE=/宿主机上的项目绝对路径
+CODEX_WORKSPACE=/本项目绝对路径/.data/codex-readonly/workspace
 CODEX_PORT=4500
+CODEX_READ_ONLY=true
+CODEX_DIAGNOSTICS_ENABLED=false
 ```
 
-工作目录使用**宿主机路径**，无需挂载项目到 Python 容器。
-Codex 会继承宿主机登录和配置；桥接为自己的线程指定 `workspace-write`、按需确认、由用户处理审批，不修改全局配置。
+工作目录必须是本项目 `.data/codex-readonly/workspace` 的绝对路径，且保持空目录。启动器创建独立配置目录，仅通过单文件符号链接复用 Codex 登录；不继承个人 MCP、skills、hooks 或项目指令。
+代码通过受控读取器访问 `~/Projects/rere`，不挂载到容器或暴露给模型内置文件工具。
 
 ## 2. 配置飞书新应用
 
 在新企业自建应用的开发者后台操作：
 
 1. 开启「机器人」能力。
-2. 为应用身份申请 `im:message:send_as_bot`、`im:message.p2p_msg:readonly`。
+2. 为应用身份申请 `im:message:send_as_bot`、`im:message.p2p_msg:readonly`、`im:message.reactions:write_only`。
 3. 在「事件配置」中选择**长连接**，添加 `im.message.receive_v1`。
 4. 在「回调配置」中选择**长连接**，添加 `card.action.trigger`。
 5. 发布应用版本，并把自己加入应用可用范围。
 
 长连接不需要公网域名或端口映射。后台可能要求先建立长连接才能保存配置；完成凭证填写并启动下面的 `pair` 后，可回到后台完成保存和发布。
 
-如需群聊，再申请 `im:message.group_at_msg:readonly`，设置 `FEISHU_ALLOW_GROUPS=true`、`FEISHU_BOT_OPEN_ID=新应用机器人自己的open_id`，并把机器人加入群。仅授权用户 @本机器人的消息会被处理；机器人身份未配置时不启用群聊。机器人 open_id 可通过飞书开发者后台 API 调试台的「获取机器人信息」接口查询。
-
+开放给同事时，先在应用后台扩大可用范围，再在 bot 成员名单添加成员。两处均须授权。
 参考：[接收消息](https://open.feishu.cn/document/server-docs/im-v1/message/events/receive)、[卡片回传](https://open.feishu.cn/document/uAjLw4CM/ukzMukzMukzM/feishu-cards/card-callback-communication)、[官方 Python SDK](https://github.com/larksuite/oapi-sdk-python)。
 
 ## 3. 启动宿主机 Codex 接口
@@ -84,6 +89,8 @@ Codex 会继承宿主机登录和配置；桥接为自己的线程指定 `worksp
 
 ```bash
 bash scripts/codex-host.sh
+# 另一个宿主机终端
+python3.12 scripts/query_host.py
 ```
 
 它启动独立的 `codex app-server`，默认监听 `127.0.0.1:4500`，要求 `.secrets/codex_token` 中的认证令牌。容器通过 Docker Desktop 的 `host.docker.internal` 连接它。
@@ -103,22 +110,74 @@ CODEX_PROXY_URL=http://127.0.0.1:7890
 如修改端口，在 `.env` 中改 `CODEX_PORT` 后重建 bridge 容器，并重新启动宿主机脚本。也可临时覆盖宿主机端口：
 
 ```bash
-CODEX_PORT=4501 bash scripts/codex-host.sh
+CODEX_PORT=4502 bash scripts/codex-host.sh
 ```
 
 电脑需要保持开机和联网。若需要随登录自动启动，可以用 macOS 的服务管理器管理此脚本；本项目不会自动安装用户级系统服务。
 
 参考：[Codex app-server](https://learn.chatgpt.com/docs/app-server)。
 
+### 线上查询授权
+
+共同查询模式使用 `CODEX_READ_ONLY=true`，忽略旧 `CODEX_DIAGNOSTICS_ENABLED` 的个人工具授权。
+
+- 飞书文档：现有 `lark-cli` 用户身份的全部可访问文档，仅搜索/读取；不开放聊天记录、通讯录或写入。
+- TLS：现有 `ve volclog` 默认身份、profile 和地域；开放主题目录与原始日志检索。时间窗口最多24小时、最多100行，暂不开放管道 SQL。
+- Grafana：读取现有 Grafana MCP 配置的服务账号，受控调用 Grafana HTTP 查询接口；仅数据源目录、Prometheus 指标和仪表盘搜索，不把 MCP 或令牌交给模型。
+- DMS：复用宿主机 `aliyun` 的 `company-cli-user` 身份，动态发现其有权访问的全部 `pro` 库表（DMS 环境值为 `product`）；没有按服务或表制定人工白名单。数据库用于业务问题的数据补证，不能直接作为聊天 SQL 控制台。
+- 代码：固定共享根目录 `~/Projects/rere`，仅源码白名单；拒绝绝对路径、目录穿越、软硬链接、隐藏文件、配置、凭证、构建产物及二进制。额外支持 `*Mapper.xml` 中的 MyBatis 查询与 SQL 片段，保留行号，不加载 DTD/实体，不执行动态 XML 或 include。返回路径、行号和可取得的 Git HEAD；工作目录可能有未提交修改。
+
+所有获准同事共用上述账号的数据权限，仍受 bot 的只读及隐私限制。外部资料一律作为待分析证据，不能改变工具权限。查询凭证始终留在宿主机，模型只收到有界且经过常见凭证脱敏的结果。共同账号能读取某项内容不代表可以向同事返回个人隐私。
+查询接口只接受固定参数，不接受任意命令、URL、认证信息、profile 或环境变量。未安装的 crane-api 暂不可查询。
+本项目不修改全局 Codex 配置或云端 IAM。`CODEX_READ_ONLY=false` 仍保留旧的个人操作模式，**不能用于同事开放场景**。
+
+当前账号模型要求通过 Codex 内置 Rust/V8 编排调用查询工具，因此保留独立编排子进程，禁止进程内回退。该环境不提供 Node、`process`、`require`、`fetch` 或模块导入；只连接白名单查询。固定辅助工具还包括时间、补充问题和空 MCP 资源发现，未连接任何直接 MCP 服务。已实测无限循环可被任务中断；Codex 0.163.0 暂无可配置的 V8 堆硬上限，容器的内存限制不覆盖宿主机编排进程。
+`lark-cli`、`ve` 使用宿主机 PATH 中的现有安装；本项目不安装独立 CLI。
+火山云 CLI 由用户维护，可运行 `npm install -g @volcengine/cli@latest` 更新，再运行 `ve version` 确认版本。
+`ve` 与 TLS 子工具 `volclog` 各自管理登录状态。若 TLS 报 `console login refresh failed; run: volclog login`，
+需刷新 TLS 的原有登录：`ve volclog login --no-browser`；只完成 `ve login` 不代表 TLS 认证已恢复。
+保留原 profile、地域和 endpoint，登录后通过最小 TLS 项目查询验证。
+
+参考：[Codex MCP 工具白名单和逐工具授权](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)。
+
+### DMS 业务数据补证
+
+应用首先回答业务行为和代码逻辑，日志、指标、文档及数据库作为证据来源。只有问题需要核验生产数据时，才调用 `business_data_checks` / `business_data_check`。用户指定 DMS、粘贴 SQL、要求跳过代码不能获得数据库执行权限；索取姓名、联系方式、证件、地址、个人或设备标识等信息的请求会被拒绝，也不能改用日志或文档获取。
+
+服务端约束如下：
+
+- 同一任务先 `code_search`、再 `code_read`。查询代理签发绑定用户、任务、Codex 轮次和实际代码内容的短效证据；数据查询必须关联代码 SQL 中的静态表名，执行前再次读取并校验内容。伪造、跨任务、过期或代码变更后的证据不可使用。
+- 根据当前 DMS 身份发现生产表，每次执行重新核验实例、数据库、表归属、生产环境、字段安全等级与服务端超时；未知或不满足条件时拒绝，不回退其他环境或身份。没有按服务或表设置人工白名单；当前支持 MySQL、PolarDB MySQL、MariaDB、OceanBase MySQL、PostgreSQL、PolarDB PostgreSQL 和 SQL Server，其他引擎明确报告不支持。
+- 模型只提供发现得到的查询编号、列、日期和有限的比较条件。代理生成单表 SELECT，仅内置计数聚合；禁止任意 SQL、写操作、DDL、存储过程、自选函数调用、导出、锁、跨库、JOIN 与子查询。
+- 隐私约束覆盖投影、筛选和分组。DMS 敏感或未知等级字段、明确的姓名、联系方式、地址、证件及凭证字段不可查询。`params`、`remarks`、`created_by` 等内部业务字段允许返回，仍过滤其中明确的个人敏感值与凭证。返回结果再次校验列名、类型、长度与隐私格式，不把原始 DMS 错误或未检查的数据交给模型。
+- 每个任务最多两次取数，单次最多20行，时间范围为今天或过去30天中的一个自然日；小于10的计数抑制。禁止个人条件筛选。分组计数和有限行数不构成完整统计，回答必须说明这些限制。
+- 只使用安全托管且处于安全协同模式、服务端查询超时不超过60秒的实例；单次代理操作最多50秒、40次 API 调用。保留 DMS 自身的更严格限时，不自动放宽云端设置或重试重查询。目录给出来源标签和实际 schema，同名库或表不混为一个来源；SQL 显式限定 schema。
+
+`config/dms-policy.example.json` 是宿主机策略的格式示例；实际文件为 `.secrets/dms-policy.json`，只固定 CLI 身份、地域、租户和开关，不含账号密钥，也不挂载到容器或交给模型。缺少策略、登录失效或元数据不明确时只关闭数据库取数，其他查询继续工作。OAuth 失效时在本机运行：
+
+```bash
+aliyun configure --mode OAuth --oauth-site-type CN --profile company-cli-user
+```
+
+隐私意图拦截还包括 Unicode 规范化、任务入队和工具调用的再次检查；`/answer` 只能收紧本轮数据库权限。词法识别不能证明模型理解了业务必要性，也不能识别所有隐晦、跨轮次的隐私请求；DMS 字段分类可能不完整，小群体抑制也不是匿名性证明。允许的业务文本及现有日志/文档会过滤明确格式的个人信息与凭证，但不能保证识别自由文本中所有个人敏感信息。
+
+本次策略使用 `readonly:v2` 会话命名空间。首次切换后创建新的 Codex 会话，旧对话及结果保留，但不复用旧线程的工具与指令。
+
+接口依据：[DMS ExecuteScript](https://help.aliyun.com/zh/dms/developer-reference/api-dms-enterprise-2018-11-01-executescript)、[生产环境标识](https://help.aliyun.com/zh/dms/developer-reference/api-dms-enterprise-2018-11-01-listinstances)、[字段敏感等级](https://help.aliyun.com/zh/dms/developer-reference/api-dms-enterprise-2018-11-01-listcolumns)。
+
 ## 4. 启动双容器并配对
 
 ```bash
-docker compose up -d --build
+docker compose build bridge maintenance
+docker compose up -d db
+docker compose run --rm maintenance
+docker compose up -d bridge
 docker compose exec bridge python -m octopus check
 docker compose exec bridge python -m octopus pair
 ```
 
-`check` 验证配置、数据库连接和 Codex 认证握手，不执行模型任务。
+维护命令迁移数据库并建立 `octopus_runtime`，然后 bridge 使用该运行账号，无 DDL/角色管理/审计修改权限。首次安装和升级都先执行维护命令。
+`check` 验证数据库、Codex 认证与只读策略、查询接口健康，不执行模型任务或向飞书发消息。
 `pair` 在终端显示一个十分钟有效的一次性配对码。把终端中的 `/pair ...` 命令私聊发给**新应用机器人**。
 
 配对只在私聊生效，配对后的新应用用户 Open ID 保存到 PostgreSQL。
@@ -134,7 +193,14 @@ docker compose up -d --force-recreate bridge
 
 ## 使用
 
-直接发文本即可创建或继续当前 Codex 会话。任务执行中发来的新消息会排队；默认全局只执行一个任务，避免同一项目被并发修改。
+直接发文本即可创建或继续当前 Codex 会话。任务执行中发来的新消息会排队；默认全局只执行一个任务。每人最多3个运行或排队任务、过去24小时100次、任务间隔2秒、单任务最多30次查询和600秒。参数见 `.env.example`。
+
+收到任务消息后，机器人先在原消息上添加「稍等」（`OneSecond`）表情，再开始执行；排队消息也会先收到表情回应。
+执行期间不发送进度卡，使用 `/status` 查看当前进度和排队数。结束时移除表情，直接回复回答正文，不显示“Codex 已完成”等结果标题；`/last` 和长回答分段也只显示正文。补充信息和错误仍会发消息提示。查询和最终输出均有大小上限。
+表情 ID 保存在 PostgreSQL，取消排队或重启后也会清理已结束任务的表情。若表情接口暂时失败，任务仍会继续；排查容器日志及新应用的 `im:message.reactions:write_only` 权限。
+从旧版升级时，需在飞书后台为新应用补充此权限并发布版本。表情使用机器人的应用身份，和本机 `lark-cli` 查询身份无关。
+
+接口参考：[添加消息表情回复](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message-reaction/create)、[飞书表情列表](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message-reaction/emojis-introduce)。
 
 | 命令 | 作用 |
 | --- | --- |
@@ -144,16 +210,32 @@ docker compose up -d --force-recreate bridge
 | `/stop` | 停止任务，取消本会话排队消息 |
 | `/resume` | 检查中断任务后，解除会话暂停 |
 | `/last` | 重新发送最近一次执行结果 |
-| `/approve 编号` | 允许本次操作，也可点击卡片按钮 |
-| `/deny 编号` | 拒绝本次操作 |
+| `/members` | 管理员私聊列出成员 |
+| `/member-add ou_…` | 管理员添加普通成员；不会自动恢复已停用成员 |
+| `/member-disable ou_…` | 管理员停用成员，取消其排队并停止运行任务 |
+| `/member-enable ou_…` | 管理员恢复成员 |
 | `/answer 编号 答案` | 回答单个问题 |
 
-多个问题请按照卡片提示，用 JSON 回答每个问题 ID。确认默认十五分钟过期；超时拒绝操作，提问超时则停止任务。
+多个问题请按照卡片提示，用 JSON 回答每个问题 ID。问题默认十五分钟过期，超时停止任务。只读模式一律拒绝命令/文件/扩展权限请求。
 配对用户只能操作自己的会话和审批卡，旧编号不能重用。
 
 如果服务或宿主机连接中断，执行中的任务会标记为结果待检查，所属会话暂停；已有排队消息会保留，不会立即重跑。
-先检查宿主机项目，必要时 `/stop` 停止仍在运行的任务，再 `/resume` 恢复。
+先检查上次任务状态，必要时 `/stop` 停止仍在运行的任务，再 `/resume` 恢复。
 恢复会话时如果 Codex 仍有活跃任务，桥接会拒绝提交新任务，避免把它意外追加到原任务。
+
+本地成员管理（使用新机器人应用的 open_id）：
+
+```bash
+docker compose exec bridge python -m octopus members list
+docker compose exec bridge python -m octopus members add ou_同事的ID
+docker compose exec bridge python -m octopus members disable ou_同事的ID
+# 新增管理员仅允许可信本地操作，聊天中不能提升角色
+docker compose exec bridge python -m octopus members add ou_管理员ID --admin
+```
+
+旧配对用户只迁移一次为管理员，重启不会重新启用已停用用户。停用会取消队列，每次工具调用和结果发出前重新检查授权；运行任务还由2秒巡检请求停止。已经发出的飞书消息不会撤回。
+只读模式使用新的会话命名空间，不恢复旧个人模式线程，也不执行其遗留排队任务。
+每人最多5个待执行/运行控制命令、过去24小时最多1000条；普通命令最多512字，补充答案最多4000字。
 
 ## 运维
 
@@ -169,6 +251,15 @@ docker compose down
 PostgreSQL 不映射宿主机端口，只能通过 Compose 内部网络访问。
 数据库中的一个 schema 绑定一个 App ID；更换应用时使用独立数据库或独立 schema，不混用用户身份。
 
+维护账号可清理30天前的终态任务/结果、90天前的审计（请按运维计划定期执行；当前未安装定时任务）：
+
+```bash
+docker compose run --rm maintenance /app/scripts/db_roles.py --retention
+```
+
+审计只记录操作者、任务 ID、操作类型和允许/拒绝结果，不保存查询正文。任务/结果保存在 PG，模型会话另存于宿主机隔离的 CODEX_HOME；PG 清理不等于清理 Codex 会话或飞书消息。
+bridge 使用只读根文件系统、非 root 业务进程、独立 tmpfs、资源上限；PG 不发布端口。宿主机隔离目前是已核验的工具和文件策略，**不是独立 macOS 用户或虚拟机**，宿主机管理员仍属信任边界。
+
 备份：
 
 ```bash
@@ -183,11 +274,11 @@ docker compose exec -T db pg_dump -U octopus octopus > .data/octopus-backup.sql
 ```bash
 uv sync --frozen --python 3.12
 uv run python -m unittest discover -s tests -v
-docker compose exec bridge python -m octopus test-db
+docker compose run --rm maintenance -c 'import os,unittest; from octopus.config import database_url_from_env; os.environ["OCTOPUS_TEST_DATABASE_URL"]=database_url_from_env(); r=unittest.TextTestRunner().run(unittest.defaultTestLoader.discover("/app/tests")); raise SystemExit(not r.wasSuccessful())'
 ```
 
 本地单元测试使用假 Codex 服务和模拟飞书接口；WebSocket 测试使用本地临时端口。
-真实数据库测试只创建和清理随机 schema，不操作应用 schema。未设置 `OCTOPUS_TEST_DATABASE_URL` 时，本地数据库测试会跳过；容器中的 `test-db` 会启用真实 PostgreSQL 测试。
+数据库测试使用随机 schema；角色隔离测试还创建临时数据库和角色，完成后删除，不操作应用数据。需使用维护身份；未设置 `OCTOPUS_TEST_DATABASE_URL` 时跳过。
 
 Python 依赖由 `uv.lock` 锁定，镜像使用含哈希的 `requirements.lock` 安装同一套依赖。
 

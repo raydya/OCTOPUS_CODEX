@@ -85,6 +85,22 @@ class MemoryStore:
             raise self.next_jobs_error
         return [job for job in self.jobs.values() if job.state == "queued"]
 
+    async def get_reaction(self, identifier: str) -> str | None:
+        return self.jobs[identifier].reaction_id
+
+    async def save_reaction(self, identifier: str, reaction_id: str) -> None:
+        self.jobs[identifier] = replace(self.jobs[identifier], reaction_id=reaction_id)
+        self.changed.set()
+
+    async def clear_reaction(self, identifier: str, reaction_id: str) -> None:
+        if self.jobs[identifier].reaction_id == reaction_id:
+            self.jobs[identifier] = replace(self.jobs[identifier], reaction_id=None)
+            self.changed.set()
+
+    async def finished_reactions(self) -> list[tuple[str, str]]:
+        return [(job.id, job.reaction_id) for job in self.jobs.values()
+                if job.state in {"done", "failed"} and job.reaction_id]
+
     async def start_job(self, identifier: str) -> bool:
         job = self.jobs[identifier]
         if job.state != "queued" or self.sessions[job.session_key].blocked_reason is not None:
@@ -116,6 +132,16 @@ class MemoryStore:
                 recovered.append(updated)
         self.changed.set()
         return recovered
+
+    async def retire_legacy_jobs(self, current_prefix: str, reason: str) -> list[Job]:
+        retired = []
+        for identifier, job in self.jobs.items():
+            if job.state == "queued" and not job.session_key.startswith(current_prefix):
+                updated = replace(job, state="failed", error=reason)
+                self.jobs[identifier] = updated
+                retired.append(updated)
+        self.changed.set()
+        return retired
 
     async def pending_count(self, key: str) -> int:
         return sum(job.session_key == key and job.state == "queued" for job in self.jobs.values())
@@ -189,7 +215,13 @@ class FakeMessenger:
         self.records: list[Sent] = []
         self.changed = asyncio.Event()
         self.failed = asyncio.Event()
-        self.fail_result_updates = False
+        self.fail_results = False
+        self.fail_reactions = False
+        self.reactions: dict[str, str] = {}
+        self.reaction_calls: list[tuple[str, str]] = []
+        self.removed_reactions: list[tuple[str, str]] = []
+        self.reaction_gates: dict[str, asyncio.Event] = {}
+        self.reaction_entered: asyncio.Queue[str] = asyncio.Queue()
         self.send_gates: dict[str, asyncio.Event] = {}
         self.send_entered: asyncio.Queue[str] = asyncio.Queue()
         self.closed = False
@@ -197,7 +229,27 @@ class FakeMessenger:
     async def start(self, on_message: Any, on_action: Any) -> None:
         self.on_message, self.on_action = on_message, on_action
 
+    async def add_reaction(self, message_id: str, emoji_type: str = "OneSecond") -> str:
+        self.reaction_calls.append((message_id, emoji_type))
+        self.reaction_entered.put_nowait(message_id)
+        if message_id in self.reaction_gates:
+            await self.reaction_gates[message_id].wait()
+        if self.fail_reactions:
+            raise RuntimeError("private API error metadata")
+        identifier = self.reactions.setdefault(message_id, f"reaction-{message_id}")
+        self.changed.set()
+        return identifier
+
+    async def remove_reaction(self, message_id: str, reaction_id: str) -> None:
+        if self.reactions.get(message_id) == reaction_id:
+            del self.reactions[message_id]
+        self.removed_reactions.append((message_id, reaction_id))
+        self.changed.set()
+
     async def send(self, chat: str, view: View, reply_to: str | None = None) -> str:
+        if self.fail_results and view.kind == "result":
+            self.failed.set()
+            raise RuntimeError("Simulated outbound delivery failure")
         if reply_to in self.send_gates:
             self.send_entered.put_nowait(reply_to)
             await self.send_gates[reply_to].wait()
@@ -207,7 +259,7 @@ class FakeMessenger:
         return identifier
 
     async def update(self, identifier: str, view: View) -> None:
-        if self.fail_result_updates and view.kind == "result":
+        if self.fail_results and view.kind == "result":
             self.failed.set()
             raise RuntimeError("Simulated outbound delivery failure")
         original = next(record for record in self.records if record.id == identifier)
@@ -316,7 +368,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.codex = FakeCodex()
         self.config = Config("cli_test", "test-secret", "unused", "/project", None, None,
                              allowed_users=("ou_alice", "ou_bob"), max_concurrent=2,
-                             task_timeout=60, approval_timeout=60, progress_interval=3600)
+                             task_timeout=60, approval_timeout=60)
         self.bridge: Bridge | None = None
 
     async def start(self) -> Bridge:
@@ -346,6 +398,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.jobs, {})
         self.assertEqual(self.codex.turns, [])
         self.assertEqual(self.messenger.records, [])
+        self.assertEqual(self.messenger.reaction_calls, [])
 
     async def test_owners_in_same_chat_have_independent_threads_and_last_results(self):
         bridge = await self.start()
@@ -376,6 +429,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.messenger.wait_record(lambda record: record.reply_to == "barrier")
         self.assertEqual(len(self.codex.turns), 1)
         self.assertEqual(list(self.store.jobs), ["same-id"])
+        self.assertEqual(self.messenger.reaction_calls, [("same-id", "OneSecond")])
 
     async def test_jobs_queue_per_session_while_other_owner_can_run(self):
         bridge = await self.start()
@@ -471,67 +525,165 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_result_delivery_does_not_erase_success_and_last_can_retry(self):
         bridge = await self.start()
         turn = await self.begin()
-        self.messenger.fail_result_updates = True
+        self.messenger.fail_results = True
         with self.assertLogs("octopus.bridge", level="ERROR"):
             self.codex.complete(turn, "successful complete result")
             await asyncio.wait_for(self.messenger.failed.wait(), 2)
             await self.store.wait_state("input", "done")
         self.assertEqual(self.store.results["oc_shared:ou_alice"],
                          {"text": "successful complete result", "status": "completed"})
-        self.messenger.fail_result_updates = False
+        self.messenger.fail_results = False
         await bridge.receive(message("last", "/last"))
         recovered = await self.messenger.wait_record(lambda record: record.reply_to == "last")
         self.assertEqual(recovered.view.text, "successful complete result")
         self.assertEqual(len(self.codex.turns), 1)
 
-    async def test_final_patch_waits_for_uncancellable_inflight_progress_patch(self):
-        self.config = replace(self.config, progress_interval=0)
-        progress_entered = asyncio.Event()
-        release_progress = asyncio.Event()
-        final_entered = asyncio.Event()
-        write_order: list[str] = []
-        inflight: list[asyncio.Task[None]] = []
-        original_update = self.messenger.update
+    async def test_acknowledgement_precedes_codex_without_delaying_inbox_acceptance(self):
+        release = asyncio.Event()
+        self.messenger.reaction_gates["input"] = release
+        bridge = await self.start()
+        await bridge.receive(message("input"))
+        self.assertEqual(await asyncio.wait_for(self.messenger.reaction_entered.get(), 2), "input")
+        self.assertEqual(self.codex.thread_count, 0)
+        self.assertEqual(self.codex.turns, [])
+        self.assertEqual(self.messenger.records, [])
+        release.set()
+        turn = await self.codex.next_turn()
+        self.assertEqual(self.messenger.reactions, {"input": "reaction-input"})
+        self.assertEqual(self.messenger.reaction_calls, [("input", "OneSecond")])
+        self.codex.emit(CodexEvent("activity", thread_id=turn.thread, turn_id=turn.id, text="Working"))
+        self.codex.emit(CodexEvent("text", thread_id=turn.thread, turn_id=turn.id, delta="partial answer"))
+        await asyncio.wait_for(bridge.events.join(), 2)
+        self.assertEqual(self.messenger.records, [])
+        await bridge.receive(message("status", "/status"))
+        status = await self.messenger.wait_record(lambda record: record.reply_to == "status")
+        self.assertIn("Working", status.view.text)
+        self.codex.complete(turn, "complete answer")
+        result = await self.messenger.wait_record(lambda record: record.view.kind == "result")
+        self.assertEqual(result.reply_to, "input")
+        self.assertEqual(result.operation, "send")
+        self.assertEqual(result.view.text, "complete answer")
+        await until(self.messenger.changed, lambda: "input" not in self.messenger.reactions)
+        self.assertIsNone(await self.store.get_reaction("input"))
 
-        async def update(identifier: str, view: View) -> None:
-            if view.kind == "progress":
-                async def network_write() -> None:
-                    progress_entered.set()
-                    await release_progress.wait()
-                    write_order.append("progress")
-                    await original_update(identifier, view)
-                # A cancelled awaiting coroutine cannot cancel a thread's HTTP
-                # request. This shielded fake preserves that transport behavior.
-                request = asyncio.create_task(network_write())
-                inflight.append(request)
-                await asyncio.shield(request)
-            else:
-                if view.kind == "result":
-                    final_entered.set()
-                    write_order.append("result")
-                await original_update(identifier, view)
+    async def test_queued_messages_react_immediately_and_late_ack_is_removed_after_stop(self):
+        release = asyncio.Event()
+        self.messenger.reaction_gates["queued"] = release
+        bridge = await self.start()
+        await self.begin("running")
+        self.assertEqual(await self.messenger.reaction_entered.get(), "running")
+        await bridge.receive(message("queued"))
+        self.assertEqual(await asyncio.wait_for(self.messenger.reaction_entered.get(), 2), "queued")
+        self.assertEqual(len(self.codex.turns), 1)
+        self.assertEqual(self.messenger.records, [])
+        await bridge.receive(message("stop", "/stop"))
+        await self.store.wait_control("stop", "done")
+        self.assertEqual(self.store.jobs["queued"].state, "failed")
+        release.set()
+        await until(self.messenger.changed, lambda: ("queued", "reaction-queued") in self.messenger.removed_reactions)
+        self.assertIsNone(await self.store.get_reaction("queued"))
+        self.assertEqual(len(self.codex.turns), 1)
 
-        self.messenger.update = update
+    async def test_reaction_failure_does_not_fail_task_or_restore_progress_card(self):
+        self.messenger.fail_reactions = True
+        bridge = await self.start()
+        with self.assertLogs("octopus.bridge", level="WARNING") as captured:
+            turn = await self.begin()
+        self.assertNotIn("private API error", "\n".join(captured.output))
+        self.assertEqual(self.messenger.records, [])
+        self.codex.complete(turn, "success despite reaction error")
+        result = await self.messenger.wait_record(lambda record: record.view.kind == "result")
+        self.assertEqual(result.view.text, "success despite reaction error")
+        self.assertEqual(self.store.jobs["input"].state, "done")
+        self.assertNotIn("oc_shared:ou_alice", bridge.blocked)
+
+    async def test_failed_reaction_persistence_removes_the_untracked_reaction(self):
+        original_save = self.store.save_reaction
+        async def fail_save(identifier: str, reaction_id: str) -> None:
+            raise RuntimeError("database unavailable")
+        self.store.save_reaction = fail_save
         await self.start()
-        turn = await self.begin()
+        with self.assertLogs("octopus.bridge", level="WARNING"):
+            turn = await self.begin()
+        self.assertEqual(self.messenger.reactions, {})
+        self.assertIn(("input", "reaction-input"), self.messenger.removed_reactions)
+        self.assertIsNone(await self.store.get_reaction("input"))
+        self.store.save_reaction = original_save
+        self.codex.complete(turn)
+        await self.messenger.wait_record(lambda record: record.view.kind == "result")
+
+    async def test_slow_cleanup_does_not_delay_new_work_and_can_retry_failed_removal(self):
+        key = "oc_shared:ou_alice"
+        await self.store.session(key, "oc_shared", "ou_alice")
+        await self.store.enqueue(key, message("old"))
+        await self.store.start_job("old")
+        await self.store.finish_job("old")
+        await self.store.save_reaction("old", "reaction-old")
+        self.messenger.reactions["old"] = "reaction-old"
+        entered, release = asyncio.Event(), asyncio.Event()
+        original_remove = self.messenger.remove_reaction
+        attempts = 0
+        async def remove(identifier: str, reaction_id: str) -> None:
+            nonlocal attempts
+            if identifier == "old":
+                attempts += 1
+                if attempts == 1:
+                    entered.set()
+                    await release.wait()
+                    raise RuntimeError("temporary network failure")
+            await original_remove(identifier, reaction_id)
+        self.messenger.remove_reaction = remove
+        bridge = await self.start()
         try:
-            await asyncio.wait_for(progress_entered.wait(), 2)
-            self.codex.complete(turn, "final result")
-            await self.store.wait_state("input", "done")
-            # Completion has been persisted, but the final PATCH must remain
-            # blocked while the simulated HTTP request is still in flight.
-            with self.assertRaises(asyncio.TimeoutError):
-                await asyncio.wait_for(final_entered.wait(), 0.03)
-            self.assertEqual(write_order, [])
-            release_progress.set()
-            await asyncio.wait_for(final_entered.wait(), 2)
+            await asyncio.wait_for(entered.wait(), 2)
+            turn = await self.begin()
+            self.assertEqual(self.store.jobs["input"].state, "running")
+            self.codex.complete(turn)
             await self.messenger.wait_record(lambda record: record.view.kind == "result")
-            self.assertEqual(write_order, ["progress", "result"])
-            updates = [record for record in self.messenger.records if record.operation == "update"]
-            self.assertEqual(updates[-1].view.text, "final result")
+            await asyncio.wait_for(bridge.idle.wait(), 2)
+            with self.assertLogs("octopus.bridge", level="WARNING"):
+                release.set()
+                await until(self.messenger.changed, lambda: not self.messenger.reactions)
+            self.assertGreaterEqual(attempts, 2)
+            self.assertIsNone(await self.store.get_reaction("old"))
         finally:
-            release_progress.set()
-            await asyncio.gather(*inflight, return_exceptions=True)
+            release.set()
+
+    async def test_restart_cleans_old_reaction_and_reuses_pending_reaction(self):
+        key = "oc_shared:ou_alice"
+        await self.store.session(key, "oc_shared", "ou_alice")
+        for identifier in ("interrupted", "queued"):
+            await self.store.enqueue(key, message(identifier))
+            await self.store.save_reaction(identifier, f"reaction-{identifier}")
+            self.messenger.reactions[identifier] = f"reaction-{identifier}"
+        await self.store.start_job("interrupted")
+        bridge = await self.start()
+        await until(self.messenger.changed, lambda: "interrupted" not in self.messenger.reactions)
+        self.assertEqual(self.messenger.reactions, {"queued": "reaction-queued"})
+        await bridge.receive(message("resume", "/resume"))
+        turn = await self.codex.next_turn()
+        self.assertEqual(self.messenger.reaction_calls, [])
+        self.codex.complete(turn)
+        await until(self.messenger.changed, lambda: not self.messenger.reactions)
+
+    async def test_shutdown_preserves_pending_acknowledgement_for_restart_cleanup(self):
+        release = asyncio.Event()
+        self.messenger.reaction_gates["input"] = release
+        bridge = await self.start()
+        await bridge.receive(message("input"))
+        await asyncio.wait_for(self.messenger.reaction_entered.get(), 2)
+        closing = asyncio.create_task(bridge.close())
+        try:
+            await asyncio.sleep(0)
+            self.assertFalse(closing.done())
+            release.set()
+            await asyncio.wait_for(closing, 2)
+            self.assertEqual(await self.store.get_reaction("input"), "reaction-input")
+            self.assertEqual(self.codex.turns, [])
+        finally:
+            release.set()
+            await closing
+            self.bridge = None
 
     async def test_restart_notifies_interrupted_owner_and_does_not_replay_work(self):
         key = "oc_shared:ou_alice"

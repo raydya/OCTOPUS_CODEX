@@ -25,7 +25,7 @@ if [[ -L "$PROJECT_ROOT/.env" || ! -f "$PROJECT_ROOT/.env" ]]; then
 fi
 chmod 0600 "$PROJECT_ROOT/.env"
 
-for secret_name in postgres_password codex_token feishu_app_secret; do
+for secret_name in postgres_password postgres_runtime_password codex_token feishu_app_secret query_token; do
     secret_path="$SECRETS_DIR/$secret_name"
     if [[ -L "$secret_path" ]]; then
         printf 'Secret path must not be a symbolic link: %s\n' "$secret_name" >&2

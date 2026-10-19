@@ -60,7 +60,14 @@ class Config:
     max_concurrent: int = 1
     task_timeout: int = 7200
     approval_timeout: int = 900
-    progress_interval: int = 2
+    read_only: bool = False
+    query_url: str = "http://host.docker.internal:4501"
+    query_token_file: str | None = None
+    max_pending_per_user: int = 3
+    daily_task_limit: int = 100
+    min_interval_seconds: int = 2
+    max_tool_calls: int = 30
+    database_migrate: bool = True
 
     @classmethod
     def from_env(cls) -> Config:
@@ -100,6 +107,24 @@ class Config:
         bot_open_id = os.environ.get("FEISHU_BOT_OPEN_ID", "").strip() or None
         if allow_groups and (not bot_open_id or not bot_open_id.startswith("ou_")):
             raise ConfigurationError("启用群聊需设置新应用机器人自己的 FEISHU_BOT_OPEN_ID，以精确识别 @机器人")
+        read_only_value = os.environ.get("CODEX_READ_ONLY", "false").strip().lower()
+        if read_only_value not in {"true", "false"}:
+            raise ConfigurationError("CODEX_READ_ONLY 必须为 true 或 false")
+        read_only = read_only_value == "true"
+        if read_only and allow_groups:
+            raise ConfigurationError("共同查询模式暂只允许私聊，避免向未授权群成员公开结果")
+        query_url = os.environ.get("QUERY_HOST_URL", "http://host.docker.internal:4501").strip()
+        query_token_file = os.environ.get("QUERY_TOKEN_FILE", "").strip() or None
+        if read_only:
+            parsed_query = urlparse(query_url)
+            if (parsed_query.scheme != "http" or parsed_query.hostname not in {"127.0.0.1", "localhost", "host.docker.internal"}
+                    or parsed_query.username or parsed_query.password or parsed_query.path not in {"", "/"}
+                    or parsed_query.query or parsed_query.fragment):
+                raise ConfigurationError("QUERY_HOST_URL 只能指向本机查询服务")
+            if not url or not query_token_file or not Path(query_token_file).is_file():
+                raise ConfigurationError("只读模式需要宿主机 Codex 和 QUERY_TOKEN_FILE")
+            if len(Path(query_token_file).read_text().strip()) < 32:
+                raise ConfigurationError("查询接口令牌至少需要32字符")
         return cls(
             app_id=app_id, app_secret=app_secret, database_url=database_url, workspace=workspace,
             codex_url=url, codex_token_file=token_file,
@@ -110,5 +135,10 @@ class Config:
             max_concurrent=_integer("MAX_CONCURRENT_TASKS", 1, 1, 8),
             task_timeout=_integer("TASK_TIMEOUT_SECONDS", 7200, 30, 86400),
             approval_timeout=_integer("APPROVAL_TIMEOUT_SECONDS", 900, 30, 3600),
-            progress_interval=_integer("PROGRESS_INTERVAL_SECONDS", 2, 1, 30),
+            read_only=read_only, query_url=query_url, query_token_file=query_token_file,
+            max_pending_per_user=_integer("MAX_PENDING_PER_USER", 3, 1, 20),
+            daily_task_limit=_integer("DAILY_TASK_LIMIT", 100, 1, 10000),
+            min_interval_seconds=_integer("MIN_REQUEST_INTERVAL_SECONDS", 2, 0, 60),
+            max_tool_calls=_integer("MAX_TOOL_CALLS", 30, 1, 100),
+            database_migrate=os.environ.get("DATABASE_MIGRATE", "true").lower() == "true",
         )

@@ -5,6 +5,20 @@ services:
     build: .
     restart: unless-stopped
     stop_grace_period: 30s
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
+    pids_limit: 128
+    mem_limit: 768m
+    cpus: 2
     depends_on:
       db:
         condition: service_healthy
@@ -16,23 +30,32 @@ services:
       FEISHU_BOT_OPEN_ID: ${FEISHU_BOT_OPEN_ID:-}
       POSTGRES_HOST: db
       POSTGRES_PORT: "5432"
-      POSTGRES_USER: ${POSTGRES_USER:-octopus}
+      POSTGRES_USER: octopus_runtime
       POSTGRES_DB: ${POSTGRES_DB:-octopus}
-      POSTGRES_PASSWORD_FILE: /run/octopus/postgres_password
+      POSTGRES_PASSWORD_FILE: /run/octopus/postgres_runtime_password
+      DATABASE_MIGRATE: "false"
       CODEX_URL: ws://host.docker.internal:${CODEX_PORT:-4500}
       CODEX_TOKEN_FILE: /run/octopus/codex_token
       CODEX_WORKSPACE: ${CODEX_WORKSPACE:-}
       CODEX_MODEL: ${CODEX_MODEL:-}
+      CODEX_READ_ONLY: ${CODEX_READ_ONLY:-true}
+      QUERY_HOST_URL: http://host.docker.internal:${OCTOPUS_QUERY_PORT:-4501}
+      QUERY_TOKEN_FILE: /run/octopus/query_token
+      MAX_PENDING_PER_USER: ${MAX_PENDING_PER_USER:-3}
+      DAILY_TASK_LIMIT: ${DAILY_TASK_LIMIT:-100}
+      MIN_REQUEST_INTERVAL_SECONDS: ${MIN_REQUEST_INTERVAL_SECONDS:-2}
+      MAX_TOOL_CALLS: ${MAX_TOOL_CALLS:-30}
       MAX_CONCURRENT_TASKS: ${MAX_CONCURRENT_TASKS:-1}
-      TASK_TIMEOUT_SECONDS: ${TASK_TIMEOUT_SECONDS:-7200}
+      TASK_TIMEOUT_SECONDS: ${TASK_TIMEOUT_SECONDS:-600}
       APPROVAL_TIMEOUT_SECONDS: ${APPROVAL_TIMEOUT_SECONDS:-900}
-      PROGRESS_INTERVAL_SECONDS: ${PROGRESS_INTERVAL_SECONDS:-2}
     secrets:
-      - postgres_password
+      - postgres_runtime_password
       - codex_token
       - feishu_app_secret
+      - query_token
     tmpfs:
       - /run/octopus:rw,nosuid,nodev,size=16m,mode=0700
+      - /tmp:rw,nosuid,nodev,noexec,size=32m,mode=1777
     networks:
       - database
       - outbound
@@ -42,6 +65,26 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+
+  maintenance:
+    profiles: ["maintenance"]
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: ["/opt/venv/bin/python"]
+    command: ["/app/scripts/db_roles.py", "--password-file", "/run/secrets/postgres_runtime_password"]
+    environment:
+      FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+      POSTGRES_HOST: db
+      POSTGRES_USER: ${POSTGRES_USER:-octopus}
+      POSTGRES_DB: ${POSTGRES_DB:-octopus}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+      - postgres_runtime_password
+    networks:
+      - database
 
   db:
     image: postgres:17-bookworm
@@ -66,6 +109,10 @@ services:
       start_period: 10s
 
 secrets:
+  postgres_runtime_password:
+    file: ./.secrets/postgres_runtime_password
+  query_token:
+    file: ./.secrets/query_token
   postgres_password:
     file: ./.secrets/postgres_password
   codex_token:

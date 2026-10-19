@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from octopus.contracts import Button, CardAction, IncomingMessage, View
-from octopus.feishu import (CARD_BUDGET, FeishuMessenger, _heartbeat, _post_with_timeout, _roundtrip,
+from octopus.feishu import (CARD_BUDGET, FeishuMessenger, _LarkApi, _heartbeat, _post_with_timeout, _roundtrip,
                             build_card, parse_action, parse_message)
 
 
@@ -107,6 +107,80 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             await messenger.update("om_reply", view)
         await messenger.close()
 
+    async def test_reaction_lifecycle_returns_own_record_for_removal(self):
+        messenger, api = self.messenger()
+        api.add_reaction.return_value = SimpleNamespace(code=0, data=SimpleNamespace(reaction_id="reaction_1"))
+        api.remove_reaction.return_value = SimpleNamespace(code=0)
+        self.assertEqual(await messenger.add_reaction("om_input"), "reaction_1")
+        api.add_reaction.assert_called_once_with("om_input", "OneSecond")
+        await messenger.remove_reaction("om_input", "reaction_1")
+        api.remove_reaction.assert_called_once_with("om_input", "reaction_1")
+        await messenger.add_reaction("om_input", "DONE")
+        api.add_reaction.assert_called_with("om_input", "DONE")
+        api.send.assert_not_called()
+        await messenger.close()
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            await messenger.add_reaction("om_input")
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            await messenger.remove_reaction("om_input", "reaction_1")
+
+    async def test_reactions_reject_invalid_input_and_missing_response_id(self):
+        messenger, api = self.messenger()
+        for bad in (None, "", "  ", 1):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    await messenger.add_reaction(bad)
+                with self.assertRaises(ValueError):
+                    await messenger.add_reaction("om_input", bad)
+                with self.assertRaises(ValueError):
+                    await messenger.remove_reaction(bad, "reaction_1")
+                with self.assertRaises(ValueError):
+                    await messenger.remove_reaction("om_input", bad)
+        api.add_reaction.assert_not_called()
+        api.remove_reaction.assert_not_called()
+        for data in (None, SimpleNamespace(), SimpleNamespace(reaction_id=""),
+                     SimpleNamespace(reaction_id=1)):
+            api.add_reaction.return_value = SimpleNamespace(code=0, data=data)
+            with self.assertRaisesRegex(RuntimeError, "no reaction ID"):
+                await messenger.add_reaction("om_input")
+        await messenger.close()
+
+    async def test_reaction_failures_expose_codes_without_sensitive_details(self):
+        messenger, api = self.messenger()
+        api.add_reaction.return_value = SimpleNamespace(code=99991672, msg="secret-never-log")
+        with self.assertRaisesRegex(RuntimeError, "99991672") as error:
+            await messenger.add_reaction("om_input")
+        self.assertNotIn("secret-never-log", str(error.exception))
+        api.remove_reaction.side_effect = RuntimeError("token=secret-never-log private message")
+        with self.assertRaisesRegex(RuntimeError, "remove_reaction failed") as error:
+            await messenger.remove_reaction("om_input", "reaction_1")
+        self.assertNotIn("secret-never-log", str(error.exception))
+        self.assertNotIn("private message", str(error.exception))
+        await messenger.close()
+
+    async def test_only_reaction_removal_accepts_documented_absent_resources(self):
+        messenger, api = self.messenger()
+        for code in (231011, 231003, 230110, 231005, 232009):
+            with self.subTest(absent_code=code):
+                response = SimpleNamespace(code=code, msg="private error detail")
+                api.remove_reaction.return_value = response
+                await messenger.remove_reaction("om_input", "reaction_1")
+                api.add_reaction.return_value = response
+                with self.assertRaisesRegex(RuntimeError, str(code)):
+                    await messenger.add_reaction("om_input")
+                api.update.return_value = response
+                with self.assertRaisesRegex(RuntimeError, str(code)):
+                    await messenger.update("om_input", View("info", "Title", "Text"))
+        # In-progress, archived/inaccessible, mismatched and unauthorized
+        # resources are not evidence that our reaction has disappeared.
+        for code in (231015, 231004, 231010, 231007, 231008, 99991672):
+            with self.subTest(retry_or_failure_code=code):
+                api.remove_reaction.return_value = SimpleNamespace(code=code, msg="private error detail")
+                with self.assertRaisesRegex(RuntimeError, str(code)) as error:
+                    await messenger.remove_reaction("om_input", "reaction_1")
+                self.assertNotIn("private error detail", str(error.exception))
+        await messenger.close()
+
     async def test_ack_is_only_sent_after_durable_inbox_handler_finishes(self):
         messenger, _ = self.messenger()
         release = asyncio.Event()
@@ -178,6 +252,31 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             await _heartbeat(connection, client)
         self.assertEqual(connection.send.call_args_list[0].args[0], {"type": "heartbeat", "connected": True})
         self.assertNotIn("secret-url", str(connection.send.call_args_list))
+
+
+class ReactionSdkTests(unittest.TestCase):
+    def setUp(self):
+        # The SDK captures a module-level event loop on first import.
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+
+    def tearDown(self):
+        self.loop.close()
+        asyncio.set_event_loop(None)
+
+    def test_sdk_maps_reaction_body_and_exact_delete_target(self):
+        api = _LarkApi.__new__(_LarkApi)
+        api.client = Mock()
+        resource = api.client.im.v1.message_reaction
+        self.assertIs(api.add_reaction("om_input", "OneSecond"), resource.create.return_value)
+        request = resource.create.call_args.args[0]
+        self.assertEqual(request.paths, {"message_id": "om_input"})
+        self.assertEqual(request.request_body.reaction_type.emoji_type, "OneSecond")
+        self.assertEqual(request.uri, "/open-apis/im/v1/messages/:message_id/reactions")
+        self.assertIs(api.remove_reaction("om_input", "reaction_1"), resource.delete.return_value)
+        request = resource.delete.call_args.args[0]
+        self.assertEqual(request.paths, {"message_id": "om_input", "reaction_id": "reaction_1"})
+        self.assertEqual(request.uri, "/open-apis/im/v1/messages/:message_id/reactions/:reaction_id")
 
 
 class ListenerHealthTests(unittest.TestCase):

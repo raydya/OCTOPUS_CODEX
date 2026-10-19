@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "volcengine-tls": {
+      "source": "volcengine/volcengine-skills",
+      "sourceType": "github",
+      "skillPath": "plugins/volcengine-storage/skills/volcengine-tls/SKILL.md",
+      "computedHash": "dabc691571856b5b91426e1c648c376540ad719ef84960b36d814505ec81ae86"
+    }
+  }
+}

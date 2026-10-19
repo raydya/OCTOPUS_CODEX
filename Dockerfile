@@ -20,6 +20,8 @@ COPY pyproject.toml /app/pyproject.toml
 COPY src /app/src
 COPY tests /app/tests
 COPY scripts/codex-host.sh scripts/codex_host.py /app/scripts/
+COPY scripts/db_roles.py /app/scripts/
+COPY config /app/config
 RUN /opt/venv/bin/pip install --no-cache-dir --no-deps .
 
 COPY docker/entrypoint.sh /usr/local/bin/octopus-entrypoint

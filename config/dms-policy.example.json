@@ -1,0 +1,8 @@
+{
+  "enabled": false,
+  "policy_version": "readonly:v2",
+  "profile": "company-cli-user",
+  "region": "cn-hangzhou",
+  "tid": 2359,
+  "timezone": "Asia/Shanghai"
+}

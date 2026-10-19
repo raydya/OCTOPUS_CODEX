@@ -6,15 +6,42 @@ import asyncio
 import json
 import logging
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
 
 from .contracts import CodexEvent, EventHandler, Question
 
 logger = logging.getLogger(__name__)
 RequestId = str | int
+ToolHandler = Callable[[str, str, str, dict[str, Any]], Awaitable[dict[str, Any]]]
+READ_ONLY_PROFILE = "octopus-readonly"
+READ_ONLY_DISABLED_FEATURES = tuple((
+    "shell_tool shell_snapshot apps plugins remote_plugin recommended_plugins tool_suggest "
+    "skill_search skill_mcp_dependency_install hooks memories multi_agent multi_agent_v2 "
+    "browser_use browser_use_external browser_use_full_cdp_access computer_use in_app_browser "
+    "code_mode code_mode_only image_generation view_image request_permissions_tool "
+    "exec_permission_approvals stable_environment_tools workspace_dependencies goals realtime_conversation"
+).split())
+
+
+def readonly_thread_config() -> dict[str, Any]:
+    """Reapply capability restrictions on both creation and restoration."""
+    return {
+        **{f"features.{name}": False for name in READ_ONLY_DISABLED_FEATURES},
+        # Current model catalogs require code_mode_only. This host is a Rust/V8
+        # isolate with no filesystem, network, process or import APIs; its only
+        # external operations are the registered dynamic query callbacks.
+        "features.code_mode_host.enabled": True,
+        "features.code_mode_host.disable_in_process_fallback": True,
+        "features.skip_host_skill_discovery": True,
+        "web_search": "disabled", "project_doc_max_bytes": 0,
+        "skills.include_instructions": False, "skills.bundled.enabled": False,
+        "cloud.skills.enabled": False, "orchestrator.mcp.enabled": False,
+        "apps._default.enabled": False, "agents.enabled": False,
+    }
 
 
 def _object(value: Any) -> dict[str, Any]:
@@ -61,13 +88,30 @@ class AppServerClient:
 
     def __init__(self, executable: str = "codex", model: str | None = None,
                  request_timeout: float = 30, extra_args: list[str] | None = None,
-                 url: str | None = None, token_file: str | None = None):
+                 url: str | None = None, token_file: str | None = None,
+                 read_only: bool = False, tool_specs: list[dict[str, Any]] | None = None,
+                 tool_handler: ToolHandler | None = None):
         if not math.isfinite(request_timeout) or request_timeout <= 0:
             raise ValueError("request_timeout 必须是正数")
         self.executable = executable
         self.model = model
         self.request_timeout = request_timeout
         self.extra_args = list(extra_args or [])
+        self.read_only = read_only
+        self.tool_specs = json.loads(json.dumps(tool_specs or []))
+        names: set[str] = set()
+        for spec in self.tool_specs:
+            name = spec.get("name") if isinstance(spec, dict) else None
+            if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name)
+                    or name in names or spec.get("type") != "function"
+                    or not isinstance(spec.get("inputSchema"), dict)):
+                raise ValueError("Invalid dynamic query tool specification")
+            names.add(name)
+        self._tool_names = names
+        self.tool_handler = tool_handler
+        self._tool_tasks: dict[RequestId, asyncio.Task[Any]] = {}
+        self._read_only_cwd: str | None = None
+        self._read_only_home: str | None = None
         if url:
             parsed = urlsplit(url)
             if parsed.scheme not in {"ws", "wss"} or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
@@ -193,14 +237,76 @@ class AppServerClient:
             raise
 
     async def _handshake(self, transport: Any) -> None:
-        await self._request("initialize", {
+        initialized = _object(await self._request("initialize", {
             "clientInfo": {"name": "octopus_codex", "title": "Octopus Codex", "version": "0.1.0"},
             "capabilities": {"experimentalApi": True, "requestAttestation": False},
-        }, require_ready=False)
+        }, require_ready=False))
+        if self.read_only:
+            product = _string(initialized.get("userAgent")).split(" ", 1)[0]
+            home = _string(initialized.get("codexHome"))
+            if not product.endswith("/0.163.0") or not home.endswith("/.data/codex-readonly/home"):
+                raise RuntimeError("Codex 只读模式需要经过验证的版本和独立配置目录")
+            self._read_only_home = home
         await self._write({"method": "initialized"})
+        if self.read_only:
+            await self._attest_read_only()
         if self._transport is not transport or self._closed:
             raise RuntimeError("Codex 初始化期间连接中断")
         self._ready = True
+
+    async def _attest_read_only(self) -> None:
+        """Refuse a personal or drifted host before any colleague thread loads."""
+        result = _object(await self._request("config/read", {"includeLayers": False}, require_ready=False))
+        config = _object(result.get("config"))
+        for key, expected in readonly_thread_config().items():
+            actual: Any = config
+            for part in key.split("."):
+                actual = _object(actual).get(part)
+            if actual != expected or type(actual) is not type(expected):
+                raise RuntimeError("Codex 只读隔离配置校验失败，拒绝接入")
+        if (config.get("approval_policy") != "never"
+                or config.get("default_permissions") != READ_ONLY_PROFILE
+                or _object(config.get("mcp_servers")) or _object(config.get("plugins"))):
+            raise RuntimeError("Codex 只读隔离配置校验失败，拒绝接入")
+        profile = _object(_object(config.get("permissions")).get(READ_ONLY_PROFILE))
+        filesystem = _object(profile.get("filesystem"))
+        filesystem = {key: value for key, value in filesystem.items()
+                      if not (key == "glob_scan_max_depth" and value is None)}
+        roots = [path for path, access in filesystem.items()
+                 if path not in {":root", ":minimal"} and access == "read"]
+        if (profile.get("extends") or filesystem.get(":root") != "deny"
+                or filesystem.get(":minimal") != "read" or len(roots) != 1
+                or set(filesystem) != {":root", ":minimal", roots[0]}
+                or not roots[0].endswith("/.data/codex-readonly/workspace")
+                or not roots[0].startswith("/") or "/../" in roots[0]
+                or _object(profile.get("network")).get("enabled") is not False
+                or profile.get("workspace_roots")):
+            raise RuntimeError("Codex 只读文件系统权限校验失败，拒绝接入")
+        self._read_only_cwd = roots[0]
+        if self._read_only_home != roots[0].removesuffix("workspace") + "home":
+            self._read_only_cwd = None
+            raise RuntimeError("Codex 只读配置目录与工作目录不匹配")
+
+    def _thread_permissions(self, cwd: str) -> dict[str, Any]:
+        if not self.read_only:
+            return {"cwd": cwd, "sandbox": "workspace-write", "approvalPolicy": "on-request",
+                    "approvalsReviewer": "user"}
+        if not self._read_only_cwd or cwd.rstrip("/") != self._read_only_cwd:
+            raise ValueError("Codex 只读模式必须使用隔离工作目录")
+        return {"cwd": self._read_only_cwd, "runtimeWorkspaceRoots": [],
+                "permissions": READ_ONLY_PROFILE, "approvalPolicy": "never",
+                "approvalsReviewer": "user", "config": readonly_thread_config()}
+
+    def _check_thread_permissions(self, result: dict[str, Any]) -> None:
+        if not self.read_only:
+            return
+        profile = _object(result.get("activePermissionProfile"))
+        sandbox = _object(result.get("sandbox"))
+        if (result.get("approvalPolicy") != "never" or result.get("cwd") != self._read_only_cwd
+                or result.get("runtimeWorkspaceRoots") != [] or result.get("instructionSources") != []
+                or profile.get("id") != READ_ONLY_PROFILE or profile.get("extends")
+                or sandbox.get("type") != "readOnly" or sandbox.get("networkAccess") is not False):
+            raise RuntimeError("Codex 会话只读权限校验失败，任务未提交")
 
     async def _read_websocket(self, websocket: Any) -> None:
         reason = "Codex WebSocket 连接已结束"
@@ -262,6 +368,11 @@ class AppServerClient:
             self._emit(CodexEvent("request_resolved", thread_id=prompt.thread_id, request_id=request_id))
         self._prompts.clear()
         self._messages.clear()
+        for task in self._tool_tasks.values():
+            task.cancel()
+        self._tool_tasks.clear()
+        self._read_only_cwd = None
+        self._read_only_home = None
         if not self._closed:
             self._emit(CodexEvent("disconnect", error=reason, text=reason))
 
@@ -308,12 +419,17 @@ class AppServerClient:
 
     async def create_thread(self, cwd: str) -> str:
         params: dict[str, Any] = {
-            "cwd": cwd, "sandbox": "workspace-write", "approvalPolicy": "on-request",
-            "approvalsReviewer": "user", "ephemeral": False,
+            **self._thread_permissions(cwd), "ephemeral": False,
         }
+        if self.read_only:
+            # No local execution environment means no apply_patch or local file
+            # tools are registered in Codex 0.163.0. Dynamic tools still work.
+            params["environments"] = []
+            params["dynamicTools"] = self.tool_specs
         if self.model:
             params["model"] = self.model
         result = _object(await self._request("thread/start", params))
+        self._check_thread_permissions(result)
         thread_id = _string(_object(result.get("thread")).get("id"))
         if not thread_id:
             raise RuntimeError("Codex thread/start 响应缺少 thread.id")
@@ -321,12 +437,12 @@ class AppServerClient:
 
     async def resume_thread(self, thread_id: str, cwd: str) -> None:
         params: dict[str, Any] = {
-            "threadId": thread_id, "cwd": cwd, "sandbox": "workspace-write",
-            "approvalPolicy": "on-request", "approvalsReviewer": "user", "excludeTurns": True,
+            **self._thread_permissions(cwd), "threadId": thread_id, "excludeTurns": True,
         }
         if self.model:
             params["model"] = self.model
         result = _object(await self._request("thread/resume", params))
+        self._check_thread_permissions(result)
         thread = _object(result.get("thread"))
         if _object(thread.get("status")).get("type") == "active":
             try:
@@ -372,9 +488,15 @@ class AppServerClient:
         active_turn_id = await self.active_turn(thread_id)
         if active_turn_id:
             raise ActiveTurnError(thread_id, active_turn_id)
-        result = _object(await self._request("turn/start", {
+        params: dict[str, Any] = {
             "threadId": thread_id, "input": [{"type": "text", "text": text, "text_elements": []}],
-        }))
+        }
+        if self.read_only:
+            params["environments"] = []
+            params["approvalPolicy"] = "never"
+            params["permissions"] = READ_ONLY_PROFILE
+            params["runtimeWorkspaceRoots"] = []
+        result = _object(await self._request("turn/start", params))
         turn_id = _string(_object(result.get("turn")).get("id"))
         if not turn_id:
             raise RuntimeError("Codex turn/start 响应缺少 turn.id；请检查任务状态，勿自动重试")
@@ -384,6 +506,8 @@ class AppServerClient:
         await self._request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
 
     async def respond_approval(self, request_id: RequestId, decision: str) -> None:
+        if self.read_only:
+            raise ValueError("只读模式不允许提升执行权限")
         prompt = self._prompts.get(request_id)
         if not prompt or prompt.kind != "approval":
             raise ValueError("审批已失效或不属于当前连接")
@@ -431,10 +555,19 @@ class AppServerClient:
         if request_id in self._prompts:
             return
         thread_id, turn_id = _string(params.get("threadId")), _string(params.get("turnId"))
+        if method == "item/tool/call" and self.read_only:
+            if request_id not in self._tool_tasks:
+                task = self._track(self._dynamic_tool(request_id, params))
+                self._tool_tasks[request_id] = task
+                task.add_done_callback(lambda _: self._tool_tasks.pop(request_id, None))
+            return
         if method == "item/permissions/requestApproval":
             await self._write({"id": request_id, "result": {"permissions": {}, "scope": "turn"}})
             return
         if thread_id and turn_id and method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}:
+            if self.read_only:
+                await self._write({"id": request_id, "result": {"decision": "decline"}})
+                return
             detail = "\n".join(filter(None, [
                 _string(params.get("command")),
                 f"目录：{params['cwd']}" if params.get("cwd") else "",
@@ -465,6 +598,35 @@ class AppServerClient:
             self._emit(CodexEvent("question", thread_id=thread_id, turn_id=turn_id, request_id=request_id, questions=questions))
             return
         await self._write({"id": request_id, "error": {"code": -32601, "message": f"Unsupported server request: {method}"}})
+
+    async def _dynamic_tool(self, request_id: RequestId, params: dict[str, Any]) -> None:
+        """Keep the protocol reader free while the authorized query is running."""
+        thread_id, turn_id = _string(params.get("threadId")), _string(params.get("turnId"))
+        name, arguments = params.get("tool"), params.get("arguments")
+        generation = self._generation
+        success, text = False, "Query denied: invalid or unavailable query tool."
+        if (thread_id and turn_id and (params.get("namespace") is None or params.get("namespace") == "")
+                and isinstance(name, str) and name in self._tool_names
+                and isinstance(arguments, dict) and self.tool_handler is not None):
+            try:
+                async with asyncio.timeout(90):
+                    result = await self.tool_handler(thread_id, turn_id, name, arguments)
+                if not isinstance(result, dict):
+                    raise ValueError("Invalid query result")
+                encoded = json.dumps(result, ensure_ascii=False, allow_nan=False)
+                if len(encoded.encode("utf-8")) > 128_000:
+                    raise ValueError("Query result exceeds limit")
+                success, text = True, encoded
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Backend exceptions may contain CLI arguments, access tokens or
+                # source data. None of that is a valid user-facing error.
+                text = "Query failed or access was revoked. Narrow the request or contact the administrator."
+        if generation == self._generation and self._transport is not None:
+            await self._write({"id": request_id, "result": {
+                "contentItems": [{"type": "inputText", "text": text}], "success": success,
+            }})
 
     def _notification(self, method: str, params: dict[str, Any]) -> None:
         thread_id = _string(params.get("threadId"))

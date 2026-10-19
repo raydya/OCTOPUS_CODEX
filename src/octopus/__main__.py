@@ -17,6 +17,7 @@ from .config import Config, ConfigurationError, database_url_from_env
 from .contracts import CardAction, IncomingMessage, View
 from .feishu import FeishuMessenger
 from .store import Store
+from .queries import QueryClient, TOOL_SPECS
 
 log = logging.getLogger("octopus")
 STATUS_FILE = Path(os.environ.get("OCTOPUS_STATUS_FILE", "/run/octopus/status.json"))
@@ -42,7 +43,8 @@ def stop_event() -> asyncio.Event:
 
 def codex_client(config: Config) -> AppServerClient:
     return AppServerClient(executable=config.codex_executable, model=config.model,
-                           url=config.codex_url, token_file=config.codex_token_file)
+                           url=config.codex_url, token_file=config.codex_token_file,
+                           read_only=config.read_only, tool_specs=TOOL_SPECS if config.read_only else None)
 
 
 async def run(wait_for_config: bool) -> None:
@@ -56,7 +58,7 @@ async def run(wait_for_config: bool) -> None:
         log.warning("%s。填写本地配置后重建 bridge 容器；当前不会接收任务。", exc)
         await stop.wait()
         return
-    store = await Store.open(config.database_url, config.app_id)
+    store = await Store.open(config.database_url, config.app_id, migrate=config.database_migrate)
     bridge: Bridge | None = None
     try:
         if not config.allowed_users and not await store.owners():
@@ -78,7 +80,8 @@ async def run(wait_for_config: bool) -> None:
         if stop.is_set():
             return
         messenger = FeishuMessenger(config.app_id, config.app_secret, logger=log.info, bot_open_id=config.bot_open_id)
-        bridge = Bridge(config, store, messenger, codex_client(config))
+        queries = QueryClient(config.query_url, config.query_token_file) if config.read_only else None
+        bridge = Bridge(config, store, messenger, codex_client(config), queries=queries)
         await bridge.start()
         log.info("已启动应用 %s 的桥接进程；消息接收情况需在飞书验证。", config.app_id)
         while not stop.is_set() and not bridge.fatal.is_set():
@@ -111,7 +114,7 @@ async def run(wait_for_config: bool) -> None:
 async def pair() -> None:
     config = Config.from_env()
     stop = stop_event()
-    store = await Store.open(config.database_url, config.app_id)
+    store = await Store.open(config.database_url, config.app_id, migrate=config.database_migrate)
     messenger = FeishuMessenger(config.app_id, config.app_secret, logger=log.info, bot_open_id=config.bot_open_id)
     try:
         if not await store.acquire_service_lock():
@@ -164,20 +167,51 @@ async def pair() -> None:
 
 async def check() -> None:
     config = Config.from_env()
-    store = await Store.open(config.database_url, config.app_id)
+    store = await Store.open(config.database_url, config.app_id, migrate=config.database_migrate)
     client = codex_client(config)
     try:
         await client.start()
+        if config.read_only:
+            await QueryClient(config.query_url, config.query_token_file).check()
         print(f"App ID：{config.app_id}\nPostgreSQL：连接成功\nCodex：认证和协议握手成功")
+        if config.read_only:
+            print("只读配置核验：通过\n宿主机受控查询接口：连接成功")
         print("未执行模型任务。飞书权限和收发消息仍需配对时验证。")
     finally:
         await client.close()
         await store.close()
 
 
+async def manage(args: argparse.Namespace) -> None:
+    config = Config.from_env()
+    store = await Store.open(config.database_url, config.app_id, migrate=config.database_migrate)
+    try:
+        if args.operation == "list":
+            for member in await store.members():
+                print(member["open_id"], member["role"], "enabled" if member["enabled"] else "disabled")
+            return
+        import re
+        if not args.open_id or not re.fullmatch(r"ou_[A-Za-z0-9_-]{3,128}", args.open_id):
+            raise ConfigurationError("请指定此机器人应用下的 open_id")
+        await store.audit("local-admin", "member." + args.operation, args.open_id, "requested")
+        if args.operation == "add":
+            await store.ensure_member(args.open_id, "admin" if args.admin else "member")
+        else:
+            if not await store.member(args.open_id):
+                raise ConfigurationError("成员不存在")
+            await store.set_member_enabled(args.open_id, args.operation == "enable")
+        await store.audit("local-admin", "member." + args.operation, args.open_id, "complete")
+        print("成员设置已保存；运行中的桥接会自动检查撤权。")
+    finally:
+        await store.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="独立飞书应用与宿主机 Codex 的持续会话桥接")
-    parser.add_argument("command", choices=["run", "pair", "check", "health", "test-db"], nargs="?", default="run")
+    parser.add_argument("command", choices=["run", "pair", "check", "health", "members"], nargs="?", default="run")
+    parser.add_argument("operation", choices=["list", "add", "disable", "enable"], nargs="?", default="list")
+    parser.add_argument("open_id", nargs="?")
+    parser.add_argument("--admin", action="store_true")
     parser.add_argument("--wait-for-config", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -187,17 +221,13 @@ def main() -> int:
             return 0 if snapshot["state"] == "running" and time.time() - snapshot["time"] < 60 else 1
         except (OSError, ValueError, KeyError):
             return 1
-    if args.command == "test-db":
-        import unittest
-        os.environ["OCTOPUS_TEST_DATABASE_URL"] = database_url_from_env()
-        suite = unittest.defaultTestLoader.discover("/app/tests", pattern="test_store.py")
-        result = unittest.TextTestRunner(verbosity=2).run(suite)
-        return 0 if result.wasSuccessful() else 1
     try:
         if args.command == "run":
             asyncio.run(run(args.wait_for_config))
         elif args.command == "pair":
             asyncio.run(pair())
+        elif args.command == "members":
+            asyncio.run(manage(args))
         else:
             asyncio.run(check())
         return 0

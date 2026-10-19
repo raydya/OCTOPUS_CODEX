@@ -60,3 +60,15 @@ class ConfigTests(unittest.TestCase):
         with patch.dict(os.environ, self.env, clear=True):
             with self.assertRaisesRegex(ConfigurationError, "尚未配置：FEISHU_APP_SECRET"):
                 Config.from_env()
+
+    def test_readonly_never_downgrades_on_typo_and_requires_local_query_auth(self):
+        secure = {**self.env, "CODEX_READ_ONLY": "true", "QUERY_TOKEN_FILE": str(self.token)}
+        with patch.dict(os.environ, secure, clear=True):
+            self.assertTrue(Config.from_env().read_only)
+        for overrides in ({"CODEX_READ_ONLY": "treu"}, {"QUERY_HOST_URL": "http://evil.test"},
+                          {"QUERY_HOST_URL": "http://localhost:4501/path"},
+                          {"QUERY_TOKEN_FILE": ""},
+                          {"FEISHU_ALLOW_GROUPS": "true", "FEISHU_BOT_OPEN_ID": "ou_bot"}):
+            with self.subTest(overrides=overrides), patch.dict(os.environ, {**secure, **overrides}, clear=True):
+                with self.assertRaises(ConfigurationError):
+                    Config.from_env()

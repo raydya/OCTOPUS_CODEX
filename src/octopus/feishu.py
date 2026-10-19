@@ -25,6 +25,10 @@ HEARTBEAT_INTERVAL = 5.0
 HEARTBEAT_TIMEOUT = 30.0
 CONNECTION_TIMEOUT = 120.0
 TRUNCATION = "\n\n…内容较长，已截断显示。"
+# Cleanup retries use IDs returned by this app's successful create call. Feishu
+# reports these codes when that reaction, its message, or its chat is gone:
+# https://open.feishu.cn/document/server-docs/im-v1/message-reaction/delete
+REACTION_GONE_CODES = frozenset({231011, 231003, 230110, 231005, 232009})
 
 
 def _object(value: Any) -> dict[str, Any]:
@@ -109,9 +113,10 @@ def build_card(view: View) -> dict[str, Any]:
     card: dict[str, Any] = {
         "schema": "2.0",
         "config": {"update_multi": True, "width_mode": "default", "enable_forward": False},
-        "header": {"title": {"tag": "plain_text", "content": view.title[:80] or "Codex"},
-                   "template": colors.get(view.kind, "blue")},
     }
+    if view.title:
+        card["header"] = {"title": {"tag": "plain_text", "content": view.title[:80]},
+                          "template": colors.get(view.kind, "blue")}
 
     def set_text(text: str) -> None:
         elements: list[dict[str, Any]] = [{"tag": "markdown", "content": text or "…"}]
@@ -257,6 +262,21 @@ class _LarkApi:
         body = PatchMessageRequestBody.builder().content(content).build()
         request = PatchMessageRequest.builder().message_id(message_id).request_body(body).build()
         return self.client.im.v1.message.patch(request)
+
+    def add_reaction(self, message_id: str, emoji_type: str) -> Any:
+        from lark_oapi.api.im.v1 import (CreateMessageReactionRequest,
+                                        CreateMessageReactionRequestBody, Emoji)
+        emoji = Emoji.builder().emoji_type(emoji_type).build()
+        body = CreateMessageReactionRequestBody.builder().reaction_type(emoji).build()
+        request = (CreateMessageReactionRequest.builder().message_id(message_id)
+                   .request_body(body).build())
+        return self.client.im.v1.message_reaction.create(request)
+
+    def remove_reaction(self, message_id: str, reaction_id: str) -> Any:
+        from lark_oapi.api.im.v1 import DeleteMessageReactionRequest
+        request = (DeleteMessageReactionRequest.builder().message_id(message_id)
+                   .reaction_id(reaction_id).build())
+        return self.client.im.v1.message_reaction.delete(request)
 
 
 class FeishuMessenger:
@@ -406,6 +426,24 @@ class FeishuMessenger:
     async def update(self, message_id: str, view: View) -> None:
         await self._request("update", message_id, _json(build_card(view)))
 
+    async def add_reaction(self, message_id: str, emoji_type: str = "OneSecond") -> str:
+        if not isinstance(message_id, str) or not message_id.strip():
+            raise ValueError("A message ID is required for a Feishu reaction")
+        if not isinstance(emoji_type, str) or not emoji_type.strip():
+            raise ValueError("An emoji type is required for a Feishu reaction")
+        response = await self._request("add_reaction", message_id, emoji_type)
+        reaction_id = getattr(getattr(response, "data", None), "reaction_id", None)
+        if not isinstance(reaction_id, str) or not reaction_id.strip():
+            raise RuntimeError("Feishu add_reaction returned no reaction ID")
+        return reaction_id
+
+    async def remove_reaction(self, message_id: str, reaction_id: str) -> None:
+        if not isinstance(message_id, str) or not message_id.strip():
+            raise ValueError("A message ID is required for a Feishu reaction")
+        if not isinstance(reaction_id, str) or not reaction_id.strip():
+            raise ValueError("A reaction ID is required to remove a Feishu reaction")
+        await self._request("remove_reaction", message_id, reaction_id)
+
     async def _request(self, operation: str, *args: Any) -> Any:
         if self._closed:
             raise RuntimeError("Feishu messenger is closed")
@@ -422,6 +460,10 @@ class FeishuMessenger:
         except Exception:
             raise RuntimeError(f"Feishu {operation} failed; check connectivity and application permissions") from None
         code = getattr(response, "code", None)
+        if operation == "remove_reaction" and isinstance(code, int) and code in REACTION_GONE_CODES:
+            # DELETE may have succeeded before persisting cleanup (or before a
+            # lost HTTP response). Absence is already the desired final state.
+            return response
         if code != 0:
             suffix = f" (code {code})" if isinstance(code, int) else ""
             raise RuntimeError(f"Feishu {operation} failed{suffix}")
