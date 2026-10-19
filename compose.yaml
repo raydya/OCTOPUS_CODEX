@@ -1,0 +1,82 @@
+name: octopus-codex
+
+services:
+  bridge:
+    build: .
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+      FEISHU_APP_SECRET_FILE: /run/octopus/feishu_app_secret
+      FEISHU_ALLOWED_USERS: ${FEISHU_ALLOWED_USERS:-}
+      FEISHU_ALLOW_GROUPS: ${FEISHU_ALLOW_GROUPS:-false}
+      FEISHU_BOT_OPEN_ID: ${FEISHU_BOT_OPEN_ID:-}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-octopus}
+      POSTGRES_DB: ${POSTGRES_DB:-octopus}
+      POSTGRES_PASSWORD_FILE: /run/octopus/postgres_password
+      CODEX_URL: ws://host.docker.internal:${CODEX_PORT:-4500}
+      CODEX_TOKEN_FILE: /run/octopus/codex_token
+      CODEX_WORKSPACE: ${CODEX_WORKSPACE:-}
+      CODEX_MODEL: ${CODEX_MODEL:-}
+      MAX_CONCURRENT_TASKS: ${MAX_CONCURRENT_TASKS:-1}
+      TASK_TIMEOUT_SECONDS: ${TASK_TIMEOUT_SECONDS:-7200}
+      APPROVAL_TIMEOUT_SECONDS: ${APPROVAL_TIMEOUT_SECONDS:-900}
+      PROGRESS_INTERVAL_SECONDS: ${PROGRESS_INTERVAL_SECONDS:-2}
+    secrets:
+      - postgres_password
+      - codex_token
+      - feishu_app_secret
+    tmpfs:
+      - /run/octopus:rw,nosuid,nodev,size=16m,mode=0700
+    networks:
+      - database
+      - outbound
+    healthcheck:
+      test: ["CMD", "/opt/venv/bin/python", "-m", "octopus", "health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  db:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-octopus}
+      POSTGRES_DB: ${POSTGRES_DB:-octopus}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      PGDATA: /var/lib/postgresql/data
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - database
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+secrets:
+  postgres_password:
+    file: ./.secrets/postgres_password
+  codex_token:
+    file: ./.secrets/codex_token
+  feishu_app_secret:
+    file: ./.secrets/feishu_app_secret
+
+volumes:
+  postgres_data:
+
+networks:
+  database:
+    internal: true
+  outbound:

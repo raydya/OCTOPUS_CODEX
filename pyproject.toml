@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "octopus-codex"
+version = "0.1.0"
+description = "Persistent Feishu conversations with a local Codex agent"
+requires-python = ">=3.11"
+dependencies = [
+  "lark-oapi==1.7.5",
+  "psycopg[binary]>=3.2,<4",
+  "websockets==15.0.1",
+]
+
+[project.scripts]
+octopus = "octopus.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/octopus"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 110
