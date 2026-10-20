@@ -18,6 +18,7 @@ from dataclasses import asdict
 from typing import Any, Callable
 
 from .contracts import ActionHandler, CardAction, IncomingMessage, MessageHandler, View
+from .images import MAX_IMAGE_BYTES, MAX_IMAGES, ImageInputError
 
 CARD_BUDGET = 28_000
 DELIVERY_TIMEOUT = 2.0
@@ -30,6 +31,21 @@ TRUNCATION = "\n\n…内容较长，已截断显示。"
 # reports these codes when that reaction, its message, or its chat is gone:
 # https://open.feishu.cn/document/server-docs/im-v1/message-reaction/delete
 REACTION_GONE_CODES = frozenset({231011, 231003, 230110, 231005, 232009})
+IMAGE_DEFAULT_PROMPT = "请结合当前对话，分析这张图片中的内容并回答相关业务或代码问题。"
+IMAGE_INVALID = "无法读取这条消息中的图片，请重新发送图片。"
+IMAGE_LIMIT = f"每条消息最多支持 {MAX_IMAGES} 张不同图片，请分开发送。"
+POST_UNSUPPORTED = "这条图文消息包含暂不支持的附件，请改用文字和图片发送。"
+IMAGE_DOWNLOAD_FAILED = "图片下载失败，请稍后重新发送图片；如果仍然失败，请联系管理员。"
+IMAGE_TOO_LARGE = "图片超过 5 MiB，请压缩后重新发送。"
+IMAGE_DOWNLOAD_TIMEOUT = 45.0
+
+
+def _valid_image_key(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"img_[A-Za-z0-9_-]{1,252}", value) is not None
+
+
+def _valid_image_message_id(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"om_[A-Za-z0-9_-]{1,253}", value) is not None
 
 
 def _object(value: Any) -> dict[str, Any]:
@@ -40,12 +56,74 @@ def _string(value: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _parse_post(content: dict[str, Any]) -> tuple[str, tuple[str, ...], str]:
+    """Preserve paragraph and image order without treating URLs as resources."""
+    if "content" not in content:
+        languages = [content.get("zh_cn"), content.get("en_us"), *content.values()]
+        content = next((item for item in languages if isinstance(item, dict)), {})
+    rows = content.get("content")
+    if not isinstance(rows, list):
+        return "", (), POST_UNSUPPORTED
+    lines = [_string(content.get("title"))]
+    keys: list[str] = []
+    error = ""
+    for row in rows:
+        if not isinstance(row, list):
+            return "", (), POST_UNSUPPORTED
+        parts: list[str] = []
+        for raw in row:
+            item = _object(raw)
+            tag = item.get("tag")
+            if tag in ("text", "md", "code_block"):
+                if not isinstance(item.get("text"), str):
+                    error = error or POST_UNSUPPORTED
+                    continue
+                text = item["text"]
+                # Receive-event `content` expands Markdown images into `img`
+                # nodes. Do not download anything embedded in arbitrary text.
+                if tag == "md" and re.search(r"!\[[^\]\n]*\]\(\s*img_", text):
+                    error = error or POST_UNSUPPORTED
+                if tag == "code_block":
+                    text = "```\n" + text + "\n```"
+                parts.append(text)
+            elif tag == "a":
+                label, href = _string(item.get("text")), _string(item.get("href"))
+                parts.append(f"{label} ({href})" if label and href and label != href else label or href)
+            elif tag == "img":
+                key = item.get("image_key")
+                if not _valid_image_key(key):
+                    error = error or IMAGE_INVALID
+                elif key not in keys and len(keys) >= MAX_IMAGES:
+                    error = error or IMAGE_LIMIT
+                else:
+                    if key not in keys:
+                        keys.append(key)
+                    parts.append(f"[图片 {keys.index(key) + 1}]")
+            elif tag == "at":
+                # As with text messages, routing mentions are not part of the prompt.
+                continue
+            elif tag == "hr":
+                parts.append("\n---\n")
+            elif tag == "emotion":
+                parts.append("[表情 " + _string(item.get("emoji_type")) + "]")
+            else:
+                # A video's cover image is not the video. Never silently answer
+                # a partial message after dropping an unsupported attachment.
+                error = error or POST_UNSUPPORTED
+        lines.append("".join(parts))
+    text = "\n".join(lines).strip()
+    if keys and not any(re.sub(r"\[图片 \d+\]", "", line).strip() for line in lines):
+        text = "请结合当前对话，分析所附图片中的内容并回答相关业务或代码问题。\n" + text
+    return text, tuple(keys), error
+
+
 def parse_message(value: Any, *, require_group_mention: bool = True,
                   bot_open_id: str | None = None) -> IncomingMessage | None:
     root = _object(value)
     event = _object(root.get("event", root))
     sender, message = _object(event.get("sender")), _object(event.get("message"))
-    if sender.get("sender_type") != "user" or message.get("message_type") != "text":
+    message_type = message.get("message_type")
+    if sender.get("sender_type") != "user" or message_type not in ("text", "image", "post"):
         return None
     sender_id = _string(_object(sender.get("sender_id")).get("open_id"))
     message_id, chat_id = _string(message.get("message_id")), _string(message.get("chat_id"))
@@ -59,20 +137,40 @@ def parse_message(value: Any, *, require_group_mention: bool = True,
             _object(item.get("id")).get("open_id") == bot_open_id for item in mentions):
             return None
     try:
-        text = _object(json.loads(message.get("content", ""))).get("text")
         created_at = int(message.get("create_time", ""))
     except (ValueError, TypeError):
         return None
-    if not isinstance(text, str) or created_at <= 0:
+    if created_at <= 0:
         return None
+    try:
+        content = _object(json.loads(message.get("content", "")))
+    except (ValueError, TypeError):
+        if message_type == "text":
+            return None
+        content = {}
+    image_keys: tuple[str, ...] = ()
+    error = ""
+    if message_type == "text":
+        text = content.get("text")
+        if not isinstance(text, str):
+            return None
+    elif message_type == "image":
+        text = IMAGE_DEFAULT_PROMPT
+        if _valid_image_key(content.get("image_key")):
+            image_keys = (content["image_key"],)
+        else:
+            error = IMAGE_INVALID
+    else:
+        text, image_keys, error = _parse_post(content)
     for mention in mentions:
         key = _string(mention.get("key"))
         if key:
             text = text.replace(key, "")
     text = text.strip()
-    if not text:
+    if not text and not error:
         return None
-    return IncomingMessage(message_id, chat_id, sender_id, text, chat_type, created_at)
+    return IncomingMessage(message_id, chat_id, sender_id, text or "请分析这条消息。",
+                           chat_type, created_at, image_keys=image_keys, attachment_error=error)
 
 
 def parse_action(value: Any) -> CardAction | None:
@@ -287,6 +385,76 @@ class _LarkApi:
                    .reaction_id(reaction_id).build())
         return self.client.im.v1.message_reaction.delete(request)
 
+    def download_image(self, message_id: str, image_key: str) -> bytes:
+        """Download only a resource belonging to the triggering message.
+
+        The SDK's resource helper buffers response.content before returning.
+        Reuse its per-app tenant-token cache, but bound the actual download.
+        """
+        import requests
+        from lark_oapi.core.token import TokenManager
+
+        if not _valid_image_message_id(message_id) or not _valid_image_key(image_key):
+            raise ImageInputError(IMAGE_INVALID)
+        deadline = time.monotonic() + IMAGE_DOWNLOAD_TIMEOUT
+        try:
+            token = TokenManager.get_self_tenant_token(self.client.config)
+            if not isinstance(token, str) or not token or time.monotonic() >= deadline:
+                raise ImageInputError(IMAGE_DOWNLOAD_FAILED)
+            # Both components are restricted path segments; never use a
+            # sender-supplied URL, SDK domain override or redirect target.
+            url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{image_key}"
+            with requests.get(url, params={"type": "image"},
+                              headers={"Authorization": f"Bearer {token}", "Accept-Encoding": "identity"},
+                              auth=lambda request: request, stream=True, allow_redirects=False,
+                              timeout=(5, 10)) as response:
+                if response.status_code != 200:
+                    # Inspect only a bounded code field, never return API text.
+                    error_body = response.raw.read1(4096, decode_content=False)
+                    try:
+                        error_code = _object(json.loads(error_body)).get("code")
+                    except (ValueError, TypeError, UnicodeError):
+                        error_code = None
+                    if error_code == 99991672:
+                        raise ImageInputError(
+                            "图片读取权限尚未开通，请管理员为机器人启用 im:message:readonly 权限并发布应用版本。")
+                    raise ImageInputError(IMAGE_DOWNLOAD_FAILED)
+                if response.headers.get("Content-Encoding", "").lower() not in ("", "identity"):
+                    raise ImageInputError(IMAGE_DOWNLOAD_FAILED)
+                content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                if content_type and not (content_type.startswith("image/")
+                                         or content_type == "application/octet-stream"):
+                    raise ImageInputError(IMAGE_DOWNLOAD_FAILED)
+                declared_size = response.headers.get("Content-Length")
+                if declared_size is not None:
+                    if not declared_size.isascii() or not declared_size.isdecimal():
+                        raise ImageInputError(IMAGE_DOWNLOAD_FAILED)
+                    if int(declared_size) > MAX_IMAGE_BYTES:
+                        raise ImageInputError(IMAGE_TOO_LARGE)
+                data = bytearray()
+                while True:
+                    if time.monotonic() >= deadline:
+                        raise ImageInputError(IMAGE_DOWNLOAD_FAILED)
+                    # read1 returns after at most one underlying read, unlike
+                    # iter_content which may wait forever to fill a large block
+                    # from a peer sending a few bytes before every read timeout.
+                    chunk = response.raw.read1(min(64 * 1024, MAX_IMAGE_BYTES - len(data) + 1),
+                                               decode_content=False)
+                    if time.monotonic() >= deadline:
+                        raise ImageInputError(IMAGE_DOWNLOAD_FAILED)
+                    if not chunk:
+                        break
+                    if len(data) + len(chunk) > MAX_IMAGE_BYTES:
+                        raise ImageInputError(IMAGE_TOO_LARGE)
+                    data.extend(chunk)
+                if not data:
+                    raise ImageInputError(IMAGE_INVALID)
+                return bytes(data)
+        except ImageInputError:
+            raise
+        except Exception:
+            raise ImageInputError(IMAGE_DOWNLOAD_FAILED) from None
+
 
 class FeishuMessenger:
     def __init__(self, app_id: str, app_secret: str, logger: Callable[[str], None] | None = None,
@@ -449,7 +617,7 @@ class FeishuMessenger:
     async def update(self, message_id: str, view: View) -> None:
         await self._request("update", message_id, _json(build_card(view)))
 
-    async def add_reaction(self, message_id: str, emoji_type: str = "OneSecond") -> str:
+    async def add_reaction(self, message_id: str, emoji_type: str = "Typing") -> str:
         if not isinstance(message_id, str) or not message_id.strip():
             raise ValueError("A message ID is required for a Feishu reaction")
         if not isinstance(emoji_type, str) or not emoji_type.strip():
@@ -467,19 +635,39 @@ class FeishuMessenger:
             raise ValueError("A reaction ID is required to remove a Feishu reaction")
         await self._request("remove_reaction", message_id, reaction_id)
 
+    async def download_image(self, message_id: str, image_key: str) -> bytes:
+        if not _valid_image_message_id(message_id) or not _valid_image_key(image_key):
+            raise ImageInputError(IMAGE_INVALID)
+        if self._closed:
+            raise ImageInputError(IMAGE_DOWNLOAD_FAILED)
+        try:
+            data = await self._invoke("download_image", message_id, image_key)
+        except ImageInputError:
+            raise
+        except Exception:
+            raise ImageInputError(IMAGE_DOWNLOAD_FAILED) from None
+        if not isinstance(data, bytes) or not data:
+            raise ImageInputError(IMAGE_INVALID)
+        if len(data) > MAX_IMAGE_BYTES:
+            raise ImageInputError(IMAGE_TOO_LARGE)
+        return data
+
+    async def _invoke(self, operation: str, *args: Any) -> Any:
+        if self._api is None:
+            if self._api_init_lock is None:
+                self._api_init_lock = asyncio.Lock()
+            async with self._api_init_lock:
+                if self._api is None:
+                    self._api = await asyncio.to_thread(_LarkApi, self._app_id, self._app_secret)
+        # SDK authentication performs synchronous I/O even in its async API.
+        # Keep all SDK HTTP work off the parent inbox event loop.
+        return await asyncio.to_thread(getattr(self._api, operation), *args)
+
     async def _request(self, operation: str, *args: Any) -> Any:
         if self._closed:
             raise RuntimeError("Feishu messenger is closed")
         try:
-            if self._api is None:
-                if self._api_init_lock is None:
-                    self._api_init_lock = asyncio.Lock()
-                async with self._api_init_lock:
-                    if self._api is None:
-                        self._api = await asyncio.to_thread(_LarkApi, self._app_id, self._app_secret)
-            # SDK authentication performs synchronous I/O even in its async API.
-            # Keep all SDK HTTP work off the parent inbox event loop.
-            response = await asyncio.to_thread(getattr(self._api, operation), *args)
+            response = await self._invoke(operation, *args)
         except Exception:
             raise RuntimeError(f"Feishu {operation} failed; check connectivity and application permissions") from None
         code = getattr(response, "code", None)

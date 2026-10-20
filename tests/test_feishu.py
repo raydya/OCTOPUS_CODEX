@@ -5,11 +5,12 @@ import json
 import unittest
 from dataclasses import asdict
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 from octopus.contracts import Button, CardAction, View
 from octopus.feishu import (CARD_BUDGET, FeishuMessenger, _LarkApi, _heartbeat, _post_with_timeout, _roundtrip,
                             build_card, parse_action, parse_message)
+from octopus.images import MAX_IMAGE_BYTES, MAX_IMAGES, ImageInputError
 
 
 def incoming(**changes):
@@ -24,7 +25,7 @@ def incoming(**changes):
 class ParserTests(unittest.TestCase):
     def test_messages_filter_and_remove_mentions(self):
         self.assertEqual(parse_message(incoming()).text, "hello")
-        for changes in ({"message_type": "image"}, {"content": "not-json"},
+        for changes in ({"message_type": "file"}, {"content": "not-json"},
                         {"chat_type": "group"}, {"create_time": "bad"}):
             self.assertIsNone(parse_message(incoming(**changes)))
         bot = incoming()
@@ -39,6 +40,100 @@ class ParserTests(unittest.TestCase):
                              mentions=[{"key": "@_user_2", "id": {"open_id": "ou_colleague"}}])
         self.assertIsNone(parse_message(colleague, bot_open_id="ou_bot"))
         self.assertIsNotNone(parse_message(incoming(chat_type="group"), require_group_mention=False))
+
+    def test_image_event_has_default_prompt_and_validated_resource_key(self):
+        message = parse_message(incoming(message_type="image",
+                                         content=json.dumps({"image_key": "img_v3_example-1"})))
+        self.assertEqual(message.image_keys, ("img_v3_example-1",))
+        self.assertIn("图片", message.text)
+        self.assertEqual(message.attachment_error, "")
+        for content in ("not-json", "[]", "{}", json.dumps({"image_key": "https://example.invalid/image"}),
+                        json.dumps({"image_key": "img_../../secret"}),
+                        json.dumps({"image_key": "img_bad?token=secret"}),
+                        json.dumps({"image_key": "img_" + "a" * 253}),
+                        json.dumps({"image_key": None})):
+            with self.subTest(content=content):
+                rejected = parse_message(incoming(message_type="image", content=content))
+                self.assertTrue(rejected.attachment_error)
+                self.assertEqual(rejected.image_keys, ())
+                self.assertNotIn("secret", rejected.attachment_error)
+
+    def test_image_and_post_enforce_user_identity_and_group_mention_before_parsing(self):
+        for kind, content in (("image", {"image_key": "img_example"}),
+                              ("post", {"content": [[{"tag": "img", "image_key": "img_example"}]]})):
+            group = incoming(message_type=kind, chat_type="group", content=json.dumps(content))
+            self.assertIsNone(parse_message(group, bot_open_id="ou_bot"))
+            group["event"]["message"]["mentions"] = [{"key": "@_user_1", "id": {"open_id": "ou_bot"}}]
+            self.assertIsNotNone(parse_message(group, bot_open_id="ou_bot"))
+            self.assertIsNone(parse_message(group, bot_open_id="ou_other"))
+            group["event"]["sender"]["sender_type"] = "bot"
+            self.assertIsNone(parse_message(group, bot_open_id="ou_bot"))
+        for field in ("message_id", "chat_id", "create_time"):
+            event = incoming(message_type="image", content=json.dumps({"image_key": "img_example"}))
+            event["event"]["message"][field] = ""
+            self.assertIsNone(parse_message(event))
+
+    def test_post_preserves_text_links_paragraphs_and_deduplicated_image_order(self):
+        post = {"title": "排查问题", "content": [
+            [{"tag": "at", "user_id": "ou_bot"}, {"tag": "text", "text": "请看"},
+             {"tag": "a", "text": "业务文档", "href": "https://example.invalid/docs"}],
+            [{"tag": "img", "image_key": "img_second"}, {"tag": "text", "text": "出现错误"},
+             {"tag": "img", "image_key": "img_first"}],
+            [{"tag": "img", "image_key": "img_second"}],
+            [{"tag": "code_block", "language": "SQL", "text": "select 1;"}],
+        ]}
+        message = parse_message(incoming(message_type="post", content=json.dumps(post)))
+        self.assertEqual(message.image_keys, ("img_second", "img_first"))
+        self.assertEqual(message.attachment_error, "")
+        self.assertEqual(message.text, "排查问题\n请看业务文档 (https://example.invalid/docs)\n"
+                                      "[图片 1]出现错误[图片 2]\n[图片 1]\n```\nselect 1;\n```")
+
+    def test_post_locale_selection_and_images_without_text(self):
+        chinese = {"content": [[{"tag": "img", "image_key": "img_cn"}]]}
+        english = {"title": "English", "content": [[{"tag": "text", "text": "hello"}]]}
+        for content, expected_keys, expected_text in (
+                ({"en_us": english, "zh_cn": chinese}, ("img_cn",), "图片"),
+                ({"ja_jp": chinese, "en_us": english}, (), "English\nhello"),
+                ({"ja_jp": chinese}, ("img_cn",), "图片")):
+            message = parse_message(incoming(message_type="post", content=json.dumps(content)))
+            self.assertEqual(message.image_keys, expected_keys)
+            self.assertIn(expected_text, message.text)
+            self.assertEqual(message.attachment_error, "")
+
+    def test_post_rejects_too_many_images_without_silently_truncating_input(self):
+        images = [{"tag": "img", "image_key": f"img_{index}"} for index in range(MAX_IMAGES)]
+        valid = parse_message(incoming(message_type="post", content=json.dumps({"content": [images * 3]})))
+        self.assertEqual(len(valid.image_keys), MAX_IMAGES)
+        self.assertEqual(valid.attachment_error, "")
+        invalid = parse_message(incoming(message_type="post", content=json.dumps(
+            {"content": [images + [{"tag": "img", "image_key": "img_extra"}]]})))
+        self.assertIn(str(MAX_IMAGES), invalid.attachment_error)
+        self.assertEqual(len(invalid.image_keys), MAX_IMAGES)
+
+    def test_post_rejects_unsupported_attachments_malformed_nodes_and_invalid_keys(self):
+        for content in (
+                {}, {"content": "not-a-list"}, {"content": ["not-a-row"]},
+                {"content": [[{"tag": "media", "image_key": "img_cover", "file_key": "file_video"}]]},
+                {"content": [[{"tag": "file", "file_key": "file_abc"}]]},
+                {"content": [[{"tag": "img", "image_key": "file_abc"}]]},
+                {"content": [[{"tag": "text", "text": []}]]},
+                {"content": [[42]]},
+                {"content": [[{"tag": "md", "text": "![embedded](img_abc)"}]]},
+        ):
+            with self.subTest(content=content):
+                message = parse_message(incoming(message_type="post", content=json.dumps(content)))
+                self.assertTrue(message.attachment_error)
+                self.assertEqual(message.image_keys, ())
+
+    def test_arbitrary_links_and_plain_markdown_are_text_not_image_downloads(self):
+        content = {"content": [[{"tag": "text", "text": "https://example.invalid/screenshot.png"},
+                               {"tag": "a", "href": "http://127.0.0.1/private.jpg", "text": "链接"}],
+                              [{"tag": "md", "text": "**hello**"}]]}
+        message = parse_message(incoming(message_type="post", content=json.dumps(content)))
+        self.assertEqual(message.image_keys, ())
+        self.assertEqual(message.attachment_error, "")
+        self.assertIn("http://127.0.0.1/private.jpg", message.text)
+        self.assertIn("**hello**", message.text)
 
     def test_action_requires_exact_decision_operator_and_context(self):
         event = {"operator": {"open_id": "ou_owner"},
@@ -108,6 +203,38 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             await messenger.update("om_reply", view)
         await messenger.close()
 
+    async def test_download_image_binds_message_and_key_and_checks_result(self):
+        messenger, api = self.messenger()
+        api.download_image.return_value = b"image-data"
+        self.assertEqual(await messenger.download_image("om_input", "img_input"), b"image-data")
+        api.download_image.assert_called_once_with("om_input", "img_input")
+        for data in (None, "", b"", b"x" * (MAX_IMAGE_BYTES + 1)):
+            api.download_image.return_value = data
+            with self.assertRaises(ImageInputError):
+                await messenger.download_image("om_input", "img_input")
+        await messenger.close()
+        with self.assertRaises(ImageInputError):
+            await messenger.download_image("om_input", "img_input")
+
+    async def test_download_invalid_resources_do_not_call_api(self):
+        messenger, api = self.messenger()
+        for message_id, image_key in (("", "img_ok"), ("om_../outside", "img_ok"),
+                                      ("om_ok", "https://example.invalid/a"),
+                                      ("om_ok", "img_a?type=file"), (None, "img_ok")):
+            with self.assertRaises(ImageInputError):
+                await messenger.download_image(message_id, image_key)
+        api.download_image.assert_not_called()
+        await messenger.close()
+
+    async def test_download_failure_does_not_expose_credentials_or_response_text(self):
+        messenger, api = self.messenger()
+        api.download_image.side_effect = RuntimeError("Bearer private-token response private-content")
+        with self.assertRaises(ImageInputError) as error:
+            await messenger.download_image("om_input", "img_input")
+        self.assertNotIn("private", str(error.exception))
+        self.assertEqual(self.logs, [])
+        await messenger.close()
+
     async def test_send_user_keeps_durable_request_id_across_retries(self):
         messenger, api = self.messenger()
         request_id = "f76b28d7-4b7c-48e6-8b73-9b5d1b324187"
@@ -172,7 +299,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         api.add_reaction.return_value = SimpleNamespace(code=0, data=SimpleNamespace(reaction_id="reaction_1"))
         api.remove_reaction.return_value = SimpleNamespace(code=0)
         self.assertEqual(await messenger.add_reaction("om_input"), "reaction_1")
-        api.add_reaction.assert_called_once_with("om_input", "OneSecond")
+        api.add_reaction.assert_called_once_with("om_input", "Typing")
         await messenger.remove_reaction("om_input", "reaction_1")
         api.remove_reaction.assert_called_once_with("om_input", "reaction_1")
         await messenger.add_reaction("om_input", "DONE")
@@ -328,10 +455,10 @@ class ReactionSdkTests(unittest.TestCase):
         api = _LarkApi.__new__(_LarkApi)
         api.client = Mock()
         resource = api.client.im.v1.message_reaction
-        self.assertIs(api.add_reaction("om_input", "OneSecond"), resource.create.return_value)
+        self.assertIs(api.add_reaction("om_input", "Typing"), resource.create.return_value)
         request = resource.create.call_args.args[0]
         self.assertEqual(request.paths, {"message_id": "om_input"})
-        self.assertEqual(request.request_body.reaction_type.emoji_type, "OneSecond")
+        self.assertEqual(request.request_body.reaction_type.emoji_type, "Typing")
         self.assertEqual(request.uri, "/open-apis/im/v1/messages/:message_id/reactions")
         self.assertIs(api.remove_reaction("om_input", "reaction_1"), resource.delete.return_value)
         request = resource.delete.call_args.args[0]
@@ -368,6 +495,123 @@ class ReactionSdkTests(unittest.TestCase):
         request = resource.reply.call_args.args[0]
         self.assertEqual(request.paths, {"message_id": "om_input"})
         self.assertEqual(request.request_body.uuid, "request2")
+
+
+class ImageDownloadSdkTests(unittest.TestCase):
+    def setUp(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.api = _LarkApi.__new__(_LarkApi)
+        self.api.client = SimpleNamespace(config=object())
+        self.response = Mock()
+        self.response.status_code = 200
+        self.response.headers = {"Content-Type": "image/png"}
+        self.response.raw.read1.side_effect = [b"first", b"second", b""]
+        self.context = Mock()
+        self.context.__enter__ = Mock(return_value=self.response)
+        self.context.__exit__ = Mock(return_value=False)
+        self.get = patch("requests.get", return_value=self.context).start()
+        self.token = patch("lark_oapi.core.token.TokenManager.get_self_tenant_token",
+                           return_value="app-private-token").start()
+        self.addCleanup(patch.stopall)
+
+    def tearDown(self):
+        self.loop.close()
+        asyncio.set_event_loop(None)
+
+    def test_streams_exact_message_resource_using_same_app_token_without_redirects(self):
+        self.assertEqual(self.api.download_image("om_event", "img_v3_key"), b"firstsecond")
+        self.token.assert_called_once_with(self.api.client.config)
+        self.get.assert_called_once()
+        self.assertEqual(self.get.call_args.args,
+                         ("https://open.feishu.cn/open-apis/im/v1/messages/om_event/resources/img_v3_key",))
+        options = self.get.call_args.kwargs
+        self.assertEqual(options["params"], {"type": "image"})
+        self.assertEqual(options["headers"]["Authorization"], "Bearer app-private-token")
+        self.assertEqual(options["headers"]["Accept-Encoding"], "identity")
+        self.assertTrue(options["stream"])
+        self.assertFalse(options["allow_redirects"])
+        self.assertEqual(options["timeout"], (5, 10))
+        self.assertEqual(self.response.raw.read1.call_args_list,
+                         [call(65536, decode_content=False)] * 3)
+        self.context.__exit__.assert_called_once()
+
+    def test_invalid_identifiers_never_fetch_token_or_make_network_requests(self):
+        for message_id, image_key in (("om_../../secret", "img_a"), ("om_a", "img_../secret"),
+                                      ("om_a", "img_a#fragment"), ("om_a\n", "img_a")):
+            with self.assertRaises(ImageInputError):
+                self.api.download_image(message_id, image_key)
+        self.token.assert_not_called()
+        self.get.assert_not_called()
+
+    def test_declared_size_and_actual_stream_size_are_both_enforced(self):
+        self.response.headers["Content-Length"] = str(MAX_IMAGE_BYTES + 1)
+        with self.assertRaisesRegex(ImageInputError, "5 MiB"):
+            self.api.download_image("om_event", "img_key")
+        self.response.raw.read1.assert_not_called()
+        del self.response.headers["Content-Length"]
+        with patch("octopus.feishu.MAX_IMAGE_BYTES", 8):
+            with self.assertRaisesRegex(ImageInputError, "5 MiB"):
+                self.api.download_image("om_event", "img_key")
+        self.assertEqual(self.response.raw.read1.call_args_list,
+                         [call(9, decode_content=False), call(4, decode_content=False)])
+        self.assertEqual(self.context.__exit__.call_count, 2)
+
+    def test_accepts_exact_limit_and_refuses_empty_body(self):
+        self.response.raw.read1.side_effect = [b"1234", b"5678", b""]
+        with patch("octopus.feishu.MAX_IMAGE_BYTES", 8):
+            self.assertEqual(self.api.download_image("om_event", "img_key"), b"12345678")
+        self.assertEqual(self.response.raw.read1.call_args_list[-1], call(1, decode_content=False))
+        self.response.raw.read1.side_effect = [b""]
+        with self.assertRaises(ImageInputError):
+            self.api.download_image("om_event", "img_key")
+
+    def test_deadline_stops_slow_progress_and_closes_response(self):
+        with patch("octopus.feishu.time.monotonic", side_effect=[0, 0, 1, 46]):
+            with self.assertRaises(ImageInputError):
+                self.api.download_image("om_event", "img_key")
+        self.response.raw.read1.assert_called_once()
+        self.context.__exit__.assert_called_once()
+
+    def test_rejects_compression_non_images_redirects_and_malformed_lengths(self):
+        for status, headers in (
+                (200, {"Content-Encoding": "gzip"}),
+                (200, {"Content-Type": "application/json"}),
+                (200, {"Content-Length": "-1"}),
+                (200, {"Content-Length": "five"}),
+                (302, {"Location": "https://attacker.invalid/?token=private"}),
+                (401, {}), (404, {}),
+        ):
+            with self.subTest(status=status, headers=headers):
+                self.response.status_code, self.response.headers = status, headers
+                self.response.raw.read1.side_effect = [b'{"code":234003,"msg":"private details"}']
+                with self.assertRaises(ImageInputError) as error:
+                    self.api.download_image("om_event", "img_key")
+                self.assertNotIn("private", str(error.exception))
+                self.assertNotIn("attacker", str(error.exception))
+        self.assertEqual(self.context.__exit__.call_count, 7)
+
+    def test_permission_error_only_exposes_fixed_required_scope_guidance(self):
+        self.response.status_code = 403
+        self.response.raw.read1.side_effect = [b'{"code":99991672,"msg":"secret response"}']
+        with self.assertRaisesRegex(ImageInputError, "im:message:readonly") as error:
+            self.api.download_image("om_event", "img_key")
+        self.assertIn("发布", str(error.exception))
+        self.assertNotIn("secret", str(error.exception))
+        self.response.raw.read1.assert_called_once_with(4096, decode_content=False)
+
+    def test_token_and_network_errors_are_sanitized(self):
+        self.token.side_effect = RuntimeError("private token response")
+        with self.assertRaises(ImageInputError) as error:
+            self.api.download_image("om_event", "img_key")
+        self.assertNotIn("private", str(error.exception))
+        self.get.assert_not_called()
+        self.token.side_effect = None
+        self.response.raw.read1.side_effect = TimeoutError("Authorization: private-token")
+        with self.assertRaises(ImageInputError) as error:
+            self.api.download_image("om_event", "img_key")
+        self.assertNotIn("private", str(error.exception))
+        self.context.__exit__.assert_called_once()
 
 
 class ListenerHealthTests(unittest.TestCase):

@@ -16,6 +16,7 @@ from .code_reader import redact
 from .queries import QueryClient, TOOL_NAMES
 from .privacy import dms_request_allowed, privacy_request_denied, redact_private_text
 from .access import ACCESS_COMMANDS, AccessRequests
+from .images import MAX_IMAGES, MAX_TOTAL_IMAGE_BYTES, ImageInputError, prepare_image
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ _BUSINESS_DATA_TOOLS = frozenset({"business_data_checks", "business_data_check"}
 _CONTEXT_FIELDS = frozenset({"context", "actor", "job_id", "thread_id", "turn_id", "question", "policy_version"})
 
 HELP = """直接发消息即可开始或继续当前对话。同一聊天中的每位用户有独立会话。
+支持图片和图文提问，每条最多4张图片，总大小不超过5 MiB。
 
 /new — 开启新会话（旧会话保存在 Codex）
 /status — 查看执行和排队状态
@@ -234,7 +236,7 @@ class Bridge:
             self._background(self._notice(message, "无法提供此类数据", PRIVACY_REFUSAL))
             return
         await self.store.session(key, message.chat_id, message.sender_id)
-        if message.text.strip().startswith("/"):
+        if message.text.strip().startswith("/") and not message.image_keys and not message.attachment_error:
             if self.config.read_only:
                 limit = 4000 if message.text.strip().split()[0].lower() == "/answer" else 512
                 if len(message.text) > limit:
@@ -281,7 +283,7 @@ class Bridge:
     async def _acknowledge(self, message: IncomingMessage) -> None:
         try:
             if not await self.store.get_reaction(message.id):
-                reaction_id = await self.messenger.add_reaction(message.id, "OneSecond")
+                reaction_id = await self.messenger.add_reaction(message.id, "Typing")
                 try:
                     await self.store.save_reaction(message.id, reaction_id)
                 except Exception:
@@ -290,7 +292,7 @@ class Bridge:
                     raise
         except Exception:
             # A cosmetic acknowledgement must not lose or block accepted work.
-            log.warning("稍等表情添加失败；请检查连接及 im:message.reactions:write_only 权限，任务将继续")
+            log.warning("Typing 表情添加失败；请检查连接及 im:message.reactions:write_only 权限，任务将继续")
         # /stop may have cancelled a queued job during the HTTP request.
         self._reaction_cleanup_wakeup.set()
 
@@ -315,7 +317,7 @@ class Bridge:
                     await self.store.clear_reaction(message_id, reaction_id)
                 except Exception:
                     # Keep the ID so another completion or restart can retry.
-                    log.warning("稍等表情移除失败，将在后续任务结束或重启时重试")
+                    log.warning("任务表情移除失败，将在后续任务结束或重启时重试")
         except Exception:
             log.warning("无法读取待清理表情，将在后续任务结束或重启时重试")
 
@@ -516,6 +518,10 @@ class Bridge:
             return {"ok": False, "error": PRIVACY_REFUSAL}
         if arguments.keys() & _CONTEXT_FIELDS:
             return {"ok": False, "error": "查询参数不能指定任务身份或授权上下文。"}
+        if tool in _BUSINESS_DATA_TOOLS and active.job.message.image_keys:
+            await self._audit(actor, "data.image_request", tool, "deny", active.job.id)
+            return {"ok": False, "error": "图片消息可结合代码、日志和文档分析，但不能据图片内容授权数据库查询。"
+                    "如需核验生产数据，请用户另发一条文字消息描述具体业务问题；本轮不要尝试其他方式查询数据库。"}
         if tool in _BUSINESS_DATA_TOOLS and (
                 not active.data_checks_allowed or not dms_request_allowed(active.job.message.text)):
             await self._audit(actor, "data.request", tool, "deny", active.job.id)
@@ -613,6 +619,41 @@ class Bridge:
             if len(controls) >= 100:
                 self.control_wakeup.set()
 
+    async def _image_inputs(self, job: Any) -> tuple[str, ...] | None:
+        """Prepare only this accepted message's attachments, outside the inbox ACK."""
+        if job.message.attachment_error:
+            raise ImageInputError(job.message.attachment_error)
+        if len(job.message.image_keys) > MAX_IMAGES:
+            raise ImageInputError("每条消息最多支持4张图片，请分开发送。")
+        inputs: list[str] = []
+        downloaded_size = encoded_size = 0
+        try:
+            async with asyncio.timeout(60):
+                for image_key in job.message.image_keys:
+                    if (self.closed or job.session_key in self._stop_starting
+                            or not await self._authorized(job.message.sender_id)):
+                        return None
+                    try:
+                        raw = await self.messenger.download_image(job.message.id, image_key)
+                    except ImageInputError:
+                        raise
+                    except Exception:
+                        raise ImageInputError("图片下载失败，请稍后重新发送；若持续失败，请联系管理员检查图片读取权限。") from None
+                    downloaded_size += len(raw)
+                    if downloaded_size > MAX_TOTAL_IMAGE_BYTES:
+                        raise ImageInputError("每条消息的图片总大小不能超过5 MiB，请压缩或分开发送。")
+                    image = await asyncio.to_thread(prepare_image, raw)
+                    del raw
+                    payload = image.partition(",")[2]
+                    padding = len(payload) - len(payload.rstrip("="))
+                    encoded_size += len(payload) // 4 * 3 - padding
+                    if encoded_size > MAX_TOTAL_IMAGE_BYTES:
+                        raise ImageInputError("图片处理后总大小超过5 MiB，请缩小图片或分开发送。")
+                    inputs.append(image)
+        except TimeoutError:
+            raise ImageInputError("图片读取超时，请稍后重新发送。") from None
+        return tuple(inputs)
+
     async def _run_job(self, job: Any) -> None:
         active: Active | None = None
         persisted_result = False
@@ -631,6 +672,11 @@ class Bridge:
             if not await self._authorized(job.message.sender_id):
                 await self.store.finish_job(job.id, "member_disabled")
                 return
+            images = await self._image_inputs(job)
+            if (images is None or self.closed or job.session_key in self._stop_starting
+                    or not await self._authorized(job.message.sender_id)):
+                await self.store.finish_job(job.id, "任务已取消或成员已停用")
+                return
             session = await self.store.get_session(job.session_key)
             if session.thread_id:
                 thread_id = session.thread_id
@@ -638,12 +684,17 @@ class Bridge:
             else:
                 thread_id = await self.codex.create_thread(self.config.workspace)
                 await self.store.set_thread(job.session_key, thread_id)
-            active = Active(job, thread_id, asyncio.get_running_loop().create_future())
+            active = Active(job, thread_id, asyncio.get_running_loop().create_future(),
+                            data_checks_allowed=not bool(job.message.image_keys))
             self.active[thread_id] = active
             if job.session_key in self._stop_starting or not await self._authorized(job.message.sender_id):
                 active.done.set_result(CodexEvent("completed", thread_id=thread_id, status="interrupted"))
             else:
-                active.turn_id = await self.codex.start_turn(thread_id, job.message.text)
+                if images:
+                    active.turn_id = await self.codex.start_turn(thread_id, job.message.text, images=images)
+                else:
+                    active.turn_id = await self.codex.start_turn(thread_id, job.message.text)
+                images = ()
                 active.turn_ready.set()
                 if active.stopping:
                     await self.codex.interrupt(thread_id, active.turn_id)
@@ -665,6 +716,17 @@ class Bridge:
         except asyncio.CancelledError:
             # Leave durable running state for restart recovery; never auto-replay it.
             raise
+        except ImageInputError as exc:
+            # Attachment validation/download fails before a model turn is sent.
+            # Keep the existing conversation usable for a corrected next message.
+            reason = str(exc)
+            await self.store.finish_job(job.id, "image_input_failed")
+            await self._audit(job.message.sender_id, "image.input", decision="deny", job_id=job.id)
+            await self.store.save_result(job.session_key, reason, "failed")
+            try:
+                await self._notice(job.message, "", reason, "error")
+            except Exception:
+                log.warning("图片处理结果发送失败，可用 /last 查看")
         except Exception as exc:
             log.error("任务失败 (%s)", type(exc).__name__)
             if persisted_result:

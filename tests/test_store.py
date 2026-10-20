@@ -56,6 +56,20 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await reopened.enqueue("session", message("message-1")))
         self.assertEqual([job.message for job in await reopened.next_jobs()], [message("message-1")])
 
+    async def test_image_references_survive_database_reopen_with_legacy_text_jobs(self) -> None:
+        image = replace(message("image"), text="截图问题", image_keys=("img_one", "img_two"))
+        await self.store.enqueue("session", image)
+        await self.store.enqueue("session", message("legacy-text"))
+        async with await AsyncConnection.connect(self.database_url, autocommit=True) as connection:
+            await connection.execute(sql.SQL(
+                "UPDATE {}.jobs SET message_json = message_json - 'image_keys' - 'attachment_error' WHERE id = %s"
+            ).format(sql.Identifier(self.schema)), ("legacy-text",))
+        await self.store.close()
+        reopened = await self.open()
+        jobs = await reopened.next_jobs()
+        self.assertEqual([job.message for job in jobs], [image, message("legacy-text")])
+        self.assertEqual(jobs[0].message.image_keys, ("img_one", "img_two"))
+
     async def test_order_and_atomic_claim_across_connections(self) -> None:
         for id in ("z", "a", "m"):
             await self.store.enqueue("session", message(id))

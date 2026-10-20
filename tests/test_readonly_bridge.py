@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 from octopus.bridge import Bridge, POLICY_MIGRATION_REASON, PRIVACY_REFUSAL, Ticket
 from octopus.contracts import CardAction, CodexEvent
-from test_bridge import MemoryStore, FakeCodex, FakeMessenger, message, until
+from test_bridge import MemoryStore, FakeCodex, FakeMessenger, message, picture, until
 from octopus.config import Config
 from octopus.access import APPLICATION_HELP
 
@@ -91,6 +91,60 @@ class ReadonlyBridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.store.set_member_enabled("ou_alice", False)
         await self.bridge.receive(message("revoked"))
         self.assertEqual(self.store.jobs, {})
+
+    async def test_unauthorized_image_gets_access_hint_without_download_or_codex(self):
+        item = replace(message("outsider-image", "看看这个截图", sender="ou_eve"), image_keys=("img_private",))
+        await self.bridge.receive(item)
+        notice = await self.messenger.wait_record(lambda row: row.reply_to == item.id)
+        self.assertEqual(notice.view.text, APPLICATION_HELP)
+        self.assertEqual(self.messenger.download_calls, [])
+        self.assertEqual(self.store.jobs, {})
+        self.assertEqual(self.codex.turns, [])
+
+    async def test_privacy_request_with_image_is_refused_before_download(self):
+        item = replace(message("privacy-image", "帮我获取这个人的手机号"), image_keys=("img_private",))
+        await self.bridge.receive(item)
+        notice = await self.messenger.wait_record(lambda row: row.reply_to == item.id)
+        self.assertEqual(notice.view.text, PRIVACY_REFUSAL)
+        self.assertEqual(self.messenger.download_calls, [])
+        self.assertEqual(self.codex.turns, [])
+
+    async def test_image_is_not_forwarded_if_member_is_revoked_while_downloading(self):
+        gate = asyncio.Event()
+        self.messenger.download_gates["revoked-image"] = gate
+        self.messenger.images[("revoked-image", "img_first")] = picture()
+        item = replace(message("revoked-image"), image_keys=("img_first", "img_second"))
+        await self.bridge.receive(item)
+        await asyncio.wait_for(self.messenger.download_entered.get(), 2)
+        await self.store.set_member_enabled("ou_alice", False)
+        gate.set()
+        await self.store.wait_state(item.id, "failed")
+        self.assertEqual(self.messenger.download_calls, [(item.id, "img_first")])
+        self.assertEqual(self.codex.thread_count, 0)
+        self.assertEqual(self.codex.turns, [])
+        await until(self.messenger.changed, lambda: not self.messenger.reactions)
+
+    async def test_denied_admission_does_not_download_images(self):
+        self.store.admission_result = "queue_full"
+        item = replace(message("limited-image"), image_keys=("img_private",))
+        await self.bridge.receive(item)
+        await self.messenger.wait_record(lambda row: row.reply_to == item.id)
+        self.assertEqual(self.messenger.download_calls, [])
+        self.assertEqual(self.codex.turns, [])
+
+    async def test_image_contents_cannot_authorize_database_queries(self):
+        item = replace(message("business-image", "这个状态为什么不对"), image_keys=("img_business",))
+        self.messenger.images[(item.id, "img_business")] = picture()
+        await self.bridge.receive(item)
+        turn = await self.codex.next_turn()
+        self.assertEqual(len(turn.images), 1)
+        for tool in ("business_data_checks", "business_data_check"):
+            denied = await self.bridge._query_tool(turn.thread, turn.id, tool, {})
+            self.assertFalse(denied["ok"])
+            self.assertIn("文字消息", denied["error"])
+        self.assertEqual(self.queries.calls, [])
+        self.assertTrue((await self.bridge._query_tool(turn.thread, turn.id, "code_repositories", {}))["ok"])
+        self.codex.complete(turn)
 
     async def test_unknown_user_gets_application_instructions_before_any_work(self):
         await self.bridge.receive(message("new-colleague", "能帮我看看业务问题吗", sender="ou_eve"))

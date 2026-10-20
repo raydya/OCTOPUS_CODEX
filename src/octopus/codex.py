@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import math
@@ -13,6 +15,7 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
 
 from .contracts import CodexEvent, EventHandler, Question
+from .images import MAX_IMAGES, MAX_TOTAL_IMAGE_BYTES, ImageInputError
 
 logger = logging.getLogger(__name__)
 RequestId = str | int
@@ -58,6 +61,35 @@ def _is_id(value: Any) -> bool:
 
 def _error(value: Any) -> str:
     return _string(_object(value).get("message")) or str(value or "未知错误")
+
+
+def _image_inputs(images: tuple[str, ...]) -> list[dict[str, str]]:
+    """Allow only bounded, inline images that the message layer has sanitized."""
+    if not isinstance(images, tuple) or len(images) > MAX_IMAGES:
+        raise ImageInputError(f"每条消息最多支持 {MAX_IMAGES} 张图片。")
+    inputs: list[dict[str, str]] = []
+    total_bytes = 0
+    for image in images:
+        if not isinstance(image, str):
+            raise ImageInputError("图片输入格式无效，请重新发送图片。")
+        prefix, separator, encoded = image.partition(",")
+        if (not separator or prefix not in {"data:image/png;base64", "data:image/jpeg;base64"}
+                or not encoded):
+            raise ImageInputError("图片输入格式无效，请重新发送图片。")
+        # Reject before allocating decoded bytes; input must fit in the same
+        # bounded app-server frame as the prompt and the other images.
+        remaining = MAX_TOTAL_IMAGE_BYTES - total_bytes
+        if len(encoded) > 4 * ((remaining + 2) // 3):
+            raise ImageInputError("图片总大小超过限制，请减少图片数量或压缩后重试。")
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            raise ImageInputError("图片输入格式无效，请重新发送图片。") from None
+        total_bytes += len(decoded)
+        if not decoded or total_bytes > MAX_TOTAL_IMAGE_BYTES:
+            raise ImageInputError("图片总大小超过限制，请减少图片数量或压缩后重试。")
+        inputs.append({"type": "image", "url": image})
+    return inputs
 
 
 @dataclass
@@ -484,13 +516,15 @@ class AppServerClient:
             raise RuntimeError("无法确认 Codex 会话处于空闲状态，未提交新任务")
         return None
 
-    async def start_turn(self, thread_id: str, text: str) -> str:
+    async def start_turn(self, thread_id: str, text: str, images: tuple[str, ...] = ()) -> str:
+        image_inputs = _image_inputs(images)
         # turn/start may steer an existing turn. Never use it as an implicit queue.
         active_turn_id = await self.active_turn(thread_id)
         if active_turn_id:
             raise ActiveTurnError(thread_id, active_turn_id)
         params: dict[str, Any] = {
-            "threadId": thread_id, "input": [{"type": "text", "text": text, "text_elements": []}],
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": text, "text_elements": []}, *image_inputs],
         }
         if self.reasoning_effort:
             # Apply on every turn so resumed conversations use the current setting.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from pathlib import Path
 import sys
@@ -11,8 +12,13 @@ from unittest.mock import AsyncMock
 
 from octopus.codex import ActiveTurnError, AppServerClient, readonly_thread_config
 from octopus.contracts import CodexEvent
+from octopus.images import MAX_IMAGES, MAX_TOTAL_IMAGE_BYTES, ImageInputError
 
 FIXTURE = Path(__file__).parent / "fixtures" / "fake_codex.py"
+INLINE_PNG = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+)
 
 
 class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
@@ -69,6 +75,65 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(turn["environments"], [])
         self.assertEqual(turn["permissions"], "octopus-readonly")
         self.assertEqual(turn["effort"], "xhigh")
+
+    async def test_image_input_keeps_text_effort_and_readonly_turn_permissions(self):
+        client = self.client()
+        client.reasoning_effort = "xhigh"
+        client.active_turn = AsyncMock(return_value=None)
+        client._request.return_value = {"turn": {"id": "turn-image"}}
+        self.assertEqual(await client.start_turn("thread-safe", "解释截图", (INLINE_PNG,)), "turn-image")
+        client.active_turn.assert_awaited_once_with("thread-safe")
+        client._request.assert_awaited_once_with("turn/start", {
+            "threadId": "thread-safe",
+            "input": [
+                {"type": "text", "text": "解释截图", "text_elements": []},
+                {"type": "image", "url": INLINE_PNG},
+            ],
+            "effort": "xhigh",
+            "environments": [],
+            "approvalPolicy": "never",
+            "permissions": "octopus-readonly",
+            "runtimeWorkspaceRoots": [],
+        })
+
+    async def test_image_input_rejects_urls_paths_and_invalid_base64_before_protocol_calls(self):
+        client = self.client()
+        client.active_turn = AsyncMock(return_value=None)
+        invalid = (
+            "https://example.com/image.png", "http://127.0.0.1/private",
+            "file:///private/secret.png", "/private/secret.png", "~/Pictures/local.jpg",
+            "data:image/svg+xml;base64,PHN2Zy8+", "data:image/gif;base64,R0lGODlh",
+            "data:image/png;base64", "data:image/png;base64,",
+            "data:image/png;base64,%%%=", "data:image/png;base64,YQ",
+            "data:image/png;base64,YQ==\n", "data:image/png;base64,图片",
+            "data:image/png;charset=utf-8;base64,YQ==", None,
+        )
+        for image in invalid:
+            with self.subTest(image=image), self.assertRaises(ImageInputError):
+                await client.start_turn("thread-safe", "解释截图", (image,))
+        client.active_turn.assert_not_awaited()
+        client._request.assert_not_awaited()
+
+    async def test_image_count_and_total_decoded_bytes_are_bounded(self):
+        client = self.client()
+        client.active_turn = AsyncMock(return_value=None)
+        one_too_many_bytes = "data:image/png;base64," + base64.b64encode(
+            b"x" * (MAX_TOTAL_IMAGE_BYTES + 1)).decode("ascii")
+        half_plus_one = "data:image/jpeg;base64," + base64.b64encode(
+            b"x" * (MAX_TOTAL_IMAGE_BYTES // 2 + 1)).decode("ascii")
+        for images in ((INLINE_PNG,) * (MAX_IMAGES + 1), (one_too_many_bytes,),
+                       (half_plus_one, half_plus_one)):
+            with self.subTest(count=len(images)), self.assertRaises(ImageInputError):
+                await client.start_turn("thread-safe", "解释截图", images)
+        client.active_turn.assert_not_awaited()
+        client._request.assert_not_awaited()
+
+    async def test_image_input_cannot_steer_an_active_turn(self):
+        client = self.client()
+        client.active_turn = AsyncMock(return_value="existing-turn")
+        with self.assertRaises(ActiveTurnError):
+            await client.start_turn("thread-safe", "解释截图", (INLINE_PNG,))
+        client._request.assert_not_awaited()
 
     async def test_drifted_host_fails_closed_before_any_thread_starts(self):
         mutations = [
@@ -265,6 +330,19 @@ class AppServerClientTests(unittest.IsolatedAsyncioTestCase):
         turns = [call["params"] for call in self.calls() if call.get("method") == "turn/start"]
         self.assertEqual(len(turns), 2)
         self.assertEqual([turn["effort"] for turn in turns], ["xhigh", "xhigh"])
+
+    async def test_images_roundtrip_in_the_same_turn_as_the_message(self):
+        client = await self.client(reasoning_effort="xhigh")
+        await client.start_turn("thread-1", "比较这两张截图", (INLINE_PNG, INLINE_PNG))
+        await self.event("completed")
+        turns = [call["params"] for call in self.calls() if call.get("method") == "turn/start"]
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]["input"], [
+            {"type": "text", "text": "比较这两张截图", "text_elements": []},
+            {"type": "image", "url": INLINE_PNG},
+            {"type": "image", "url": INLINE_PNG},
+        ])
+        self.assertEqual(turns[0]["effort"], "xhigh")
 
     async def test_approval_uses_original_rpc_id_and_is_one_shot(self):
         client = await self.client("approval")

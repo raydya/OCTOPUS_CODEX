@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 import re
 import unittest
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Callable
+from unittest.mock import patch
+
+from PIL import Image
 
 from octopus.bridge import Bridge
 from octopus.config import Config
@@ -25,6 +30,12 @@ async def until(event: asyncio.Event, predicate: Callable[[], bool]) -> None:
 def message(identifier: str, text: str = "do work", *, sender: str = "ou_alice",
             chat: str = "oc_shared", kind: str = "p2p") -> IncomingMessage:
     return IncomingMessage(identifier, chat, sender, text, kind, 1_792_368_000_000)
+
+
+def picture(color: str = "red") -> bytes:
+    data = io.BytesIO()
+    Image.new("RGB", (8, 8), color).save(data, format="PNG")
+    return data.getvalue()
 
 
 class MemoryStore:
@@ -224,12 +235,17 @@ class FakeMessenger:
         self.reaction_entered: asyncio.Queue[str] = asyncio.Queue()
         self.send_gates: dict[str, asyncio.Event] = {}
         self.send_entered: asyncio.Queue[str] = asyncio.Queue()
+        self.images: dict[tuple[str, str], bytes] = {}
+        self.download_calls: list[tuple[str, str]] = []
+        self.download_entered: asyncio.Queue[str] = asyncio.Queue()
+        self.download_gates: dict[str, asyncio.Event] = {}
+        self.download_error: Exception | None = None
         self.closed = False
 
     async def start(self, on_message: Any, on_action: Any) -> None:
         self.on_message, self.on_action = on_message, on_action
 
-    async def add_reaction(self, message_id: str, emoji_type: str = "OneSecond") -> str:
+    async def add_reaction(self, message_id: str, emoji_type: str = "Typing") -> str:
         self.reaction_calls.append((message_id, emoji_type))
         self.reaction_entered.put_nowait(message_id)
         if message_id in self.reaction_gates:
@@ -245,6 +261,15 @@ class FakeMessenger:
             del self.reactions[message_id]
         self.removed_reactions.append((message_id, reaction_id))
         self.changed.set()
+
+    async def download_image(self, message_id: str, image_key: str) -> bytes:
+        self.download_calls.append((message_id, image_key))
+        self.download_entered.put_nowait(message_id)
+        if message_id in self.download_gates:
+            await self.download_gates[message_id].wait()
+        if self.download_error:
+            raise self.download_error
+        return self.images[(message_id, image_key)]
 
     async def send(self, chat: str, view: View, reply_to: str | None = None) -> str:
         if self.fail_results and view.kind == "result":
@@ -279,6 +304,7 @@ class Turn:
     thread: str
     id: str
     text: str
+    images: tuple[str, ...] = ()
 
 
 class FakeCodex:
@@ -321,8 +347,8 @@ class FakeCodex:
             raise self.active_turn_error
         return self.remote_active_turns.get(thread_id)
 
-    async def start_turn(self, thread_id: str, text: str) -> str:
-        turn = Turn(thread_id, f"turn-{len(self.turns) + 1}", text)
+    async def start_turn(self, thread_id: str, text: str, images: tuple[str, ...] = ()) -> str:
+        turn = Turn(thread_id, f"turn-{len(self.turns) + 1}", text, images)
         self.turns.append(turn)
         self.remote_active_turns[thread_id] = turn.id
         self.started.put_nowait(turn)
@@ -429,7 +455,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.messenger.wait_record(lambda record: record.reply_to == "barrier")
         self.assertEqual(len(self.codex.turns), 1)
         self.assertEqual(list(self.store.jobs), ["same-id"])
-        self.assertEqual(self.messenger.reaction_calls, [("same-id", "OneSecond")])
+        self.assertEqual(self.messenger.reaction_calls, [("same-id", "Typing")])
 
     async def test_jobs_queue_per_session_while_other_owner_can_run(self):
         bridge = await self.start()
@@ -550,7 +576,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         release.set()
         turn = await self.codex.next_turn()
         self.assertEqual(self.messenger.reactions, {"input": "reaction-input"})
-        self.assertEqual(self.messenger.reaction_calls, [("input", "OneSecond")])
+        self.assertEqual(self.messenger.reaction_calls, [("input", "Typing")])
         self.codex.emit(CodexEvent("activity", thread_id=turn.thread, turn_id=turn.id, text="Working"))
         self.codex.emit(CodexEvent("text", thread_id=turn.thread, turn_id=turn.id, delta="partial answer"))
         await asyncio.wait_for(bridge.events.join(), 2)
@@ -565,6 +591,106 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.view.text, "complete answer")
         await until(self.messenger.changed, lambda: "input" not in self.messenger.reactions)
         self.assertIsNone(await self.store.get_reaction("input"))
+
+    async def test_image_download_follows_ack_and_never_blocks_inbox_or_duplicates_work(self):
+        bridge = await self.start()
+        item = replace(message("image", "解释图片中的错误"), image_keys=("img_red", "img_blue"))
+        self.messenger.images[("image", "img_red")] = picture("red")
+        self.messenger.images[("image", "img_blue")] = picture("blue")
+        gate = asyncio.Event()
+        self.messenger.download_gates["image"] = gate
+        await asyncio.wait_for(bridge.receive(item), .5)
+        self.assertEqual(await asyncio.wait_for(self.messenger.download_entered.get(), 2), "image")
+        self.assertEqual(self.messenger.reaction_calls, [("image", "Typing")])
+        self.assertEqual(self.codex.turns, [])
+        await bridge.receive(item)
+        gate.set()
+        turn = await self.codex.next_turn()
+        self.assertEqual(turn.text, item.text)
+        self.assertEqual(len(turn.images), 2)
+        self.assertNotEqual(turn.images[0], turn.images[1])
+        self.assertTrue(all(value.startswith("data:image/png;base64,") for value in turn.images))
+        self.assertEqual(self.messenger.download_calls, [("image", "img_red"), ("image", "img_blue")])
+        self.codex.complete(turn, "图片中的问题")
+        await self.store.wait_state("image", "done")
+        await until(self.messenger.changed, lambda: not self.messenger.reactions)
+        follow_up = await self.begin("follow-up", "继续解释")
+        self.assertEqual(follow_up.thread, turn.thread)
+        self.assertEqual(follow_up.images, ())
+        self.codex.complete(follow_up)
+
+    async def test_image_download_error_is_safe_and_does_not_pause_conversation(self):
+        bridge = await self.start()
+        self.messenger.download_error = RuntimeError("SECRET_HTTP_BODY")
+        item = replace(message("bad-image"), image_keys=("img_bad",))
+        await bridge.receive(item)
+        notice = await self.messenger.wait_record(lambda record: record.reply_to == item.id)
+        self.assertIn("图片下载失败", notice.view.text)
+        self.assertNotIn("SECRET_HTTP_BODY", notice.view.text)
+        self.assertEqual(self.codex.thread_count, 0)
+        self.assertFalse(bridge.blocked)
+        self.assertEqual(self.store.jobs[item.id].state, "failed")
+        await until(self.messenger.changed, lambda: not self.messenger.reactions)
+        self.codex.complete(await self.begin("corrected"))
+
+    async def test_attachment_error_and_aggregate_limit_do_not_submit_partial_images(self):
+        bridge = await self.start()
+        await bridge.receive(replace(message("unsupported"), attachment_error="请将图片分开发送。"))
+        await self.store.wait_state("unsupported", "failed")
+        self.assertEqual(self.messenger.download_calls, [])
+        for key in ("img_a", "img_b"):
+            self.messenger.images[("too-large", key)] = picture()
+        # Each file is valid and individually fits; the combined payload does not.
+        with patch("octopus.bridge.MAX_TOTAL_IMAGE_BYTES", len(picture()) * 2 - 1):
+            await bridge.receive(replace(message("too-large"), image_keys=("img_a", "img_b")))
+            await self.store.wait_state("too-large", "failed")
+        self.assertEqual(self.codex.turns, [])
+        self.assertFalse(bridge.blocked)
+
+    async def test_stop_during_download_prevents_codex_and_remaining_downloads(self):
+        bridge = await self.start()
+        gate = asyncio.Event()
+        self.messenger.download_gates["image"] = gate
+        self.messenger.images[("image", "img_first")] = picture()
+        await bridge.receive(replace(message("image"), image_keys=("img_first", "img_second")))
+        await asyncio.wait_for(self.messenger.download_entered.get(), 2)
+        await bridge.receive(message("stop-image", "/stop"))
+        await self.store.wait_control("stop-image", "done")
+        gate.set()
+        await self.store.wait_state("image", "failed")
+        self.assertEqual(self.messenger.download_calls, [("image", "img_first")])
+        self.assertEqual(self.codex.thread_count, 0)
+
+    async def test_queued_image_survives_json_restore_and_stays_in_its_owners_session(self):
+        key = "oc_shared:ou_alice"
+        item = replace(message("restored"), image_keys=("img_restore",))
+        restored = IncomingMessage(**json.loads(json.dumps(asdict(item))))
+        self.assertEqual(restored.image_keys, item.image_keys)
+        legacy = asdict(message("legacy"))
+        del legacy["image_keys"], legacy["attachment_error"]
+        self.assertEqual(IncomingMessage(**legacy).image_keys, ())
+        await self.store.session(key, item.chat_id, item.sender_id)
+        await self.store.enqueue(key, restored)
+        self.messenger.images[("restored", "img_restore")] = picture()
+        bridge = await self.start()
+        turn = await self.codex.next_turn()
+        self.assertEqual(len(turn.images), 1)
+        await bridge.receive(message("bob-text", "另一位同事的问题", sender="ou_bob"))
+        other = await self.codex.next_turn()
+        self.assertNotEqual(turn.thread, other.thread)
+        self.assertEqual(other.images, ())
+        self.codex.complete(turn)
+        self.codex.complete(other)
+
+    async def test_image_caption_is_not_executed_as_bot_command(self):
+        bridge = await self.start()
+        self.messenger.images[("caption", "img_caption")] = picture()
+        await bridge.receive(replace(message("caption", "/new"), image_keys=("img_caption",)))
+        turn = await self.codex.next_turn()
+        self.assertEqual(turn.text, "/new")
+        self.assertEqual(len(turn.images), 1)
+        self.assertEqual(self.store.controls, {})
+        self.codex.complete(turn)
 
     async def test_queued_messages_react_immediately_and_late_ack_is_removed_after_stop(self):
         release = asyncio.Event()

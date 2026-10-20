@@ -9,6 +9,7 @@ description = "Persistent Feishu conversations with a local Codex agent"
 requires-python = ">=3.11"
 dependencies = [
   "lark-oapi==1.7.5",
+  "pillow==13.0.0",
   "psycopg[binary]>=3.2,<4",
   "websockets==15.0.1",
 ]
