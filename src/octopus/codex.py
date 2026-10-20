@@ -90,11 +90,12 @@ class AppServerClient:
                  request_timeout: float = 30, extra_args: list[str] | None = None,
                  url: str | None = None, token_file: str | None = None,
                  read_only: bool = False, tool_specs: list[dict[str, Any]] | None = None,
-                 tool_handler: ToolHandler | None = None):
+                 tool_handler: ToolHandler | None = None, reasoning_effort: str | None = None):
         if not math.isfinite(request_timeout) or request_timeout <= 0:
             raise ValueError("request_timeout 必须是正数")
         self.executable = executable
         self.model = model
+        self.reasoning_effort = reasoning_effort
         self.request_timeout = request_timeout
         self.extra_args = list(extra_args or [])
         self.read_only = read_only
@@ -491,6 +492,9 @@ class AppServerClient:
         params: dict[str, Any] = {
             "threadId": thread_id, "input": [{"type": "text", "text": text, "text_elements": []}],
         }
+        if self.reasoning_effort:
+            # Apply on every turn so resumed conversations use the current setting.
+            params["effort"] = self.reasoning_effort
         if self.read_only:
             params["environments"] = []
             params["approvalPolicy"] = "never"

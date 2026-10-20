@@ -71,6 +71,8 @@ CODEX_DIAGNOSTICS_ENABLED=false
 工作目录必须是本项目 `.data/codex-readonly/workspace` 的绝对路径，且保持空目录。启动器创建独立配置目录，仅通过单文件符号链接复用 Codex 登录；不继承个人 MCP、skills、hooks 或项目指令。
 代码通过受控读取器访问 `~/Projects/rere`，不挂载到容器或暴露给模型内置文件工具。
 
+`CODEX_MODEL` 留空时使用 bot 独立 Codex 配置的默认模型。`CODEX_REASONING_EFFORT=xhigh` 设置思考强度，Docker Compose 默认使用 `xhigh`。修改后重建 bridge 容器即可；桥接每轮都显式传入思考强度，因此已有会话从下一轮开始生效。
+
 ## 2. 配置飞书新应用
 
 在新企业自建应用的开发者后台操作：

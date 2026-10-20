@@ -54,6 +54,7 @@ class Config:
     codex_token_file: str | None
     codex_executable: str = "codex"
     model: str | None = None
+    reasoning_effort: str | None = None
     allowed_users: tuple[str, ...] = ()
     allow_groups: bool = False
     bot_open_id: str | None = None
@@ -111,6 +112,13 @@ class Config:
         if read_only_value not in {"true", "false"}:
             raise ConfigurationError("CODEX_READ_ONLY 必须为 true 或 false")
         read_only = read_only_value == "true"
+        reasoning_effort = os.environ.get("CODEX_REASONING_EFFORT", "").strip() or None
+        if reasoning_effort is not None and reasoning_effort not in {
+            "low", "medium", "high", "xhigh", "max", "ultra",
+        }:
+            raise ConfigurationError(
+                "CODEX_REASONING_EFFORT 必须为 low、medium、high、xhigh、max、ultra 或留空"
+            )
         if read_only and allow_groups:
             raise ConfigurationError("共同查询模式暂只允许私聊，避免向未授权群成员公开结果")
         query_url = os.environ.get("QUERY_HOST_URL", "http://host.docker.internal:4501").strip()
@@ -130,6 +138,7 @@ class Config:
             codex_url=url, codex_token_file=token_file,
             codex_executable=os.environ.get("CODEX_EXECUTABLE", "codex"),
             model=os.environ.get("CODEX_MODEL", "").strip() or None,
+            reasoning_effort=reasoning_effort,
             allowed_users=tuple(x.strip() for x in os.environ.get("FEISHU_ALLOWED_USERS", "").split(",") if x.strip()),
             allow_groups=allow_groups, bot_open_id=bot_open_id,
             max_concurrent=_integer("MAX_CONCURRENT_TASKS", 1, 1, 8),

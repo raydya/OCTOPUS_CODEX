@@ -45,6 +45,7 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_readonly_host_attestation_and_every_thread_turn_overrides(self):
         client = self.client()
+        client.reasoning_effort = "xhigh"
         await client._attest_read_only()
         client._request.return_value = self.thread_response()
         self.assertEqual(await client.create_thread(self.cwd), "thread-safe")
@@ -67,6 +68,7 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
         turn = client._request.call_args.args[1]
         self.assertEqual(turn["environments"], [])
         self.assertEqual(turn["permissions"], "octopus-readonly")
+        self.assertEqual(turn["effort"], "xhigh")
 
     async def test_drifted_host_fails_closed_before_any_thread_starts(self):
         mutations = [
@@ -208,9 +210,10 @@ class AppServerClientTests(unittest.IsolatedAsyncioTestCase):
         self.events: asyncio.Queue[CodexEvent] = asyncio.Queue()
         self.history: list[CodexEvent] = []
 
-    async def client(self, scenario="normal", timeout=2):
+    async def client(self, scenario="normal", timeout=2, reasoning_effort=None):
         client = AppServerClient(sys.executable, model="test-model", request_timeout=timeout,
-            extra_args=[str(FIXTURE), "--record", str(self.record), "--scenario", scenario])
+            extra_args=[str(FIXTURE), "--record", str(self.record), "--scenario", scenario],
+            reasoning_effort=reasoning_effort)
         client.on_event(self.events.put_nowait)
         client.on_event(self.history.append)
         self.addAsyncCleanup(client.close)
@@ -243,11 +246,25 @@ class AppServerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(call.get("method") == "initialize" for call in calls), 1)
         self.assertTrue(calls[0]["params"]["capabilities"]["experimentalApi"])
         for call in calls:
+            if call.get("method") == "turn/start":
+                self.assertNotIn("effort", call["params"])
             if call.get("method") in {"thread/start", "thread/resume"}:
                 self.assertEqual(call["params"]["approvalPolicy"], "on-request")
                 self.assertEqual(call["params"]["approvalsReviewer"], "user")
                 self.assertEqual(call["params"]["sandbox"], "workspace-write")
                 self.assertEqual(call["params"]["model"], "test-model")
+
+    async def test_reasoning_effort_is_applied_to_new_and_resumed_conversations(self):
+        client = await self.client(reasoning_effort="xhigh")
+        thread_id = await client.create_thread("/tmp/project")
+        await client.start_turn(thread_id, "first question")
+        await self.event("completed")
+        await client.resume_thread(thread_id, "/tmp/project")
+        await client.start_turn(thread_id, "follow-up question")
+        await self.event("completed")
+        turns = [call["params"] for call in self.calls() if call.get("method") == "turn/start"]
+        self.assertEqual(len(turns), 2)
+        self.assertEqual([turn["effort"] for turn in turns], ["xhigh", "xhigh"])
 
     async def test_approval_uses_original_rpc_id_and_is_one_shot(self):
         client = await self.client("approval")

@@ -35,6 +35,7 @@ services:
       CODEX_TOKEN_FILE: /run/octopus/codex_token
       CODEX_WORKSPACE: ${CODEX_WORKSPACE:-}
       CODEX_MODEL: ${CODEX_MODEL:-}
+      CODEX_REASONING_EFFORT: ${CODEX_REASONING_EFFORT:-xhigh}
       CODEX_READ_ONLY: ${CODEX_READ_ONLY:-true}
       QUERY_HOST_URL: http://host.docker.internal:${OCTOPUS_QUERY_PORT:-4501}
       QUERY_TOKEN_FILE: /run/octopus/query_token

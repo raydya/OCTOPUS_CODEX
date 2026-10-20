@@ -41,6 +41,20 @@ class ConfigTests(unittest.TestCase):
             os.environ["FEISHU_BOT_OPEN_ID"] = "ou_new_bot"
             self.assertEqual(Config.from_env().bot_open_id, "ou_new_bot")
 
+    def test_reasoning_effort_is_optional_and_trims_whitespace(self):
+        with patch.dict(os.environ, self.env, clear=True):
+            self.assertIsNone(Config.from_env().reasoning_effort)
+        for value, expected in (("", None), ("   ", None), (" xhigh ", "xhigh")):
+            with self.subTest(value=value), patch.dict(
+                os.environ, {**self.env, "CODEX_REASONING_EFFORT": value}, clear=True
+            ):
+                self.assertEqual(Config.from_env().reasoning_effort, expected)
+
+    def test_invalid_reasoning_effort_is_rejected(self):
+        with patch.dict(os.environ, {**self.env, "CODEX_REASONING_EFFORT": "xhig"}, clear=True):
+            with self.assertRaisesRegex(ConfigurationError, "CODEX_REASONING_EFFORT"):
+                Config.from_env()
+
     def test_remote_plaintext_and_url_credentials_are_rejected(self):
         for url in ("ws://external.example:4500", "wss://user:secret@external.example"):
             with patch.dict(os.environ, {**self.env, "CODEX_URL": url}, clear=True):
