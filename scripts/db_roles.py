@@ -31,6 +31,8 @@ TABLE_GRANTS = {
     "controls": "SELECT, INSERT, UPDATE, DELETE",
     "last_results": "SELECT, INSERT, UPDATE, DELETE",
     "audit_events": "SELECT, INSERT",
+    "access_requests": "SELECT, INSERT, UPDATE",
+    "access_deliveries": "SELECT, INSERT, UPDATE",
 }
 
 

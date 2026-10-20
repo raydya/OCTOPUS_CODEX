@@ -111,6 +111,30 @@ class DatabaseRoleTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "维护账号必须是本库所有者"):
             await maintain(self.database_admin_url, "cli_role_test", runtime_role=self.role, schema=self.schema)
 
+    async def test_runtime_can_manage_access_outbox_but_cannot_erase_requests_or_audit(self) -> None:
+        await self.provision()
+        runtime = await Store.open(self.runtime_url, "cli_role_test", schema=self.schema, migrate=False)
+        self.addAsyncCleanup(runtime.close)
+        await runtime.ensure_member("admin", "admin")
+        status, request = await runtime.submit_access_request(
+            IncomingMessage("access-message", "applicant-chat", "applicant", "not stored", "p2p", 1000)
+        )
+        self.assertEqual(status, "created")
+        review = next(d for d in await runtime.access_deliveries() if d["kind"] == "review")
+        await runtime.retry_access_delivery(review["delivery_id"])
+        await runtime.complete_access_delivery(review["delivery_id"], "admin-card")
+        self.assertEqual((await runtime.decide_access_request(
+            request["id"], "admin", "accept", card_id="admin-card"
+        ))[0], "decided")
+        await runtime.complete_access_delivery(review["delivery_id"], "admin-card", terminal=True)
+        self.assertEqual((await runtime.member("applicant"))["role"], "member")
+        async with await AsyncConnection.connect(self.runtime_url, autocommit=True) as connection:
+            for table in ("access_requests", "access_deliveries", "audit_events"):
+                with self.assertRaises(errors.InsufficientPrivilege):
+                    await connection.execute(sql.SQL("DELETE FROM {}").format(sql.Identifier(self.schema, table)))
+                with self.assertRaises(errors.InsufficientPrivilege):
+                    await connection.execute(sql.SQL("TRUNCATE {}").format(sql.Identifier(self.schema, table)))
+
     async def test_privileged_member_or_object_owner_runtime_cannot_be_adopted(self) -> None:
         async with await AsyncConnection.connect(self.database_admin_url, autocommit=True) as connection:
             await connection.execute(sql.SQL("ALTER ROLE {} CREATEDB").format(sql.Identifier(self.role)))
@@ -164,7 +188,7 @@ class DatabaseRoleTests(unittest.IsolatedAsyncioTestCase):
             redirect_stdout(output),
         ):
             self.assertEqual(await asyncio.to_thread(main), 0)
-        self.assertEqual(json.loads(output.getvalue()), {"jobs": 0, "controls": 0, "inbound_ids": 0, "last_results": 1, "audit_events": 1})
+        self.assertEqual(json.loads(output.getvalue()), {"jobs": 0, "controls": 0, "inbound_ids": 0, "last_results": 1, "audit_events": 1, "access_requests": 0, "access_deliveries": 0})
         self.assertIsNone(await maintenance.last_result("session"))
 
 

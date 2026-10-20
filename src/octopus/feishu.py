@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import multiprocessing
+import re
 import time
 import uuid
 from dataclasses import asdict
@@ -257,6 +258,14 @@ class _LarkApi:
                    .request_body(body).build())
         return self.client.im.v1.message.create(request)
 
+    def send_user(self, open_id: str, content: str, request_id: str) -> Any:
+        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+        body = (CreateMessageRequestBody.builder().receive_id(open_id).msg_type("interactive")
+                .content(content).uuid(request_id).build())
+        request = (CreateMessageRequest.builder().receive_id_type("open_id")
+                   .request_body(body).build())
+        return self.client.im.v1.message.create(request)
+
     def update(self, message_id: str, content: str) -> Any:
         from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
         body = PatchMessageRequestBody.builder().content(content).build()
@@ -421,6 +430,20 @@ class FeishuMessenger:
         message_id = getattr(getattr(response, "data", None), "message_id", None)
         if not isinstance(message_id, str) or not message_id:
             raise RuntimeError("Feishu send returned no message ID")
+        return message_id
+
+    async def send_user(self, open_id: str, view: View, *, request_id: str | None = None) -> str:
+        """Send as this application; callers persist request_id across outbox retries."""
+        if not isinstance(open_id, str) or re.fullmatch(r"ou_[A-Za-z0-9_-]{1,125}", open_id) is None:
+            raise ValueError("A valid Feishu open ID is required")
+        if request_id is None:
+            request_id = uuid.uuid4().hex
+        elif not isinstance(request_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,50}", request_id) is None:
+            raise ValueError("A valid Feishu message request ID is required")
+        response = await self._request("send_user", open_id, _json(build_card(view)), request_id)
+        message_id = getattr(getattr(response, "data", None), "message_id", None)
+        if not isinstance(message_id, str) or not message_id.strip():
+            raise RuntimeError("Feishu send_user returned no message ID")
         return message_id
 
     async def update(self, message_id: str, view: View) -> None:

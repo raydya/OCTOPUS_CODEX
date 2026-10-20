@@ -15,6 +15,7 @@ from .store import Store
 from .code_reader import redact
 from .queries import QueryClient, TOOL_NAMES
 from .privacy import dms_request_allowed, privacy_request_denied, redact_private_text
+from .access import ACCESS_COMMANDS, AccessRequests
 
 log = logging.getLogger(__name__)
 
@@ -87,6 +88,7 @@ class Bridge:
         self.config, self.store, self.messenger, self.codex = config, store, messenger, codex
         self.allowed = set(config.allowed_users)
         self.queries = queries
+        self.access = AccessRequests(store, messenger) if config.read_only else None
         self._control_times: dict[str, float] = {}
         if config.read_only:
             if queries is None:
@@ -147,6 +149,8 @@ class Bridge:
         self.connected = True
         self._background(self._event_worker(), critical=True)
         await self.messenger.start(self.receive, self.receive_action)
+        if self.access:
+            self._background(self.access.run(), critical=True)
         self._background(self._reaction_cleanup_worker())
         self._background(self._restore_reactions(), critical=True)
         legacy_keys = await self._close_legacy_sessions(recovered, retired) if self.config.read_only else set()
@@ -208,7 +212,16 @@ class Bridge:
 
     async def receive(self, message: IncomingMessage) -> None:
         """Only persist/validate here: Feishu needs its event ACK in <3 seconds."""
-        if self.closed or not await self._authorized(message.sender_id):
+        if self.closed:
+            return
+        authorized = await self._authorized(message.sender_id)
+        if self.access:
+            handled, reply = await self.access.receive(message, authorized=authorized)
+            if handled:
+                if reply:
+                    self._background(self.access.reply(message, reply))
+                return
+        if not authorized:
             return
         if message.chat_type == "group" and (self.config.read_only or not self.config.allow_groups):
             return
@@ -309,6 +322,14 @@ class Bridge:
     async def receive_action(self, action: CardAction) -> None:
         if self.closed:
             return
+        if self.access and action.ticket_id.startswith("access-test:"):
+            decision = await self.access.self_test.decide(action)
+            if decision:
+                self._background(self.access.self_test.deliver_result(decision))
+            return
+        if self.access and action.ticket_id.startswith("access:"):
+            await self.access.receive_action(action)
+            return
         ticket = self.tickets.get(action.ticket_id)
         if not ticket or ticket.consumed or not await self._authorized(action.sender_id):
             return
@@ -335,7 +356,9 @@ class Bridge:
         parts = message.text.strip().split(maxsplit=2)
         command, key = parts[0].lower(), self._key(message)
         active = next((x for x in self.active.values() if x.job.session_key == key), None)
-        if self.config.read_only and command in {"/members", "/member-add", "/member-disable", "/member-enable"}:
+        if self.access and command in ACCESS_COMMANDS:
+            await self._notice(message, "", await self.access.command(message))
+        elif self.config.read_only and command in {"/members", "/member-add", "/member-disable", "/member-enable"}:
             await self._member_command(message, command, parts)
         elif command == "/help":
             help_text = HELP
@@ -343,6 +366,8 @@ class Bridge:
                 help_text = "只读业务查询：日志、指标、飞书文档和共享代码。\n" + "\n".join(
                     line for line in HELP.splitlines() if "/approve" not in line and "/deny" not in line)
                 help_text += "\n管理员：/members、/member-add ou_…、/member-disable ou_…、/member-enable ou_…"
+                help_text += "\n权限申请：未授权用户发送“申请权限”或 /apply；管理员用 /access-requests 查看待办，或点击申请通知的通过/拒绝按钮。"
+                help_text += "\n管理员自测：/access-test 给自己发送测试申请卡片，不改变任何成员权限。"
             await self._notice(message, "Codex 使用说明", help_text)
         elif command == "/status":
             session = await self.store.get_session(key)

@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import unittest
 from dataclasses import replace
+from unittest.mock import AsyncMock
 
 from octopus.bridge import Bridge, POLICY_MIGRATION_REASON, PRIVACY_REFUSAL, Ticket
-from octopus.contracts import CodexEvent
+from octopus.contracts import CardAction, CodexEvent
 from test_bridge import MemoryStore, FakeCodex, FakeMessenger, message, until
 from octopus.config import Config
+from octopus.access import APPLICATION_HELP
 
 
 class MembersStore(MemoryStore):
@@ -25,6 +27,9 @@ class MembersStore(MemoryStore):
 
     async def members(self):
         return list(self.people.values())
+
+    async def access_deliveries(self, limit=20):
+        return []
 
     async def set_member_enabled(self, actor, enabled):
         self.people[actor]["enabled"] = enabled
@@ -87,6 +92,55 @@ class ReadonlyBridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.bridge.receive(message("revoked"))
         self.assertEqual(self.store.jobs, {})
 
+    async def test_unknown_user_gets_application_instructions_before_any_work(self):
+        await self.bridge.receive(message("new-colleague", "能帮我看看业务问题吗", sender="ou_eve"))
+        notice = await self.messenger.wait_record(lambda row: row.reply_to == "new-colleague")
+        self.assertEqual(notice.view.text, APPLICATION_HELP)
+        self.assertIn("申请权限", notice.view.text)
+        self.assertIn("/apply", notice.view.text)
+        self.assertEqual(notice.view.title, "")
+        self.assertEqual(self.store.sessions, {})
+        self.assertEqual(self.store.jobs, {})
+        self.assertEqual(self.codex.turns, [])
+        self.assertEqual(self.queries.calls, [])
+        await self.bridge.receive(message("repeated-hint", "再问一次", sender="ou_eve"))
+        await asyncio.sleep(0)
+        self.assertEqual(len(self.messenger.records), 1)
+
+    async def test_revoked_user_is_directed_to_admin_instead_of_self_application(self):
+        await self.store.set_member_enabled("ou_alice", False)
+        await self.bridge.receive(message("revoked-hint", "帮我查个问题"))
+        notice = await self.messenger.wait_record(lambda row: row.reply_to == "revoked-hint")
+        self.assertIn("已被停用", notice.view.text)
+        self.assertIn("联系管理员", notice.view.text)
+        self.assertNotIn("/apply", notice.view.text)
+        self.assertEqual(self.store.sessions, {})
+        self.assertEqual(self.codex.turns, [])
+
+    async def test_admin_self_test_routes_card_and_result_without_changing_permissions(self):
+        async def direct_message(open_id, view, *, request_id=None):
+            return await self.messenger.send(open_id, view)
+
+        self.messenger.send_user = AsyncMock(side_effect=direct_message)
+        original_members = [dict(member) for member in await self.store.members()]
+        await self.bridge.receive(message("test-command", "/access-test"))
+        review = await self.messenger.wait_record(
+            lambda row: row.chat == "ou_alice" and bool(row.view.actions),
+        )
+        # Let the completed command bind its card ID before the simulated click.
+        await self.messenger.wait_record(lambda row: row.reply_to == "test-command")
+        self.assertIn("测试", review.view.title)
+        action = CardAction(review.view.actions[0].ticket_id, "accept", "ou_alice", "oc_shared", review.id)
+        await self.bridge.receive_action(action)
+        await self.messenger.wait_record(
+            lambda row: row.chat == "ou_alice" and row.operation == "send" and not row.view.actions,
+        )
+        self.assertEqual(await self.store.members(), original_members)
+        self.assertEqual(self.store.jobs, {})
+        self.assertEqual(self.codex.turns, [])
+        self.assertEqual(self.codex.approvals, [])
+        self.assertEqual(self.queries.calls, [])
+        self.assertEqual(self.messenger.send_user.await_count, 2)
     async def test_scope_namespace_never_resumes_personal_thread(self):
         key = "oc_shared:ou_alice"
         await self.store.session(key, "oc_shared", "ou_alice")

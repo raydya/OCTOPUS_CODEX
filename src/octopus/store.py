@@ -10,6 +10,7 @@ from typing import Any, Literal
 from psycopg import AsyncConnection, sql
 from psycopg.types.json import Jsonb
 
+from .access_store import ACCESS_SCHEMA, AccessStore
 from .contracts import IncomingMessage
 from .database import connect_database
 
@@ -36,7 +37,7 @@ class Job:
 INTERRUPTED_ERROR = "服务重启，上一任务结果未确认；不会自动重跑"
 CONTROL_INTERRUPTED_ERROR = "服务重启，控制命令结果未确认；不会自动重放，请重新发送"
 MEMBER_DISABLED_ERROR = "成员已停用，任务已取消"
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 
 def _now() -> int:
@@ -55,7 +56,7 @@ def _positive_limit(value: int, field: str, maximum: int = 1_000_000) -> int:
     return value
 
 
-class Store:
+class Store(AccessStore):
     def __init__(self, connection: AsyncConnection[dict[str, Any]], schema: str):
         self._db = connection
         self._schema = schema
@@ -352,6 +353,7 @@ class Store:
         _metadata(open_id, "成员 ID", 256)
         async with self._lock:
             async with self._db.transaction():
+                await self._member_lock(open_id)
                 now = _now()
                 await self._db.execute("INSERT INTO owners (open_id, created_at) VALUES (%s, %s) ON CONFLICT (open_id) DO NOTHING", (open_id, now))
                 await self._db.execute(
@@ -376,11 +378,13 @@ class Store:
         if not isinstance(role, str) or role not in {"admin", "member"}:
             raise ValueError("成员角色必须是 admin 或 member")
         async with self._lock:
-            now = _now()
-            await self._db.execute(
-                "INSERT INTO users (open_id, role, enabled, created_at, updated_at) VALUES (%s, %s, TRUE, %s, %s) ON CONFLICT (open_id) DO NOTHING",
-                (open_id, role, now, now),
-            )
+            async with self._db.transaction():
+                await self._member_lock(open_id)
+                now = _now()
+                await self._db.execute(
+                    "INSERT INTO users (open_id, role, enabled, created_at, updated_at) VALUES (%s, %s, TRUE, %s, %s) ON CONFLICT (open_id) DO NOTHING",
+                    (open_id, role, now, now),
+                )
 
     async def member(self, open_id: str) -> dict[str, Any] | None:
         _metadata(open_id, "成员 ID", 256)
@@ -457,6 +461,7 @@ class Store:
                 counts["last_results"] = cursor.rowcount
                 cursor = await self._db.execute("DELETE FROM audit_events WHERE created_at < %s", (audit_cutoff,))
                 counts["audit_events"] = cursor.rowcount
+                counts.update(await self._purge_access(cutoff))
         return counts
 
     async def claim_message(self, id: str) -> bool:
@@ -596,4 +601,4 @@ _SCHEMA = (
         created_at BIGINT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS audit_events_created ON audit_events (created_at)",
-)
+) + ACCESS_SCHEMA

@@ -7,7 +7,7 @@ from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from octopus.contracts import Button, CardAction, IncomingMessage, View
+from octopus.contracts import Button, CardAction, View
 from octopus.feishu import (CARD_BUDGET, FeishuMessenger, _LarkApi, _heartbeat, _post_with_timeout, _roundtrip,
                             build_card, parse_action, parse_message)
 
@@ -84,6 +84,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         if api is None:
             api = Mock()
             api.send.return_value = SimpleNamespace(code=0, data=SimpleNamespace(message_id="om_reply"))
+            api.send_user.return_value = SimpleNamespace(code=0, data=SimpleNamespace(message_id="om_direct"))
             api.update.return_value = SimpleNamespace(code=0)
         messenger = FeishuMessenger("cli_separate", "secret-never-log", self.logs.append, api=api)
         messenger._connection = Mock()
@@ -105,6 +106,65 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         api.update.return_value = SimpleNamespace(code=230027)
         with self.assertRaisesRegex(RuntimeError, "230027"):
             await messenger.update("om_reply", view)
+        await messenger.close()
+
+    async def test_send_user_keeps_durable_request_id_across_retries(self):
+        messenger, api = self.messenger()
+        request_id = "f76b28d7-4b7c-48e6-8b73-9b5d1b324187"
+        view = View("approval", "交谈权限申请", "用户希望使用机器人",
+                    [Button("同意", "access:" + request_id, "accept")])
+        api.send_user.side_effect = [
+            TimeoutError("token=secret-never-log private response"),
+            SimpleNamespace(code=0, data=SimpleNamespace(message_id="om_direct")),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "send_user failed") as error:
+            await messenger.send_user("ou_owner", view, request_id=request_id)
+        self.assertNotIn("secret-never-log", str(error.exception))
+        self.assertNotIn("private response", str(error.exception))
+        self.assertEqual(await messenger.send_user("ou_owner", view, request_id=request_id), "om_direct")
+        self.assertEqual(api.send_user.call_count, 2)
+        for call in api.send_user.call_args_list:
+            self.assertEqual(call.args[0], "ou_owner")
+            self.assertEqual(call.args[2], request_id)
+            card = json.loads(call.args[1])
+            value = card["body"]["elements"][1]["columns"][0]["elements"][0]["behaviors"][0]["value"]
+            self.assertEqual(value, {"ticketId": "access:" + request_id, "decision": "accept"})
+        api.send.assert_not_called()
+        await messenger.close()
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            await messenger.send_user("ou_owner", view, request_id=request_id)
+
+    async def test_send_user_generates_default_id_and_rejects_invalid_identifiers(self):
+        messenger, api = self.messenger()
+        view = View("info", "", "申请已通过")
+        with patch("octopus.feishu.uuid.uuid4", return_value=SimpleNamespace(hex="a" * 32)):
+            self.assertEqual(await messenger.send_user("ou_applicant", view), "om_direct")
+        self.assertEqual(api.send_user.call_args.args[2], "a" * 32)
+        api.send_user.reset_mock()
+        for open_id in (None, "", "ou_", "oc_chat", "ou_a\n", "ou_中文", "ou_" + "a" * 126, 1):
+            with self.subTest(open_id=open_id):
+                with self.assertRaisesRegex(ValueError, "open ID"):
+                    await messenger.send_user(open_id, view)
+        for request_id in ("", " ", "a" * 51, "secret\nvalue", "秘密", 1):
+            with self.subTest(request_id=request_id):
+                with self.assertRaisesRegex(ValueError, "request ID") as error:
+                    await messenger.send_user("ou_owner", view, request_id=request_id)
+                self.assertNotIn("secret", str(error.exception))
+        api.send_user.assert_not_called()
+        await messenger.close()
+
+    async def test_send_user_failure_codes_and_missing_ids_are_sanitized(self):
+        messenger, api = self.messenger()
+        view = View("info", "", "申请结果")
+        api.send_user.return_value = SimpleNamespace(code=99991672, msg="secret-never-log")
+        with self.assertRaisesRegex(RuntimeError, "99991672") as error:
+            await messenger.send_user("ou_applicant", view)
+        self.assertNotIn("secret-never-log", str(error.exception))
+        for data in (None, SimpleNamespace(), SimpleNamespace(message_id=""),
+                     SimpleNamespace(message_id="  "), SimpleNamespace(message_id=1)):
+            api.send_user.return_value = SimpleNamespace(code=0, data=data)
+            with self.assertRaisesRegex(RuntimeError, "no message ID"):
+                await messenger.send_user("ou_applicant", view)
         await messenger.close()
 
     async def test_reaction_lifecycle_returns_own_record_for_removal(self):
@@ -277,6 +337,37 @@ class ReactionSdkTests(unittest.TestCase):
         request = resource.delete.call_args.args[0]
         self.assertEqual(request.paths, {"message_id": "om_input", "reaction_id": "reaction_1"})
         self.assertEqual(request.uri, "/open-apis/im/v1/messages/:message_id/reactions/:reaction_id")
+
+    def test_sdk_sends_direct_card_with_open_id_and_exact_idempotency_key(self):
+        api = _LarkApi.__new__(_LarkApi)
+        api.client = Mock()
+        resource = api.client.im.v1.message
+        content = '{"schema":"2.0","body":{"elements":[]}}'
+        request_id = "f76b28d74b7c48e68b739b5d1b3241870000"
+        self.assertIs(api.send_user("ou_owner", content, request_id), resource.create.return_value)
+        request = resource.create.call_args.args[0]
+        self.assertEqual(request.uri, "/open-apis/im/v1/messages")
+        self.assertEqual(request.receive_id_type, "open_id")
+        self.assertEqual(dict(request.queries), {"receive_id_type": "open_id"})
+        self.assertEqual(request.request_body.receive_id, "ou_owner")
+        self.assertEqual(request.request_body.msg_type, "interactive")
+        self.assertEqual(request.request_body.content, content)
+        self.assertEqual(request.request_body.uuid, request_id)
+        resource.reply.assert_not_called()
+
+    def test_sdk_chat_send_and_reply_keep_existing_target_semantics(self):
+        api = _LarkApi.__new__(_LarkApi)
+        api.client = Mock()
+        resource = api.client.im.v1.message
+        api.send("oc_chat", "content", None, "request1")
+        request = resource.create.call_args.args[0]
+        self.assertEqual(request.receive_id_type, "chat_id")
+        self.assertEqual(request.request_body.receive_id, "oc_chat")
+        self.assertEqual(request.request_body.uuid, "request1")
+        api.send("oc_chat", "content", "om_input", "request2")
+        request = resource.reply.call_args.args[0]
+        self.assertEqual(request.paths, {"message_id": "om_input"})
+        self.assertEqual(request.request_body.uuid, "request2")
 
 
 class ListenerHealthTests(unittest.TestCase):

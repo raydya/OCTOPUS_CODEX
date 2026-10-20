@@ -601,14 +601,14 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         await self.store.finish_job("recent")
         await self.store.audit("owner", "recent-query")
         deleted = await self.store.purge_history()
-        self.assertEqual(deleted, {"jobs": 2, "controls": 2, "inbound_ids": 5, "last_results": 1, "audit_events": 1})
+        self.assertEqual(deleted, {"jobs": 2, "controls": 2, "inbound_ids": 5, "last_results": 1, "audit_events": 1, "access_requests": 0, "access_deliveries": 0})
         self.assertEqual(await self.job_states(), [("old-running", "running", None), ("old-queued", "queued", None), ("recent", "done", None)])
         self.assertFalse(await self.store.claim_message("old-running"))
         self.assertFalse(await self.store.claim_message("old-queued-control"))
         self.assertTrue(await self.store.claim_message("old-done"))
         self.assertIsNone(await self.store.last_result("result-only"))
         self.assertIsNotNone(await self.store.last_result("session"))
-        self.assertEqual(await self.store.purge_history(), {"jobs": 0, "controls": 0, "inbound_ids": 0, "last_results": 0, "audit_events": 0})
+        self.assertEqual(await self.store.purge_history(), {"jobs": 0, "controls": 0, "inbound_ids": 0, "last_results": 0, "audit_events": 0, "access_requests": 0, "access_deliveries": 0})
 
     async def test_governance_rejects_invalid_roles_limits_and_states(self) -> None:
         for role in ("owner", "", None, 1, []):
