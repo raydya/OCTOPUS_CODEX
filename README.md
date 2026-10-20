@@ -6,8 +6,9 @@
 飞书私聊（成员名单）
           │ 官方 Python SDK 长连接
           ▼
-Docker Compose
-  bridge：Python 3.12 ───── db：PostgreSQL 17（持久卷）
+本项目 Docker Compose
+  bridge：Python 3.12 ───── local-infra：共享 PostgreSQL 17
+                              └── 独立数据库 octopus、独立账号
           │ 带 Bearer 认证的 WebSocket
           ▼
 宿主机独立 Codex app-server
@@ -18,7 +19,7 @@ Docker Compose
 
 机器人应用凭证只从本项目读取；文档查询复用宿主机 `lark-cli` 的现有身份。
 每个「聊天 + 发送人」对应独立 Codex 会话，不接管桌面端已打开的对话。
-Python 和 PostgreSQL 各一个容器；Codex 在宿主机执行。
+Python 在本项目容器运行，PostgreSQL 由独立 `local-infra` Compose 管理；Codex 在宿主机执行。
 
 ## 已实现
 
@@ -49,8 +50,10 @@ bash scripts/bootstrap.sh
 - `.secrets/feishu_app_secret`：填写**新飞书应用**的 App Secret，单行纯文本。
 - `.secrets/codex_token`：自动生成的宿主机连接认证令牌。
 - `.secrets/query_token`：自动生成的查询接口认证令牌。
-- `.secrets/postgres_password`：数据库维护账号密码，仅维护容器使用。
+- `.secrets/postgres_owner_password`：本库所有者 `octopus_owner` 的迁移密码，仅维护容器使用；不是集群管理员。
 - `.secrets/postgres_runtime_password`：bridge 的受限运行账号密码。
+
+先由 `local-infra` 使用对应密码创建 `octopus` 数据库、`octopus_owner` 和 `octopus_runtime`，并创建内部网络 `local-infra-codex-db`。本项目 bootstrap 只准备本地文件，不创建数据库账号、不启动 PG。旧 `.secrets/postgres_password` 不再挂载或用于当前部署。
 
 `.env`、`.secrets` 都不会进入 Git 或 Docker 构建上下文。
 `.secrets` 目录权限为 0700，文件为 0600；容器以只读 secret 挂载并将运行时副本放在私有 tmpfs。
@@ -165,18 +168,21 @@ aliyun configure --mode OAuth --oauth-site-type CN --profile company-cli-user
 
 接口依据：[DMS ExecuteScript](https://help.aliyun.com/zh/dms/developer-reference/api-dms-enterprise-2018-11-01-executescript)、[生产环境标识](https://help.aliyun.com/zh/dms/developer-reference/api-dms-enterprise-2018-11-01-listinstances)、[字段敏感等级](https://help.aliyun.com/zh/dms/developer-reference/api-dms-enterprise-2018-11-01-listcolumns)。
 
-## 4. 启动双容器并配对
+## 4. 连接共享数据库并配对
 
 ```bash
 docker compose build bridge maintenance
-docker compose up -d db
 docker compose run --rm maintenance
 docker compose up -d bridge
 docker compose exec bridge python -m octopus check
 docker compose exec bridge python -m octopus pair
 ```
 
-维护命令迁移数据库并建立 `octopus_runtime`，然后 bridge 使用该运行账号，无 DDL/角色管理/审计修改权限。首次安装和升级都先执行维护命令。
+运行前先在 `local-infra` 启动共享 PG。本项目通过外部网络 `local-infra-codex-db` 上的 `shared-postgres:5432` 连接 `octopus` 数据库，无本地 `db` 服务或 PG 数据卷。
+维护命令使用 `octopus_owner` 迁移表结构、授权已由基础设施创建的 `octopus_runtime`，不创建/修改角色或读取运行账号密码。owner 必须是本库所有者且没有集群管理权限或其他角色成员资格；runtime 必须是专用 `NOINHERIT LOGIN`，没有管理权限、角色成员资格或对象所有权。首次安装和升级都先执行维护命令。
+bridge 使用 runtime，无 DDL/角色管理/审计修改权限。数据库连接最多等待 30 秒；等待期结束后启动失败，由 Compose 的重启策略重试，不自动重试 SQL 或任务。
+
+迁移保留 `octopus.meta` 中的 `app_id`、`runtime_role` 和全部业务记录；不同 App ID 或已绑定的不同 runtime 会拒绝维护。共享实例中其他应用必须使用独立数据库和账号；数据库 CONNECT 与跨库访问限制由 `local-infra` 管理。
 `check` 验证数据库、Codex 认证与只读策略、查询接口健康，不执行模型任务或向飞书发消息。
 `pair` 在终端显示一个十分钟有效的一次性配对码。把终端中的 `/pair ...` 命令私聊发给**新应用机器人**。
 
@@ -242,14 +248,13 @@ docker compose exec bridge python -m octopus members add ou_管理员ID --admin
 ```bash
 docker compose ps
 docker compose logs --tail=100 bridge
-docker compose logs --tail=100 db
 docker compose restart bridge
 docker compose down
 ```
 
-`docker compose down` 保留 PostgreSQL 持久卷；`down -v` 会删除会话、配对用户和任务数据。
-PostgreSQL 不映射宿主机端口，只能通过 Compose 内部网络访问。
-数据库中的一个 schema 绑定一个 App ID；更换应用时使用独立数据库或独立 schema，不混用用户身份。
+本项目 `docker compose down` 只关闭应用，不关闭共享 PG，也不删除基础设施持久卷。PG 的启停、日志、升级、备份由 `local-infra` 管理；其维护窗口会影响使用该实例的应用。
+bridge 通过专用内部网络连接 PG；不挂载其他应用或数据库管理员凭证。基础设施可以为宿主机应用开放仅绑定 loopback 的 PG 端口。
+数据库中的 `octopus` schema 绑定一个 App ID；增加其他应用时使用独立数据库和账号，不混用用户身份。
 
 维护账号可清理30天前的终态任务/结果、90天前的审计（请按运维计划定期执行；当前未安装定时任务）：
 
@@ -258,14 +263,10 @@ docker compose run --rm maintenance /app/scripts/db_roles.py --retention
 ```
 
 审计只记录操作者、任务 ID、操作类型和允许/拒绝结果，不保存查询正文。任务/结果保存在 PG，模型会话另存于宿主机隔离的 CODEX_HOME；PG 清理不等于清理 Codex 会话或飞书消息。
-bridge 使用只读根文件系统、非 root 业务进程、独立 tmpfs、资源上限；PG 不发布端口。宿主机隔离目前是已核验的工具和文件策略，**不是独立 macOS 用户或虚拟机**，宿主机管理员仍属信任边界。
+bridge 使用只读根文件系统、非 root 业务进程、独立 tmpfs、资源上限。宿主机隔离目前是已核验的工具和文件策略，**不是独立 macOS 用户或虚拟机**，宿主机管理员仍属信任边界。
 
-备份：
-
-```bash
-mkdir -p .data
-docker compose exec -T db pg_dump -U octopus octopus > .data/octopus-backup.sql
-```
+数据库备份和恢复由 `local-infra` 按库管理，恢复时保留 `octopus` schema、App ID/运行账号绑定和迁移版本。数据对象应归 `octopus_owner` 所有，再执行本项目 maintenance 重建最小权限；不能把旧集群超级用户授权带入共享实例。
+完整应用恢复还需备份宿主机的隔离 `CODEX_HOME`；凭证应单独安全保存，不能写入备份日志或 Git。旧 PG 数据卷及迁移回退副本已清理；数据库恢复使用 `local-infra` 的日常备份。
 
 健康检查通过表示调度进程运行且飞书连接有近期心跳。首次权限和事件配置仍需通过真实私聊验证。
 
@@ -274,11 +275,10 @@ docker compose exec -T db pg_dump -U octopus octopus > .data/octopus-backup.sql
 ```bash
 uv sync --frozen --python 3.12
 uv run python -m unittest discover -s tests -v
-docker compose run --rm maintenance -c 'import os,unittest; from octopus.config import database_url_from_env; os.environ["OCTOPUS_TEST_DATABASE_URL"]=database_url_from_env(); r=unittest.TextTestRunner().run(unittest.defaultTestLoader.discover("/app/tests")); raise SystemExit(not r.wasSuccessful())'
 ```
 
 本地单元测试使用假 Codex 服务和模拟飞书接口；WebSocket 测试使用本地临时端口。
-数据库测试使用随机 schema；角色隔离测试还创建临时数据库和角色，完成后删除，不操作应用数据。需使用维护身份；未设置 `OCTOPUS_TEST_DATABASE_URL` 时跳过。
+数据库集成测试仅连接独立的临时测试 PG 实例，通过 `OCTOPUS_TEST_DATABASE_URL` 提供测试管理员连接；不要使用正式共享 PG 或 maintenance 凭证。测试使用随机 schema/数据库/角色，完成后删除，验证迁移 owner 无角色管理权限、runtime 无 DDL 和审计修改权限。未设置测试连接时跳过数据库测试。
 
 Python 依赖由 `uv.lock` 锁定，镜像使用含哈希的 `requirements.lock` 安装同一套依赖。
 

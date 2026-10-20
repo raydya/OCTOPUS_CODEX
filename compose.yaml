@@ -19,16 +19,13 @@ services:
     pids_limit: 128
     mem_limit: 768m
     cpus: 2
-    depends_on:
-      db:
-        condition: service_healthy
     environment:
       FEISHU_APP_ID: ${FEISHU_APP_ID:-}
       FEISHU_APP_SECRET_FILE: /run/octopus/feishu_app_secret
       FEISHU_ALLOWED_USERS: ${FEISHU_ALLOWED_USERS:-}
       FEISHU_ALLOW_GROUPS: ${FEISHU_ALLOW_GROUPS:-false}
       FEISHU_BOT_OPEN_ID: ${FEISHU_BOT_OPEN_ID:-}
-      POSTGRES_HOST: db
+      POSTGRES_HOST: shared-postgres
       POSTGRES_PORT: "5432"
       POSTGRES_USER: octopus_runtime
       POSTGRES_DB: ${POSTGRES_DB:-octopus}
@@ -69,61 +66,34 @@ services:
   maintenance:
     profiles: ["maintenance"]
     build: .
-    depends_on:
-      db:
-        condition: service_healthy
     entrypoint: ["/opt/venv/bin/python"]
-    command: ["/app/scripts/db_roles.py", "--password-file", "/run/secrets/postgres_runtime_password"]
+    command: ["/app/scripts/db_roles.py"]
     environment:
       FEISHU_APP_ID: ${FEISHU_APP_ID:-}
-      POSTGRES_HOST: db
-      POSTGRES_USER: ${POSTGRES_USER:-octopus}
+      POSTGRES_HOST: shared-postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: octopus_owner
       POSTGRES_DB: ${POSTGRES_DB:-octopus}
-      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_owner_password
     secrets:
-      - postgres_password
-      - postgres_runtime_password
+      - postgres_owner_password
     networks:
       - database
-
-  db:
-    image: postgres:17-bookworm
-    restart: unless-stopped
-    stop_grace_period: 30s
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-octopus}
-      POSTGRES_DB: ${POSTGRES_DB:-octopus}
-      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
-      PGDATA: /var/lib/postgresql/data
-    secrets:
-      - postgres_password
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    networks:
-      - database
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
-      interval: 5s
-      timeout: 5s
-      retries: 12
-      start_period: 10s
 
 secrets:
   postgres_runtime_password:
     file: ./.secrets/postgres_runtime_password
   query_token:
     file: ./.secrets/query_token
-  postgres_password:
-    file: ./.secrets/postgres_password
+  postgres_owner_password:
+    file: ./.secrets/postgres_owner_password
   codex_token:
     file: ./.secrets/codex_token
   feishu_app_secret:
     file: ./.secrets/feishu_app_secret
 
-volumes:
-  postgres_data:
-
 networks:
   database:
-    internal: true
+    external: true
+    name: local-infra-codex-db
   outbound:

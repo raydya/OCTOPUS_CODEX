@@ -25,7 +25,7 @@ if [[ -L "$PROJECT_ROOT/.env" || ! -f "$PROJECT_ROOT/.env" ]]; then
 fi
 chmod 0600 "$PROJECT_ROOT/.env"
 
-for secret_name in postgres_password postgres_runtime_password codex_token feishu_app_secret query_token; do
+for secret_name in postgres_owner_password postgres_runtime_password codex_token feishu_app_secret query_token; do
     secret_path="$SECRETS_DIR/$secret_name"
     if [[ -L "$secret_path" ]]; then
         printf 'Secret path must not be a symbolic link: %s\n' "$secret_name" >&2
@@ -47,3 +47,4 @@ done
 
 printf 'Local configuration is ready. Existing values were preserved.\n'
 printf 'Fill .env and .secrets/feishu_app_secret for the new Feishu application.\n'
+printf 'Have local-infra provision octopus_owner and octopus_runtime using the matching secret files before maintenance.\n'

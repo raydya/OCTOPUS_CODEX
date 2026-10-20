@@ -8,10 +8,10 @@ from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 from psycopg import AsyncConnection, sql
-from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from .contracts import IncomingMessage
+from .database import connect_database
 
 
 @dataclass(frozen=True)
@@ -70,7 +70,7 @@ class Store:
             raise ValueError("数据库 schema 必须是长度不超过 63 的安全标识符")
         if not isinstance(migrate, bool):
             raise ValueError("迁移开关必须是布尔值")
-        connection = await AsyncConnection.connect(database_url, autocommit=True, row_factory=dict_row, connect_timeout=10)
+        connection = await connect_database(database_url)
         store = cls(connection, schema)
         try:
             async with store._lock:

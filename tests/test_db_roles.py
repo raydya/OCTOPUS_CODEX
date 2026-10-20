@@ -15,7 +15,7 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 from octopus.contracts import IncomingMessage
 from octopus.store import Store
-from scripts.db_roles import main, provision
+from scripts.db_roles import main, maintain
 
 
 @unittest.skipUnless(os.environ.get("OCTOPUS_TEST_DATABASE_URL"), "Set OCTOPUS_TEST_DATABASE_URL to run PostgreSQL role integration tests")
@@ -27,14 +27,23 @@ class DatabaseRoleTests(unittest.IsolatedAsyncioTestCase):
         suffix = uuid.uuid4().hex
         self.database = f"octopus_test_db_{suffix}"
         self.role = f"octopus_test_role_{suffix}"
+        self.owner = f"octopus_test_owner_{suffix}"
         self.schema = "octopus_test"
         self.password = secrets.token_urlsafe(40)
-        async with await AsyncConnection.connect(self.admin_url, autocommit=True) as connection:
-            await connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(self.database)))
+        self.owner_password = secrets.token_urlsafe(40)
         self.addAsyncCleanup(self.drop_database_and_role)
+        async with await AsyncConnection.connect(self.admin_url, autocommit=True) as connection:
+            for role, password in ((self.owner, self.owner_password), (self.role, self.password)):
+                await connection.execute(sql.SQL(
+                    "CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD {}"
+                ).format(sql.Identifier(role), sql.Literal(password)))
+            await connection.execute(sql.SQL("CREATE DATABASE {} OWNER {}").format(
+                sql.Identifier(self.database), sql.Identifier(self.owner)))
+            await connection.execute(sql.SQL("REVOKE ALL ON DATABASE {} FROM PUBLIC").format(sql.Identifier(self.database)))
         admin_options = conninfo_to_dict(self.admin_url)
         admin_options["dbname"] = self.database
-        self.database_url = make_conninfo(**admin_options)
+        self.database_admin_url = make_conninfo(**admin_options)
+        self.database_url = make_conninfo(**dict(admin_options, user=self.owner, password=self.owner_password))
         runtime_options = dict(admin_options, user=self.role, password=self.password)
         self.runtime_url = make_conninfo(**runtime_options)
 
@@ -42,13 +51,14 @@ class DatabaseRoleTests(unittest.IsolatedAsyncioTestCase):
         async with await AsyncConnection.connect(self.admin_url, autocommit=True) as connection:
             await connection.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(self.database)))
             await connection.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(self.role)))
+            await connection.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(self.owner)))
 
     async def provision(self) -> None:
-        await provision(self.database_url, "cli_role_test", self.password, runtime_role=self.role, schema=self.schema)
+        await maintain(self.database_url, "cli_role_test", runtime_role=self.role, schema=self.schema)
 
     async def test_runtime_can_operate_bridge_but_cannot_change_schema_roles_or_audit(self) -> None:
         await self.provision()
-        await self.provision()  # Refreshing the managed role is idempotent.
+        await self.provision()  # Reapplying grants never rotates a runtime password.
         runtime = await Store.open(self.runtime_url, "cli_role_test", schema=self.schema, migrate=False)
         self.addAsyncCleanup(runtime.close)
         await runtime.add_owner("admin")
@@ -92,34 +102,50 @@ class DatabaseRoleTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(maintenance.close)
         self.assertEqual((await maintenance.purge_history())["audit_events"], 0)
 
-    async def test_existing_unmanaged_or_privileged_role_cannot_be_adopted(self) -> None:
+    async def test_owner_cannot_manage_cluster_roles_or_accept_admin_credentials(self) -> None:
         async with await AsyncConnection.connect(self.database_url, autocommit=True) as connection:
-            await connection.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(self.role)))
-        with self.assertRaisesRegex(ValueError, "不由此应用管理"):
+            with self.assertRaises(errors.InsufficientPrivilege):
+                await connection.execute("CREATE ROLE forbidden")
+            with self.assertRaises(errors.InsufficientPrivilege):
+                await connection.execute(sql.SQL("ALTER ROLE {} CREATEDB").format(sql.Identifier(self.role)))
+        with self.assertRaisesRegex(ValueError, "维护账号必须是本库所有者"):
+            await maintain(self.database_admin_url, "cli_role_test", runtime_role=self.role, schema=self.schema)
+
+    async def test_privileged_member_or_object_owner_runtime_cannot_be_adopted(self) -> None:
+        async with await AsyncConnection.connect(self.database_admin_url, autocommit=True) as connection:
+            await connection.execute(sql.SQL("ALTER ROLE {} CREATEDB").format(sql.Identifier(self.role)))
+        with self.assertRaisesRegex(ValueError, "无管理权限"):
             await self.provision()
-        async with await AsyncConnection.connect(self.database_url, autocommit=True) as connection:
-            await connection.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(self.role)))
-        await self.provision()
-        async with await AsyncConnection.connect(self.database_url, autocommit=True) as connection:
+        async with await AsyncConnection.connect(self.database_admin_url, autocommit=True) as connection:
+            await connection.execute(sql.SQL("ALTER ROLE {} NOCREATEDB").format(sql.Identifier(self.role)))
             await connection.execute(sql.SQL("GRANT pg_read_all_data TO {}").format(sql.Identifier(self.role)))
         with self.assertRaisesRegex(ValueError, "其他角色成员资格"):
             await self.provision()
-        async with await AsyncConnection.connect(self.database_url, autocommit=True) as connection:
+        async with await AsyncConnection.connect(self.database_admin_url, autocommit=True) as connection:
             await connection.execute(sql.SQL("REVOKE pg_read_all_data FROM {}").format(sql.Identifier(self.role)))
             await connection.execute(sql.SQL("CREATE SCHEMA forbidden_owner AUTHORIZATION {}").format(sql.Identifier(self.role)))
         with self.assertRaisesRegex(ValueError, "拥有数据库对象"):
             await self.provision()
 
-    async def test_invalid_identity_or_password_fails_before_migration(self) -> None:
+    async def test_missing_runtime_or_invalid_identity_fails_before_migration(self) -> None:
         for role in ("pg_unsafe", "bad;role", "bad-role", "x" * 64, ""):
             with self.assertRaises(ValueError):
-                await provision(self.database_url, "cli_role_test", self.password, runtime_role=role, schema=self.schema)
-        for password in ("short", "x" * 32 + "\n", "x" * 1025, "中" * 32):
-            with self.assertRaises(ValueError):
-                await provision(self.database_url, "cli_role_test", password, runtime_role=self.role, schema=self.schema)
+                await maintain(self.database_url, "cli_role_test", runtime_role=role, schema=self.schema)
+        with self.assertRaisesRegex(ValueError, "尚未由基础设施创建"):
+            await maintain(self.database_url, "cli_role_test", runtime_role="missing_runtime_" + uuid.uuid4().hex, schema=self.schema)
         async with await AsyncConnection.connect(self.database_url, autocommit=True) as connection:
             cursor = await connection.execute("SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = %s", (self.schema,))
             self.assertIsNone(await cursor.fetchone())
+
+    async def test_app_and_runtime_binding_survive_maintenance(self) -> None:
+        await self.provision()
+        with self.assertRaisesRegex(ValueError, "已绑定其他飞书应用"):
+            await maintain(self.database_url, "cli_other_app", runtime_role=self.role, schema=self.schema)
+        async with await AsyncConnection.connect(self.database_url, autocommit=True) as connection:
+            await connection.execute(sql.SQL("UPDATE {} SET value = 'different_runtime' WHERE key = 'runtime_role'").format(
+                sql.Identifier(self.schema, "meta")))
+        with self.assertRaisesRegex(ValueError, "已绑定另一个运行账号"):
+            await self.provision()
 
     async def test_retention_cli_needs_no_runtime_secret_and_prints_only_deletion_counts(self) -> None:
         await self.provision()
@@ -135,7 +161,6 @@ class DatabaseRoleTests(unittest.IsolatedAsyncioTestCase):
             patch.dict(os.environ, {"FEISHU_APP_ID": "cli_role_test"}),
             patch("sys.argv", ["db_roles.py", "--retention", "--schema", self.schema]),
             patch("scripts.db_roles.database_url_from_env", return_value=self.database_url),
-            patch("scripts.db_roles.read_password", side_effect=AssertionError("Must not read runtime password")),
             redirect_stdout(output),
         ):
             self.assertEqual(await asyncio.to_thread(main), 0)

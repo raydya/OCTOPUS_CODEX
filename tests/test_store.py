@@ -269,7 +269,11 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.store.acquire_service_lock())
         self.assertFalse(await second.acquire_service_lock())
         await self.store.close()
-        self.assertTrue(await second.acquire_service_lock())
+        # Closing the client socket does not wait for the independent server
+        # process to release its session locks. Startup also polls this lock.
+        async with asyncio.timeout(2):
+            while not await second.acquire_service_lock():
+                await asyncio.sleep(0.01)
 
     async def test_concurrent_recovery_does_not_return_the_same_job_twice(self) -> None:
         await self.store.enqueue("session", message("running"))

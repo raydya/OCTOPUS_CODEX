@@ -1,9 +1,8 @@
-"""Provision a restricted bridge login using the trusted maintenance identity.
+"""Migrate this application's schema and grant an existing restricted login.
 
-Run in the Python image with the administrator's POSTGRES_* environment and
-FEISHU_APP_ID. Supply the runtime password through a mounted local secret file,
-never through an argument or a database URL in shell history. This targets the
-dedicated application database; its PUBLIC CREATE/TEMP privileges are revoked.
+The infrastructure service owns role creation, passwords and cross-database
+access. Run with octopus_owner, never a cluster administrator. This command
+neither reads the runtime password nor creates/alters roles.
 """
 
 from __future__ import annotations
@@ -14,12 +13,11 @@ import json
 import os
 import re
 import sys
-from pathlib import Path
 
 from psycopg import AsyncConnection, sql
-from psycopg.rows import dict_row
 
 from octopus.config import database_url_from_env
+from octopus.database import connect_database
 from octopus.store import Store
 
 
@@ -42,77 +40,81 @@ def _identifier(value: str) -> str:
     return value
 
 
-def read_password(path: Path) -> str:
-    if path.stat().st_size > 4096:
-        raise ValueError("运行账号密码文件过大")
-    password = path.read_text().strip()
-    _password(password)
-    return password
+async def _owner_context(connection: AsyncConnection) -> dict:
+    cursor = await connection.execute(
+        """SELECT current_user AS owner, current_database() AS database,
+                  r.rolsuper, r.rolcreatedb, r.rolcreaterole, r.rolreplication, r.rolbypassrls,
+                  d.datdba = r.oid AS owns_database,
+                  EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members WHERE member = r.oid) AS has_membership
+           FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_database d ON d.datname = current_database()
+           WHERE r.rolname = current_user"""
+    )
+    context = await cursor.fetchone()
+    if not context or not context["owns_database"] or context["has_membership"] or any(
+        context[key] for key in ("rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
+    ):
+        raise ValueError("维护账号必须是本库所有者，不能有集群管理权限或其他角色成员资格")
+    return context
 
 
-def _password(password: str) -> None:
-    if not isinstance(password, str) or not 32 <= len(password) <= 1024 or any(ord(char) < 33 or ord(char) > 126 for char in password):
-        raise ValueError("运行账号密码必须是 32 至 1024 个可打印 ASCII 字符，且不能包含空白")
+async def _runtime_identity(connection: AsyncConnection, runtime_role: str, owner: str) -> None:
+    if runtime_role == owner:
+        raise ValueError("运行账号不能与维护账号相同")
+    cursor = await connection.execute(
+        """SELECT oid, rolcanlogin, rolinherit, rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls
+           FROM pg_catalog.pg_roles WHERE rolname = %s""", (runtime_role,),
+    )
+    existing = await cursor.fetchone()
+    if not existing:
+        raise ValueError("运行账号尚未由基础设施创建")
+    if not existing["rolcanlogin"] or any(
+        existing[key] for key in ("rolinherit", "rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
+    ):
+        raise ValueError("运行账号必须是无管理权限的专用 NOINHERIT LOGIN")
+    cursor = await connection.execute(
+        """SELECT 1 FROM pg_catalog.pg_shdepend
+           WHERE refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass AND refobjid = %s AND deptype = 'o'
+           UNION ALL SELECT 1 FROM pg_catalog.pg_auth_members WHERE member = %s LIMIT 1""",
+        (existing["oid"], existing["oid"]),
+    )
+    if await cursor.fetchone():
+        raise ValueError("运行账号拥有数据库对象或其他角色成员资格，不能安全复用")
 
 
-async def provision(
+async def maintain(
     database_url: str,
     app_id: str,
-    password: str,
     *,
     runtime_role: str = "octopus_runtime",
     schema: str = "octopus",
 ) -> None:
-    """Migrate as administrator, then create or refresh one known runtime login.
+    """Migrate using the database owner, then grant the pre-provisioned runtime.
 
-    Existing roles are accepted only when this schema already records them as
-    its managed runtime login. Owners and members of other roles are rejected,
-    because NOINHERIT alone would still allow SET ROLE to elevate privileges.
+    Infrastructure validates the intended role during first installation. Once
+    initialized, meta binds both the Feishu app and runtime role across upgrades.
     """
     _identifier(runtime_role)
     _identifier(schema)
-    _password(password)
+    # Fail before any schema changes if handed administrator/runtime credentials
+    # or an unsafe infrastructure-provisioned identity.
+    async with await connect_database(database_url) as connection:
+        context = await _owner_context(connection)
+        await _runtime_identity(connection, runtime_role, context["owner"])
     store = await Store.open(database_url, app_id, schema=schema)
     await store.close()
-    async with await AsyncConnection.connect(database_url, autocommit=True, row_factory=dict_row) as connection:
+    async with await connect_database(database_url) as connection:
         async with connection.transaction():
             await connection.execute(
                 "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(%s, 0))",
                 (f"octopus:db-role:{runtime_role}",),
             )
-            cursor = await connection.execute("SELECT current_user AS administrator, current_database() AS database")
-            context = await cursor.fetchone()
-            assert context is not None
-            if runtime_role == context["administrator"]:
-                raise ValueError("运行账号不能与维护账号相同")
+            context = await _owner_context(connection)
+            await _runtime_identity(connection, runtime_role, context["owner"])
             meta = sql.Identifier(schema, "meta")
             cursor = await connection.execute(sql.SQL("SELECT value FROM {} WHERE key = 'runtime_role'").format(meta))
             registered = await cursor.fetchone()
             if registered and registered["value"] != runtime_role:
                 raise ValueError("此应用已绑定另一个运行账号；请单独安排身份迁移")
-            cursor = await connection.execute("SELECT oid FROM pg_catalog.pg_roles WHERE rolname = %s", (runtime_role,))
-            existing = await cursor.fetchone()
-            if existing:
-                if not registered:
-                    raise ValueError("指定角色已存在且不由此应用管理，请使用新的专用角色名")
-                cursor = await connection.execute(
-                    """SELECT 1 FROM pg_catalog.pg_shdepend
-                       WHERE refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass AND refobjid = %s AND deptype = 'o'
-                       UNION ALL SELECT 1 FROM pg_catalog.pg_auth_members WHERE member = %s LIMIT 1""",
-                    (existing["oid"], existing["oid"]),
-                )
-                if await cursor.fetchone():
-                    raise ValueError("运行账号拥有数据库对象或其他角色成员资格，不能安全复用")
-            else:
-                await connection.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(runtime_role)))
-            # Utility statements do not accept bind parameters for passwords;
-            # psycopg's Literal performs SQL quoting without shell interpolation.
-            await connection.execute(
-                sql.SQL("ALTER ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD {} VALID UNTIL 'infinity'").format(
-                    sql.Identifier(runtime_role), sql.Literal(password)
-                )
-            )
-            await connection.execute(sql.SQL("ALTER ROLE {} RESET ALL").format(sql.Identifier(runtime_role)))
             database = sql.Identifier(context["database"])
             role = sql.Identifier(runtime_role)
             namespace = sql.Identifier(schema)
@@ -122,9 +124,7 @@ async def provision(
             await connection.execute(sql.SQL("REVOKE CREATE, TEMPORARY ON DATABASE {} FROM PUBLIC").format(database))
             await connection.execute(sql.SQL("REVOKE ALL PRIVILEGES ON DATABASE {} FROM {}").format(database, role))
             await connection.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(database, role))
-            cursor = await connection.execute("SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname NOT LIKE 'pg_%' AND nspname <> 'information_schema'")
-            for row in await cursor.fetchall():
-                await connection.execute(sql.SQL("REVOKE CREATE ON SCHEMA {} FROM PUBLIC").format(sql.Identifier(row["nspname"])))
+            await connection.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
             await connection.execute(sql.SQL("REVOKE ALL ON SCHEMA {} FROM PUBLIC, {}").format(namespace, role))
             await connection.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(namespace, role))
             await connection.execute(sql.SQL("REVOKE ALL ON ALL TABLES IN SCHEMA {} FROM PUBLIC, {}").format(namespace, role))
@@ -141,6 +141,8 @@ async def provision(
 async def retention(database_url: str, app_id: str, *, schema: str = "octopus", days: int = 30, audit_days: int = 90) -> dict[str, int]:
     """Purge expired data using maintenance credentials without rotating a login."""
     _identifier(schema)
+    async with await connect_database(database_url) as connection:
+        await _owner_context(connection)
     store = await Store.open(database_url, app_id, schema=schema, migrate=False)
     try:
         return await store.purge_history(days=days, audit_days=audit_days)
@@ -149,16 +151,13 @@ async def retention(database_url: str, app_id: str, *, schema: str = "octopus", 
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="使用维护账号配置最小权限运行账号或清理过期记录")
-    parser.add_argument("--password-file", type=Path)
+    parser = argparse.ArgumentParser(description="使用本库 owner 迁移、授权已有运行账号或清理过期记录")
     parser.add_argument("--role", default="octopus_runtime")
     parser.add_argument("--schema", default="octopus")
     parser.add_argument("--retention", action="store_true", help="仅清理过期记录，不读取或修改运行账号密码")
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--audit-days", type=int, default=90)
     args = parser.parse_args()
-    if not args.retention and args.password_file is None:
-        parser.error("配置运行账号时必须提供 --password-file；记录清理使用 --retention")
     try:
         app_id = os.environ.get("FEISHU_APP_ID", "")
         if not app_id:
@@ -167,11 +166,11 @@ def main() -> int:
             counts = asyncio.run(retention(database_url_from_env(), app_id, schema=args.schema, days=args.days, audit_days=args.audit_days))
             print(json.dumps(counts, sort_keys=True))
             return 0
-        asyncio.run(provision(database_url_from_env(), app_id, read_password(args.password_file), runtime_role=args.role, schema=args.schema))
+        asyncio.run(maintain(database_url_from_env(), app_id, runtime_role=args.role, schema=args.schema))
     except Exception as exc:
         # Driver errors may include connection strings or SQL password literals.
         # Keep failures actionable without disclosing them in logs.
-        print(f"数据库维护失败（{type(exc).__name__}）；检查维护账号、应用绑定、参数和本地密码文件。", file=sys.stderr)
+        print(f"数据库维护失败（{type(exc).__name__}）；检查本库 owner、预建运行账号、应用绑定和参数。", file=sys.stderr)
         return 1
     print("数据库迁移和运行账号授权完成；运行账号无 DDL、角色管理或审计修改权限。")
     return 0
