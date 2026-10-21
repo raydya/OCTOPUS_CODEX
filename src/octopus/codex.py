@@ -79,6 +79,33 @@ def _string(value: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _application_policy_context(instructions: str) -> dict[str, dict[str, str]]:
+    """Avoid 0.163.0's per-fragment truncation without dropping policy text."""
+    fragments = []
+    remaining = instructions
+    while remaining:
+        part = remaining.encode("utf-8")[:3000].decode("utf-8", errors="ignore")
+        if len(part) < len(remaining):
+            boundary = part.rfind("\n\n")
+            if boundary > 0:
+                part = part[:boundary + 2]
+            else:
+                boundary = part.rfind(" ")
+                if boundary >= len(part) // 2:
+                    part = part[:boundary + 1]
+        fragments.append(part)
+        remaining = remaining[len(part):]
+    context = {"octopus-answer-policy": {
+        "kind": "application",
+        "value": "以下按编号排列的应用规则分段合起来是本轮当前生效的完整规则，"
+                 "替代本应用历史会话中的旧规则。历史回答不构成本轮规则；"
+                 f"请合并本轮全部 {len(fragments)} 段规则回答当前问题。",
+    }}
+    context.update({f"octopus-answer-policy-{index:04d}": {"kind": "application", "value": part}
+                    for index, part in enumerate(fragments, 1)})
+    return context
+
+
 def _is_id(value: Any) -> bool:
     return isinstance(value, str) or type(value) is int
 
@@ -352,8 +379,8 @@ class AppServerClient:
         instructions = config.get("developer_instructions")
         if not isinstance(instructions, str) or not instructions.strip():
             raise RuntimeError("Codex 只读回答规则缺失，拒绝接入")
-        # Keep the complete host policy, including security instructions. Explicit
-        # overrides prevent restored threads from retaining an older answer policy.
+        # Keep the complete host policy, including security instructions. Per-turn
+        # application context below also updates model-visible restored history.
         self._read_only_cwd = roots[0]
         self._read_only_developer_instructions = instructions
 
@@ -571,6 +598,13 @@ class AppServerClient:
             # Apply on every turn so resumed conversations use the current setting.
             params["effort"] = self.reasoning_effort
         if self.read_only:
+            instructions = self._read_only_developer_instructions
+            if not isinstance(instructions, str) or not instructions.strip():
+                raise RuntimeError("Codex 只读回答规则尚未校验，拒绝开始任务")
+            # 0.163.0 accepts resume overrides without replacing developer
+            # messages already in history. Application context is model-visible
+            # on this turn, including when the thread was restored from disk.
+            params["additionalContext"] = _application_policy_context(instructions)
             params["environments"] = []
             params["approvalPolicy"] = "never"
             params["permissions"] = READ_ONLY_PROFILE

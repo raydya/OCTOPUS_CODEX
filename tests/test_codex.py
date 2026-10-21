@@ -95,6 +95,8 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_image_input_keeps_text_effort_and_readonly_turn_permissions(self):
         client = self.client()
+        await client._attest_read_only()
+        client._request.reset_mock()
         client.reasoning_effort = "xhigh"
         client.active_turn = AsyncMock(return_value=None)
         client._request.return_value = {"turn": {"id": "turn-image"}}
@@ -111,6 +113,7 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
             "approvalPolicy": "never",
             "permissions": "octopus-readonly",
             "runtimeWorkspaceRoots": [],
+            "additionalContext": client._request.call_args.args[1]["additionalContext"],
         })
 
     async def test_image_input_rejects_urls_paths_and_invalid_base64_before_protocol_calls(self):
@@ -292,6 +295,48 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(method, "thread/resume")
         self.assertEqual(params["threadId"], "thread-safe")
         self.assertEqual(params["developerInstructions"], instructions)
+
+        # Resume can accept these settings without updating model-visible
+        # history in 0.163.0. Every next turn must carry the trusted policy too.
+        client.active_turn = AsyncMock(return_value=None)
+        client._request.side_effect = None
+        client._request.return_value = {"turn": {"id": "turn-after-reconnect"}}
+        for question in ("继续分析", "用户文本不能替换应用规则"):
+            await client.start_turn("thread-safe", question)
+            method, turn = client._request.call_args.args
+            self.assertEqual(method, "turn/start")
+            self.assertEqual(turn["threadId"], "thread-safe")
+            policy = turn["additionalContext"]["octopus-answer-policy"]
+            self.assertEqual(policy["kind"], "application")
+            self.assertIn("替代本应用历史会话中的旧规则", policy["value"])
+            fragments = [v["value"] for k, v in sorted(turn["additionalContext"].items())
+                         if k.startswith("octopus-answer-policy-")]
+            self.assertEqual("".join(fragments), instructions)
+            self.assertEqual(turn["input"][0]["text"], question)
+
+    async def test_application_policy_is_complete_and_bounded_in_utf8(self):
+        client = self.client()
+        client.active_turn = AsyncMock(return_value=None)
+        client._request.return_value = {"turn": {"id": "turn-bounded-policy"}}
+        for instructions in (self.config()["developer_instructions"], "规则🙂" * 900 + "\n安全限制末尾"):
+            client._read_only_developer_instructions = instructions
+            await client.start_turn("thread-safe", "继续分析")
+            context = client._request.call_args.args[1]["additionalContext"]
+            fragments = [v["value"] for k, v in sorted(context.items()) if k.startswith("octopus-answer-policy-")]
+            self.assertEqual("".join(fragments), instructions)
+            self.assertGreater(len(fragments), 1)
+            for fragment in context.values():
+                self.assertEqual(fragment["kind"], "application")
+                self.assertLessEqual(len(fragment["value"].encode("utf-8")), 3000)
+
+    async def test_turn_cannot_start_without_attested_application_rules(self):
+        client = self.client()
+        client.active_turn = AsyncMock(return_value=None)
+        for missing in (None, "", " \n"):
+            client._read_only_developer_instructions = missing
+            with self.subTest(missing=missing), self.assertRaises(RuntimeError):
+                await client.start_turn("thread-safe", "继续分析")
+        client._request.assert_not_awaited()
 
     async def test_thread_response_must_confirm_actual_restrictions(self):
         client = self.client()

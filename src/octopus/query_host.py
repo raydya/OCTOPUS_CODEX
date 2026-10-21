@@ -65,6 +65,19 @@ _ALLOWED_ARGUMENTS = {
 class QueryError(Exception):
     """An intentionally generic, safe error suitable for returning to the bridge."""
 
+    def __init__(self, message: str, *, code: Optional[str] = None):
+        super().__init__(message)
+        self.code = code
+
+
+def _raise_tls_auth_error(value: Any) -> None:
+    # Inspect only the documented classification, never forward provider text,
+    # request IDs, login URLs, or credentials from stdout/stderr.
+    if (isinstance(value, dict) and value.get("status") == "failed"
+            and isinstance(value.get("error"), dict) and value["error"].get("kind") == "auth"):
+        raise QueryError("TLS authentication failed; an administrator must renew the host-side TLS login",
+                         code="tls_auth_required")
+
 
 def _string(value: Any, minimum: int = 1, maximum: int = 1024) -> str:
     if (not isinstance(value, str) or not minimum <= len(value) <= maximum
@@ -225,6 +238,15 @@ def run_cli(argv: list[str], *, tls: bool = False, timeout: Optional[float] = No
             raise QueryError("query provider timed out; narrow the query")
         process.wait(timeout=remaining)
         if process.returncode != 0:
+            if tls:
+                # volclog emits its structured failure envelope before exiting
+                # nonzero. Preserve its safe classification across the broker.
+                try:
+                    failure = _json(bytes(output))
+                except (ValueError, TypeError):
+                    pass
+                else:
+                    _raise_tls_auth_error(failure)
             raise QueryError("query provider failed; check its host-side authorization")
         try:
             return _json(bytes(output))
@@ -362,6 +384,7 @@ class QueryHost:
     def _tls(self, action, payload):
         data = self.runner(["ve", "volclog", "tool", "exec", action, "--input",
                             json.dumps(payload, ensure_ascii=False, separators=(",", ":")), "--output-mode", "stdout"], tls=True)
+        _raise_tls_auth_error(data)
         if not isinstance(data, dict) or data.get("status") != "success":
             raise QueryError("TLS query failed; check its host-side authorization and query scope")
         if not isinstance(data.get("summary", {}), dict):
@@ -574,7 +597,10 @@ class QueryHandler(BaseHTTPRequestHandler):
         except (ValueError, TypeError, FileNotFoundError, RecursionError):
             self._send(400, {"ok": False, "error": "invalid or forbidden query arguments"})
         except QueryError as exc:
-            self._send(502, {"ok": False, "error": str(exc)})
+            error = {"ok": False, "error": str(exc)}
+            if exc.code is not None:
+                error["error_code"] = exc.code
+            self._send(502, error)
         except (TimeoutError, socket.timeout):
             self._send(408, {"ok": False, "error": "request timed out"})
         except Exception:

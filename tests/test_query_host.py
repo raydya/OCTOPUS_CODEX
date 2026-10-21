@@ -167,6 +167,17 @@ class QueryHostTests(unittest.TestCase):
         self.assertTrue(self.runner.call_args.kwargs["tls"])
         self.assertEqual(argv[-2:], ["--output-mode", "stdout"])
 
+    def test_tls_auth_envelope_retains_only_safe_classification(self):
+        self.runner.return_value = {
+            "status": "failed", "data": None,
+            "error": {"kind": "auth", "message": "private-token", "hint": "private-login-url"},
+            "summary": {"deliveryMode": "stdout"},
+        }
+        with self.assertRaises(QueryError) as caught:
+            self.host.execute("tls_topics", {"query": "billing"})
+        self.assertEqual(caught.exception.code, "tls_auth_required")
+        self.assertNotIn("private", str(caught.exception))
+
     def test_tls_search_preserves_millisecond_units_and_enforces_window(self):
         self.runner.return_value = {"status": "success", "summary": {"deliveryMode": "stdout"}, "data": {"Logs": []}}
         args = {"topic_id": "topic-1", "query": 'level:ERROR AND service:"billing"',
@@ -283,6 +294,30 @@ class QueryHostTests(unittest.TestCase):
             run_cli([sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.1)
         self.assertLess(time.monotonic() - started, 5)
 
+    def test_nonzero_tls_cli_auth_error_is_classified_without_provider_details(self):
+        # Shape and exit code captured from a real expired volclog login.
+        envelope = {
+            "action": "tool.topic.describe-topics", "artifacts": [], "data": None,
+            "error": {"code": "CLIError", "hint": "private-login-url", "kind": "auth",
+                      "message": "private-token", "requestId": "", "source": "cli", "statusCode": 0},
+            "requestId": "", "status": "failed",
+            "summary": {"deliveryMode": "stdout", "dryRun": False, "itemCount": 0,
+                        "outputMode": "stdout", "totalBytes": 0},
+        }
+        program = "import sys; print(%r); print('private-stderr', file=sys.stderr); sys.exit(2)" % json.dumps(envelope)
+        for tls in (True, False):
+            with self.subTest(tls=tls), self.assertRaises(QueryError) as caught:
+                run_cli([sys.executable, "-c", program], tls=tls)
+            self.assertEqual(caught.exception.code, "tls_auth_required" if tls else None)
+            self.assertNotIn("private", str(caught.exception))
+        for output in ('not-json private-token', '{"status":"failed","error":"auth private-token"}',
+                       '{"status":"failed","error":{"kind":"unknown","message":"private-token"}}'):
+            program = "import sys; print(%r); sys.exit(2)" % output
+            with self.subTest(output=output), self.assertRaises(QueryError) as caught:
+                run_cli([sys.executable, "-c", program], tls=True)
+            self.assertIsNone(caught.exception.code)
+            self.assertNotIn("private", str(caught.exception))
+
     def test_tls_subprocess_metadata_and_no_token_inherited(self):
         program = "import json,os;print(json.dumps({k:os.environ.get(k) for k in ['VE_CALLER_TYPE','VE_CALLER_NAME','VE_SKILL_NAME','QUERY_SECRET']}))"
         with patch.dict(os.environ, {"QUERY_SECRET": "must-not-be-inherited"}):
@@ -376,6 +411,13 @@ class QueryHTTPTests(unittest.TestCase):
     def test_nonloopback_binding_is_rejected(self):
         with self.assertRaises(ValueError):
             QueryHTTPServer(("0.0.0.0", 4501), self.host, self.token)
+
+    def test_safe_tls_auth_classification_crosses_http_error_boundary(self):
+        self.host.execute.side_effect = QueryError("TLS authentication failed", code="tls_auth_required")
+        status, data = self.authorized(body=json.dumps({"tool": "tls_topics", "arguments": {}}))
+        self.assertEqual(status, 502)
+        self.assertEqual(data, {"ok": False, "error": "TLS authentication failed",
+                                "error_code": "tls_auth_required"})
 
     def test_concurrency_is_bounded_before_thread_creation(self):
         sockets = []

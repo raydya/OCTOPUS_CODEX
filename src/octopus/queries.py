@@ -5,6 +5,7 @@ import asyncio
 import json
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 from urllib.request import Request, build_opener, ProxyHandler, HTTPRedirectHandler
 
 
@@ -45,7 +46,8 @@ TOOL_SPECS = [
           {"query": S, "page_token": S, "limit": I}, ["query"]),
     _spec("docs_fetch", "读取飞书 doc/docx/wiki 文档；document 为文档链接或令牌，keyword 可缩小范围。",
           {"document": S, "keyword": S}, ["document"]),
-    _spec("tls_topics", "列出当前火山日志账号可访问的日志主题。",
+    _spec("tls_topics", "列出当前火山日志账号可访问的日志主题。query 只匹配项目/主题名称或ID，不检索日志内容。"
+          "服务名不一定是主题名；无匹配时先不传query分页查目录，再按项目选择主题，用tls_search检索服务或错误内容。",
           {"query": S, "project_id": S, "page": I}, []),
     _spec("tls_search", "搜索 TLS 原始日志，时间为 Unix 毫秒，窗口最多24小时，limit 最多100。"
           "仅检索表达式，不支持管道SQL。结果可能截断，不可把当前行数当总数。",
@@ -58,6 +60,26 @@ TOOL_SPECS = [
     _spec("grafana_search_dashboards", "按关键词查找 Grafana 仪表盘链接。", {"query": S}, ["query"]),
 ]
 TOOL_NAMES = frozenset(x["name"] for x in TOOL_SPECS)
+_HTTP_ERRORS = {
+    400: "查询参数无效或不在允许范围内；本次未执行查询。",
+    401: "查询桥接认证失败，需管理员检查服务配置；本次未获取查询结果。",
+    403: "查询桥接认证失败，需管理员检查服务配置；本次未获取查询结果。",
+    408: "查询请求超时；本次未获取查询结果。",
+    413: "查询请求超过大小上限；请缩小输入范围后重试。",
+    500: "查询服务内部错误；本次未获取查询结果。",
+    502: "查询提供方执行失败；本次未获取查询结果。",
+}
+_RESPONSE_TOO_LARGE = "查询结果超过大小上限；请缩小查询范围后重试。"
+
+
+def _query_failure(status: int | None = None, result: Any = None) -> dict[str, Any]:
+    # Only interpret a known machine code; provider messages may contain secrets.
+    if (status in (None, 502) and isinstance(result, dict) and result.get("ok") is False
+            and result.get("error_code") == "tls_auth_required"):
+        message = "TLS 查询身份已失效，需管理员在宿主机重新登录 TLS；本次未获取日志。"
+    else:
+        message = _HTTP_ERRORS.get(status, "查询服务请求失败；本次未获取查询结果。")
+    return {"ok": False, "error": message}
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -87,14 +109,33 @@ class QueryClient:
         try:
             with opener.open(request, timeout=65) as response:
                 payload = response.read(65537)
-            if len(payload) > 65536:
-                raise ValueError("Query response too large")
-            result = json.loads(payload)
-            if not isinstance(result, dict) or result.get("ok") is not True:
-                return {"ok": False, "error": "查询未完成；请检查参数、查询权限或服务连接。"}
-            return result
+        except HTTPError as exc:
+            try:
+                payload = exc.read(65537)
+                if len(payload) > 65536:
+                    return {"ok": False, "error": _RESPONSE_TOO_LARGE}
+                try:
+                    result = json.loads(payload)
+                except (ValueError, RecursionError):
+                    result = None
+                return _query_failure(exc.code, result)
+            except Exception:
+                return _query_failure(exc.code)
+            finally:
+                exc.close()
+        except TimeoutError:
+            return _query_failure(408)
         except Exception:
-            return {"ok": False, "error": "查询服务不可用或结果超出上限；请缩小范围重试。"}
+            return {"ok": False, "error": "查询服务连接失败或暂时不可用；本次未获取查询结果。"}
+        if len(payload) > 65536:
+            return {"ok": False, "error": _RESPONSE_TOO_LARGE}
+        try:
+            result = json.loads(payload)
+        except (ValueError, RecursionError):
+            return {"ok": False, "error": "查询服务返回了无效响应；本次未获取查询结果。"}
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            return _query_failure(result=result)
+        return result
 
     async def check(self) -> None:
         if not (await asyncio.to_thread(self._request, None)).get("ok"):
