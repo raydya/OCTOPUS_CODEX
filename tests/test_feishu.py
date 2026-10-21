@@ -40,7 +40,7 @@ class ParserTests(unittest.TestCase):
             event = incoming(chat_type="group", mentions=mentions,
                              content=json.dumps({"text": " @_user_1 \n"}), **metadata)
             message = parse_message(event, bot_open_id="ou_bot")
-            self.assertEqual(message.text, "请结合本话题上下文分析问题并给出处理建议。")
+            self.assertEqual(message.text, "请结合本话题上下文核验事实并回答其中的问题。")
             self.assertTrue(message.mentioned_bot)
             self.assertEqual(message.topic_id, metadata.get("root_id", message.id))
             self.assertIsNone(parse_message(event, bot_open_id="ou_other", require_group_mention=False))
@@ -281,6 +281,64 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 await messenger.fetch_thread_context(self.topic_trigger(**changes))
         api.get_message.assert_not_called()
         api.list_thread.assert_not_called()
+        await messenger.close()
+
+    async def test_topic_context_ignores_valid_empty_history_and_preserves_other_messages(self):
+        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        root = history("om_root", root_id="", create_time=500)
+        api.get_message.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[root]))
+        mention = SimpleNamespace(key="@_user_1")
+        for kind, content, mentions in (
+                ("text", {"text": " @_user_1 \n"}, [mention]),
+                ("text", {"text": ""}, []),
+                ("text", {"text": " \n\t"}, []),
+                ("post", {"content": [[{"tag": "at", "user_id": "ou_bot"}]]}, [mention]),
+                ("post", {"content": [[{"tag": "text", "text": "@_user_1"}]]}, [mention]),
+                ("post", {"content": []}, []),
+                ("post", {"zh_cn": {"title": "", "content": [[]]}}, [])):
+            with self.subTest(kind=kind, content=content):
+                empty = history("om_empty", msg_type=kind, mentions=mentions,
+                                body=SimpleNamespace(content=json.dumps(content)))
+                api.list_thread.return_value = SimpleNamespace(
+                    code=0, data=SimpleNamespace(items=[history(), empty, root]))
+                context = await messenger.fetch_thread_context(self.topic_trigger())
+                self.assertEqual([item.id for item in context], ["om_root", "om_previous"])
+                self.assertTrue(all(item.text == "问题详情" for item in context))
+        await messenger.close()
+
+    async def test_topic_context_empty_root_preserves_substantive_replies(self):
+        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        root = history("om_root", root_id="", create_time=500,
+                       body=SimpleNamespace(content=json.dumps({"text": "@_user_1"})),
+                       mentions=[SimpleNamespace(key="@_user_1")])
+        api.get_message.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[root]))
+        api.list_thread.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[history(), root]))
+        context = await messenger.fetch_thread_context(self.topic_trigger())
+        self.assertEqual([item.id for item in context], ["om_previous"])
+        await messenger.close()
+
+    async def test_topic_context_does_not_ignore_invalid_text_as_empty_history(self):
+        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        root = history("om_root", root_id="", create_time=500)
+        api.get_message.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[root]))
+        for content in ("{", "[]", "{}", '{"text": null}', '{"text": 123}', '{"text": []}'):
+            with self.subTest(content=content):
+                invalid = history("om_invalid", body=SimpleNamespace(content=content))
+                api.list_thread.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[invalid]))
+                with self.assertRaisesRegex(RuntimeError, THREAD_CONTEXT_UNAVAILABLE):
+                    await messenger.fetch_thread_context(self.topic_trigger())
+        await messenger.close()
+
+    async def test_topic_context_does_not_ignore_out_of_scope_empty_history(self):
+        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        root = history("om_root", root_id="", create_time=500)
+        api.get_message.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[root]))
+        for changes in ({"chat_id": "oc_other"}, {"root_id": "om_other"}, {"thread_id": "omt_other"}):
+            with self.subTest(changes=changes):
+                invalid = history("om_empty", body=SimpleNamespace(content=json.dumps({"text": ""})), **changes)
+                api.list_thread.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[invalid]))
+                with self.assertRaisesRegex(RuntimeError, THREAD_CONTEXT_UNAVAILABLE):
+                    await messenger.fetch_thread_context(self.topic_trigger())
         await messenger.close()
 
     async def test_topic_context_bounds_count_text_and_keeps_root_and_latest_details(self):

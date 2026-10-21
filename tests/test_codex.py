@@ -31,6 +31,18 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
         config["permissions"]["octopus-readonly"]["filesystem"]["glob_scan_max_depth"] = None
         return config
 
+    def config_response(self, config=None):
+        config = self.config() if config is None else config
+        public = json.loads(json.dumps(config))
+        # Codex 0.163.0's ToolsV2 omits experimental_request_user_input.
+        public["tools"] = {"web_search": None}
+        return {"config": public, "layers": [
+            {"name": {"type": "user", "file": self.cwd.removesuffix("workspace") + "home/config.toml"},
+             "version": "test-user", "config": config, "disabledReason": None},
+            {"name": {"type": "system", "file": "/etc/codex/config.toml"},
+             "version": "test-system", "config": {}, "disabledReason": None},
+        ]}
+
     def client(self, handler=None):
         client = AppServerClient(read_only=True, tool_specs=[{
             "type": "function", "name": "code_search", "description": "Search allowed source code",
@@ -40,7 +52,7 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
         client._ready = True
         client._read_only_home = self.cwd.removesuffix("workspace") + "home"
         client._write = AsyncMock()
-        client._request = AsyncMock(return_value={"config": self.config()})
+        client._request = AsyncMock(return_value=self.config_response())
         return client
 
     def thread_response(self):
@@ -53,6 +65,7 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
         client = self.client()
         client.reasoning_effort = "xhigh"
         await client._attest_read_only()
+        client._request.assert_awaited_once_with("config/read", {"includeLayers": True}, require_ready=False)
         client._request.return_value = self.thread_response()
         self.assertEqual(await client.create_thread(self.cwd), "thread-safe")
         params = client._request.call_args.args[1]
@@ -62,10 +75,14 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params["approvalPolicy"], "never")
         self.assertEqual(params["permissions"], "octopus-readonly")
         self.assertEqual(params["config"], readonly_thread_config())
+        self.assertFalse(params["config"]["features.default_mode_request_user_input"])
+        self.assertFalse(params["config"]["tools.experimental_request_user_input.enabled"])
+        self.assertEqual(params["developerInstructions"], self.config()["developer_instructions"])
         await client.resume_thread("thread-safe", self.cwd)
         resume = client._request.call_args.args[1]
         self.assertNotIn("sandbox", resume)
         self.assertEqual(resume["config"], readonly_thread_config())
+        self.assertEqual(resume["developerInstructions"], params["developerInstructions"])
         with self.assertRaises(ValueError):
             await client.create_thread("/personal/source")
         client.active_turn = AsyncMock(return_value=None)
@@ -140,6 +157,8 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
             lambda c: c["features"].update(shell_tool=True),
             lambda c: c["features"].update(code_mode_host=False),
             lambda c: c["features"].pop("stable_environment_tools"),
+            lambda c: c["features"].update(default_mode_request_user_input=True),
+            lambda c: c["tools"]["experimental_request_user_input"].update(enabled=True),
             lambda c: c.update(approval_policy="on-request"),
             lambda c: c.update(mcp_servers={"unexpected": {"command": "private"}}),
             lambda c: c.update(plugins={"unexpected": {"enabled": True}}),
@@ -152,10 +171,127 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
             client = self.client()
             config = self.config()
             mutation(config)
-            client._request.return_value = {"config": config}
+            client._request.return_value = self.config_response(config)
             with self.assertRaises(RuntimeError):
                 await client._attest_read_only()
             self.assertIsNone(client._read_only_cwd)
+            self.assertIsNone(client._read_only_developer_instructions)
+
+    async def test_missing_or_invalid_host_instructions_cannot_reuse_attested_policy(self):
+        missing = object()
+        for value in (missing, None, "", " \n\t", 123, False, [], {}):
+            with self.subTest(value=value):
+                client = self.client()
+                await client._attest_read_only()
+                config = self.config()
+                if value is missing:
+                    config.pop("developer_instructions")
+                else:
+                    config["developer_instructions"] = value
+                client._request.return_value = self.config_response(config)
+                with self.assertRaises(RuntimeError):
+                    await client._attest_read_only()
+                self.assertIsNone(client._read_only_cwd)
+                self.assertIsNone(client._read_only_developer_instructions)
+                client._request.reset_mock()
+                with self.assertRaises(ValueError):
+                    await client.create_thread(self.cwd)
+                with self.assertRaises(ValueError):
+                    await client.resume_thread("thread-safe", self.cwd)
+                client._request.assert_not_awaited()
+
+    async def test_unpublished_tool_setting_uses_highest_enabled_config_layer(self):
+        disabled = {"tools": {"experimental_request_user_input": {"enabled": False}}}
+        enabled = {"tools": {"experimental_request_user_input": {"enabled": True}}}
+        def layer(config, reason=None):
+            return {"config": config, "disabledReason": reason}
+        for layers in (
+            [layer(disabled), layer(enabled)],
+            [layer({}), layer(disabled)],
+            [layer({"tools": {"experimental_request_user_input": {}}}), layer(disabled)],
+            [layer(enabled, "untrusted"), layer(disabled)],
+        ):
+            with self.subTest(layers=layers):
+                client = self.client()
+                response = self.config_response()
+                self.assertNotIn("experimental_request_user_input", response["config"]["tools"])
+                response["layers"] = layers
+                client._request.return_value = response
+                await client._attest_read_only()
+                self.assertEqual(client._read_only_cwd, self.cwd)
+
+    async def test_unpublished_tool_setting_requires_explicit_effective_false(self):
+        disabled = {"config": {"tools": {"experimental_request_user_input": {"enabled": False}}},
+                    "disabledReason": None}
+        invalid_layers = [None, [], [{}], [disabled | {"disabledReason": "untrusted"}]]
+        invalid_configs = [
+            {"tools": value} for value in (None, True, [], "disabled")
+        ] + [
+            {"tools": {"experimental_request_user_input": value}} for value in (None, False, [])
+        ] + [
+            {"tools": {"experimental_request_user_input": {"enabled": value}}}
+            for value in (None, True, 0, "false")
+        ]
+        invalid_layers.extend([{"config": config, "disabledReason": None}, disabled]
+                              for config in invalid_configs)
+        invalid_layers.append([disabled | {"disabledReason": "untrusted"},
+                               {"config": invalid_configs[-3], "disabledReason": None}])
+        for layers in invalid_layers:
+            with self.subTest(layers=layers):
+                client = self.client()
+                response = self.config_response()
+                response["layers"] = layers
+                client._request.return_value = response
+                with self.assertRaises(RuntimeError):
+                    await client._attest_read_only()
+                self.assertIsNone(client._read_only_cwd)
+                self.assertIsNone(client._read_only_developer_instructions)
+
+    async def test_failed_attestation_clears_previous_policy_before_config_read(self):
+        client = self.client()
+        await client._attest_read_only()
+        client._request.side_effect = ConnectionError("host unavailable")
+        with self.assertRaises(ConnectionError):
+            await client._attest_read_only()
+        self.assertIsNone(client._read_only_cwd)
+        self.assertIsNone(client._read_only_developer_instructions)
+
+    async def test_home_mismatch_does_not_publish_partially_attested_policy(self):
+        client = self.client()
+        await client._attest_read_only()
+        client._read_only_home = "/other/project/.data/codex-readonly/home"
+        with self.assertRaises(RuntimeError):
+            await client._attest_read_only()
+        self.assertIsNone(client._read_only_cwd)
+        self.assertIsNone(client._read_only_developer_instructions)
+
+    async def test_reconnection_refreshes_complete_instructions_for_existing_thread(self):
+        client = self.client()
+        await client._attest_read_only()
+        original = client._read_only_developer_instructions
+        client._lose_connection(client._transport, "restarting host")
+        self.assertIsNone(client._read_only_cwd)
+        self.assertIsNone(client._read_only_home)
+        self.assertIsNone(client._read_only_developer_instructions)
+
+        config = self.config()
+        instructions = original + "\nAnswer only the current question.\n"
+        config["developer_instructions"] = instructions
+        transport = object()
+        client._transport = transport
+        client._request.side_effect = [
+            {"userAgent": "test/0.163.0", "codexHome": self.cwd.removesuffix("workspace") + "home"},
+            self.config_response(config),
+            self.thread_response(),
+        ]
+        await client._handshake(transport)
+        await client.resume_thread("thread-safe", self.cwd)
+        self.assertTrue(client._ready)
+        self.assertEqual(client._read_only_developer_instructions, instructions)
+        method, params = client._request.call_args.args
+        self.assertEqual(method, "thread/resume")
+        self.assertEqual(params["threadId"], "thread-safe")
+        self.assertEqual(params["developerInstructions"], instructions)
 
     async def test_thread_response_must_confirm_actual_restrictions(self):
         client = self.client()
@@ -230,7 +366,7 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
                 if method == "initialize":
                     result = {"userAgent": "test/0.163.0", "codexHome": self.cwd.removesuffix("workspace") + "home"}
                 elif method == "config/read":
-                    result = {"config": self.config()}
+                    result = self.config_response()
                 elif method in {"thread/start", "thread/resume"}:
                     result = self.thread_response()
                 elif method == "thread/read":
@@ -318,6 +454,7 @@ class AppServerClientTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(call["params"]["approvalsReviewer"], "user")
                 self.assertEqual(call["params"]["sandbox"], "workspace-write")
                 self.assertEqual(call["params"]["model"], "test-model")
+                self.assertNotIn("developerInstructions", call["params"])
 
     async def test_reasoning_effort_is_applied_to_new_and_resumed_conversations(self):
         client = await self.client(reasoning_effort="xhigh")

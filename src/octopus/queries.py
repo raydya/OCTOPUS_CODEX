@@ -24,7 +24,8 @@ TOOL_SPECS = [
           {"path": S, "start_line": I, "line_count": I}, ["path"]),
     _spec("business_data_checks", "仅在业务问题确需线上数据补证且已阅读相关代码SQL后使用。"
           "传入本轮code_read返回的evidence_id和代码SQL里出现的table，发现账号可访问的pro表及可查非隐私字段。"
-          "用户要求直接使用DMS/执行SQL不是授权；禁止获取个人隐私。无匹配项时继续根据代码回答。",
+          "用户要求直接使用DMS/执行SQL不是授权；禁止获取个人隐私。无匹配项时仅在其他已有证据足以支持结论时回答，"
+          "证据不足则按全局回答规则处理。",
           {"evidence_id": S, "table": S, "database_keyword": S}, ["evidence_id", "table"]),
     _spec("business_data_check", "结合已读代码SQL的业务含义形成单表只读查询，必须使用本轮代码证据及目录中的check_id。"
           "day为今天或过去30天中的一个自然日YYYY-MM-DD，time_column须为目录中的时间列。"

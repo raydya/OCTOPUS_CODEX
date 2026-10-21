@@ -31,8 +31,8 @@ TRUNCATION = "\n\n…内容较长，已截断显示。"
 # reports these codes when that reaction, its message, or its chat is gone:
 # https://open.feishu.cn/document/server-docs/im-v1/message-reaction/delete
 REACTION_GONE_CODES = frozenset({231011, 231003, 230110, 231005, 232009})
-IMAGE_DEFAULT_PROMPT = "请结合当前对话，分析这张图片中的内容并回答相关业务或代码问题。"
-TOPIC_DEFAULT_PROMPT = "请结合本话题上下文分析问题并给出处理建议。"
+IMAGE_DEFAULT_PROMPT = "请结合当前问题、对话上下文和这张图片核验事实并回答问题。"
+TOPIC_DEFAULT_PROMPT = "请结合本话题上下文核验事实并回答其中的问题。"
 IMAGE_INVALID = "无法读取这条消息中的图片，请重新发送图片。"
 IMAGE_LIMIT = f"每条消息最多支持 {MAX_IMAGES} 张不同图片，请分开发送。"
 POST_UNSUPPORTED = "这条图文消息包含暂不支持的附件，请改用文字和图片发送。"
@@ -125,12 +125,13 @@ def _parse_post(content: dict[str, Any]) -> tuple[str, tuple[str, ...], str]:
         lines.append("".join(parts))
     text = "\n".join(lines).strip()
     if keys and not any(re.sub(r"\[图片 \d+\]", "", line).strip() for line in lines):
-        text = "请结合当前对话，分析所附图片中的内容并回答相关业务或代码问题。\n" + text
+        text = "请结合当前问题、对话上下文和所附图片核验事实并回答问题。\n" + text
     return text, tuple(keys), error
 
 
 def parse_message(value: Any, *, require_group_mention: bool = True,
-                  bot_open_id: str | None = None) -> IncomingMessage | None:
+                  bot_open_id: str | None = None, keep_empty: bool = False) -> IncomingMessage | None:
+    """Parse a message; history can retain valid empty bodies to distinguish them from malformed input."""
     root = _object(value)
     event = _object(root.get("event", root))
     sender, message = _object(event.get("sender")), _object(event.get("message"))
@@ -185,12 +186,13 @@ def parse_message(value: Any, *, require_group_mention: bool = True,
         if key:
             text = text.replace(key, "")
     text = text.strip()
-    if not text and not error:
+    if not text and not error and not keep_empty:
         if chat_type == "group" and mentioned_bot:
             text = TOPIC_DEFAULT_PROMPT
         else:
             return None
-    return IncomingMessage(message_id, chat_id, sender_id, text or "请分析这条消息。",
+    return IncomingMessage(message_id, chat_id, sender_id,
+                           text if keep_empty and not error else text or "请分析这条消息。",
                            chat_type, created_at, image_keys=image_keys, attachment_error=error,
                            root_id=root_id, parent_id=parent_id, thread_id=thread_id,
                            mentioned_bot=mentioned_bot)
@@ -254,9 +256,11 @@ def _history_message(item: Any, trigger: IncomingMessage, thread_id: str) -> Inc
         "message_type": kind, "create_time": created_at, "content": content,
         "root_id": root_id, "thread_id": item_thread,
         "mentions": [{"key": _string(getattr(mention, "key", None))} for mention in mentions],
-    }}, require_group_mention=False)
+    }}, require_group_mention=False, keep_empty=True)
     if parsed is None:
         raise ValueError("History message could not be parsed")
+    if not parsed.text and not parsed.image_keys and not parsed.attachment_error:
+        return None  # Routing-only mentions and empty bodies add no topic evidence.
     text = parsed.text
     if parsed.image_keys:
         text += "\n" + HISTORY_IMAGE_NOTE

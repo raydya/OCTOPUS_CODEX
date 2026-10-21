@@ -26,7 +26,8 @@ READ_ONLY_DISABLED_FEATURES = tuple((
     "skill_search skill_mcp_dependency_install hooks memories multi_agent multi_agent_v2 "
     "browser_use browser_use_external browser_use_full_cdp_access computer_use in_app_browser "
     "code_mode code_mode_only image_generation view_image request_permissions_tool "
-    "exec_permission_approvals stable_environment_tools workspace_dependencies goals realtime_conversation"
+    "exec_permission_approvals stable_environment_tools workspace_dependencies goals realtime_conversation "
+    "default_mode_request_user_input"
 ).split())
 
 
@@ -44,11 +45,34 @@ def readonly_thread_config() -> dict[str, Any]:
         "skills.include_instructions": False, "skills.bundled.enabled": False,
         "cloud.skills.enabled": False, "orchestrator.mcp.enabled": False,
         "apps._default.enabled": False, "agents.enabled": False,
+        "tools.experimental_request_user_input.enabled": False,
     }
 
 
 def _object(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _config_layer_value(layers: Any, key: str) -> Any:
+    """Read a leaf from Codex 0.163.0's highest-to-lowest config layers."""
+    if not isinstance(layers, list):
+        return None
+    for layer in layers:
+        if not isinstance(layer, dict):
+            return None
+        if layer.get("disabledReason") is not None:
+            continue
+        value = layer.get("config")
+        for part in key.split("."):
+            # A higher-priority scalar/array parent replaces the lower table.
+            if not isinstance(value, dict):
+                return None
+            if part not in value:
+                break
+            value = value[part]
+        else:
+            return value
+    return None
 
 
 def _string(value: Any) -> str:
@@ -145,6 +169,7 @@ class AppServerClient:
         self._tool_tasks: dict[RequestId, asyncio.Task[Any]] = {}
         self._read_only_cwd: str | None = None
         self._read_only_home: str | None = None
+        self._read_only_developer_instructions: str | None = None
         if url:
             parsed = urlsplit(url)
             if parsed.scheme not in {"ws", "wss"} or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
@@ -289,12 +314,19 @@ class AppServerClient:
 
     async def _attest_read_only(self) -> None:
         """Refuse a personal or drifted host before any colleague thread loads."""
-        result = _object(await self._request("config/read", {"includeLayers": False}, require_ready=False))
+        self._read_only_cwd = None
+        self._read_only_developer_instructions = None
+        result = _object(await self._request("config/read", {"includeLayers": True}, require_ready=False))
         config = _object(result.get("config"))
         for key, expected in readonly_thread_config().items():
-            actual: Any = config
-            for part in key.split("."):
-                actual = _object(actual).get(part)
+            if key == "tools.experimental_request_user_input.enabled":
+                # ToolsV2 only serializes web_search in 0.163.0. The original
+                # layers retain this supported runtime setting without loss.
+                actual = _config_layer_value(result.get("layers"), key)
+            else:
+                actual: Any = config
+                for part in key.split("."):
+                    actual = _object(actual).get(part)
             if actual != expected or type(actual) is not type(expected):
                 raise RuntimeError("Codex 只读隔离配置校验失败，拒绝接入")
         if (config.get("approval_policy") != "never"
@@ -315,10 +347,15 @@ class AppServerClient:
                 or _object(profile.get("network")).get("enabled") is not False
                 or profile.get("workspace_roots")):
             raise RuntimeError("Codex 只读文件系统权限校验失败，拒绝接入")
-        self._read_only_cwd = roots[0]
         if self._read_only_home != roots[0].removesuffix("workspace") + "home":
-            self._read_only_cwd = None
             raise RuntimeError("Codex 只读配置目录与工作目录不匹配")
+        instructions = config.get("developer_instructions")
+        if not isinstance(instructions, str) or not instructions.strip():
+            raise RuntimeError("Codex 只读回答规则缺失，拒绝接入")
+        # Keep the complete host policy, including security instructions. Explicit
+        # overrides prevent restored threads from retaining an older answer policy.
+        self._read_only_cwd = roots[0]
+        self._read_only_developer_instructions = instructions
 
     def _thread_permissions(self, cwd: str) -> dict[str, Any]:
         if not self.read_only:
@@ -326,9 +363,12 @@ class AppServerClient:
                     "approvalsReviewer": "user"}
         if not self._read_only_cwd or cwd.rstrip("/") != self._read_only_cwd:
             raise ValueError("Codex 只读模式必须使用隔离工作目录")
+        if self._read_only_developer_instructions is None:
+            raise RuntimeError("Codex 只读回答规则尚未校验，拒绝创建或恢复会话")
         return {"cwd": self._read_only_cwd, "runtimeWorkspaceRoots": [],
                 "permissions": READ_ONLY_PROFILE, "approvalPolicy": "never",
-                "approvalsReviewer": "user", "config": readonly_thread_config()}
+                "approvalsReviewer": "user", "config": readonly_thread_config(),
+                "developerInstructions": self._read_only_developer_instructions}
 
     def _check_thread_permissions(self, result: dict[str, Any]) -> None:
         if not self.read_only:
@@ -406,6 +446,7 @@ class AppServerClient:
         self._tool_tasks.clear()
         self._read_only_cwd = None
         self._read_only_home = None
+        self._read_only_developer_instructions = None
         if not self._closed:
             self._emit(CodexEvent("disconnect", error=reason, text=reason))
 
