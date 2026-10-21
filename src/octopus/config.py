@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -69,6 +70,7 @@ class Config:
     min_interval_seconds: int = 2
     max_tool_calls: int = 30
     database_migrate: bool = True
+    support_group_ids: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls) -> Config:
@@ -105,6 +107,14 @@ class Config:
         elif not Path(workspace).is_dir():
             raise ConfigurationError("本地模式的 CODEX_WORKSPACE 目录不存在")
         allow_groups = os.environ.get("FEISHU_ALLOW_GROUPS", "false").lower() == "true"
+        support_group_ids = tuple(dict.fromkeys(
+            value.strip() for value in os.environ.get("FEISHU_SUPPORT_GROUP_IDS", "").split(",")
+            if value.strip()
+        ))
+        if any(not re.fullmatch(r"oc_[A-Za-z0-9_-]{1,128}", value) for value in support_group_ids):
+            raise ConfigurationError("FEISHU_SUPPORT_GROUP_IDS 必须是逗号分隔的精确 oc_ 群 ID")
+        if support_group_ids and not allow_groups:
+            raise ConfigurationError("配置答疑群需同时设置 FEISHU_ALLOW_GROUPS=true")
         bot_open_id = os.environ.get("FEISHU_BOT_OPEN_ID", "").strip() or None
         if allow_groups and (not bot_open_id or not bot_open_id.startswith("ou_")):
             raise ConfigurationError("启用群聊需设置新应用机器人自己的 FEISHU_BOT_OPEN_ID，以精确识别 @机器人")
@@ -119,8 +129,10 @@ class Config:
             raise ConfigurationError(
                 "CODEX_REASONING_EFFORT 必须为 low、medium、high、xhigh、max、ultra 或留空"
             )
-        if read_only and allow_groups:
-            raise ConfigurationError("共同查询模式暂只允许私聊，避免向未授权群成员公开结果")
+        if read_only and allow_groups and not support_group_ids:
+            raise ConfigurationError("共同查询群聊需配置 FEISHU_SUPPORT_GROUP_IDS，仅向指定群开放")
+        if support_group_ids and not read_only:
+            raise ConfigurationError("答疑群仅支持 CODEX_READ_ONLY=true 的受控查询模式")
         query_url = os.environ.get("QUERY_HOST_URL", "http://host.docker.internal:4501").strip()
         query_token_file = os.environ.get("QUERY_TOKEN_FILE", "").strip() or None
         if read_only:
@@ -150,4 +162,5 @@ class Config:
             min_interval_seconds=_integer("MIN_REQUEST_INTERVAL_SECONDS", 2, 0, 60),
             max_tool_calls=_integer("MAX_TOOL_CALLS", 30, 1, 100),
             database_migrate=os.environ.get("DATABASE_MIGRATE", "true").lower() == "true",
+            support_group_ids=support_group_ids,
         )

@@ -641,7 +641,7 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await self.store.set_member_enabled("owner", value)
         with self.assertRaisesRegex(ValueError, "成员不存在"):
-            await self.store.set_member_enabled("missing", False)
+            await self.store.set_member_enabled("missing", True)
         for value in (0, -1, True, 3651):
             with self.assertRaises(ValueError):
                 await self.store.purge_history(days=value)

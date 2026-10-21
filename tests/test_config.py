@@ -86,3 +86,16 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(overrides=overrides), patch.dict(os.environ, {**secure, **overrides}, clear=True):
                 with self.assertRaises(ConfigurationError):
                     Config.from_env()
+
+    def test_support_groups_require_exact_ids_bot_and_readonly_mode(self):
+        secure = {**self.env, "CODEX_READ_ONLY": "true", "QUERY_TOKEN_FILE": str(self.token),
+                  "FEISHU_ALLOW_GROUPS": "true", "FEISHU_BOT_OPEN_ID": "ou_bot",
+                  "FEISHU_SUPPORT_GROUP_IDS": " oc_support , oc_support,oc_second "}
+        with patch.dict(os.environ, secure, clear=True):
+            self.assertEqual(Config.from_env().support_group_ids, ("oc_support", "oc_second"))
+        for override in ({"FEISHU_SUPPORT_GROUP_IDS": "*"}, {"FEISHU_SUPPORT_GROUP_IDS": "质检工具问题反馈"},
+                         {"FEISHU_ALLOW_GROUPS": "false"}, {"FEISHU_BOT_OPEN_ID": ""},
+                         {"CODEX_READ_ONLY": "false"}):
+            with self.subTest(override=override), patch.dict(os.environ, {**secure, **override}, clear=True):
+                with self.assertRaises(ConfigurationError):
+                    Config.from_env()

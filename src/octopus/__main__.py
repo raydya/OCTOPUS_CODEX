@@ -80,7 +80,8 @@ async def run(wait_for_config: bool) -> None:
                 pass
         if stop.is_set():
             return
-        messenger = FeishuMessenger(config.app_id, config.app_secret, logger=log.info, bot_open_id=config.bot_open_id)
+        messenger = FeishuMessenger(config.app_id, config.app_secret, logger=log.info,
+                                    bot_open_id=config.bot_open_id, support_group_ids=config.support_group_ids)
         queries = QueryClient(config.query_url, config.query_token_file) if config.read_only else None
         bridge = Bridge(config, store, messenger, codex_client(config), queries=queries)
         await bridge.start()
@@ -198,7 +199,7 @@ async def manage(args: argparse.Namespace) -> None:
         if args.operation == "add":
             await store.ensure_member(args.open_id, "admin" if args.admin else "member")
         else:
-            if not await store.member(args.open_id):
+            if args.operation == "enable" and not await store.member(args.open_id):
                 raise ConfigurationError("成员不存在")
             await store.set_member_enabled(args.open_id, args.operation == "enable")
         await store.audit("local-admin", "member." + args.operation, args.open_id, "complete")

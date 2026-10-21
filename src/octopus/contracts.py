@@ -14,6 +14,10 @@ class IncomingMessage:
     created_at: int
     image_keys: tuple[str, ...] = ()
     attachment_error: str = ""
+    root_id: str = ""
+    parent_id: str = ""
+    thread_id: str = ""
+    mentioned_bot: bool = False
 
     def __post_init__(self) -> None:
         # JSONB and listener IPC restore tuples as lists. Old records omit both
@@ -21,6 +25,12 @@ class IncomingMessage:
         if not isinstance(self.image_keys, (tuple, list)):
             raise ValueError("Image references must be a list or tuple")
         object.__setattr__(self, "image_keys", tuple(self.image_keys))
+
+    @property
+    def topic_id(self) -> str:
+        # The first message may not have a thread_id until the first reply.
+        # Reply events retain the root message ID across that transition.
+        return self.root_id or self.id
 
 
 @dataclass(frozen=True)
@@ -85,6 +95,7 @@ class Messenger(Protocol):
     async def add_reaction(self, message_id: str, emoji_type: str = "Typing") -> str: ...
     async def remove_reaction(self, message_id: str, reaction_id: str) -> None: ...
     async def download_image(self, message_id: str, image_key: str) -> bytes: ...
+    async def fetch_thread_context(self, message: IncomingMessage) -> tuple[IncomingMessage, ...]: ...
     async def close(self) -> None: ...
 
 

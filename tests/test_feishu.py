@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
 
-from octopus.contracts import Button, CardAction, View
-from octopus.feishu import (CARD_BUDGET, FeishuMessenger, _LarkApi, _heartbeat, _post_with_timeout, _roundtrip,
+from octopus.contracts import Button, CardAction, IncomingMessage, View
+from octopus.feishu import (CARD_BUDGET, THREAD_CONTEXT_UNAVAILABLE, FeishuMessenger, _LarkApi,
+                            _heartbeat, _post_with_timeout, _roundtrip,
                             build_card, parse_action, parse_message)
 from octopus.images import MAX_IMAGE_BYTES, MAX_IMAGES, ImageInputError
 
@@ -22,7 +23,53 @@ def incoming(**changes):
                        "message": message}}
 
 
+def history(message_id="om_previous", **changes):
+    values = {"message_id": message_id, "chat_id": "oc_support", "root_id": "om_root",
+              "thread_id": "omt_topic", "create_time": 1000, "update_time": 0, "deleted": False,
+              "msg_type": "text", "body": SimpleNamespace(content=json.dumps({"text": "问题详情"})),
+              "sender": SimpleNamespace(sender_type="user", id_type="open_id", id="ou_colleague"),
+              "mentions": []}
+    values.update(changes)
+    return SimpleNamespace(**values)
+
+
 class ParserTests(unittest.TestCase):
+    def test_exact_bot_mention_alone_uses_topic_context_without_accepting_empty_chat(self):
+        mentions = [{"key": "@_user_1", "id": {"open_id": "ou_bot"}}]
+        for metadata in ({}, {"root_id": "om_root", "parent_id": "om_root", "thread_id": "omt_topic"}):
+            event = incoming(chat_type="group", mentions=mentions,
+                             content=json.dumps({"text": " @_user_1 \n"}), **metadata)
+            message = parse_message(event, bot_open_id="ou_bot")
+            self.assertEqual(message.text, "请结合本话题上下文分析问题并给出处理建议。")
+            self.assertTrue(message.mentioned_bot)
+            self.assertEqual(message.topic_id, metadata.get("root_id", message.id))
+            self.assertIsNone(parse_message(event, bot_open_id="ou_other", require_group_mention=False))
+            self.assertIsNone(parse_message(event, require_group_mention=False))
+        post = incoming(chat_type="group", message_type="post", mentions=mentions,
+                        content=json.dumps({"content": [[{"tag": "at", "user_id": "ou_bot"}]]}))
+        self.assertIn("本话题上下文", parse_message(post, bot_open_id="ou_bot").text)
+        for chat_type in ("p2p", "group"):
+            empty = incoming(chat_type=chat_type, content=json.dumps({"text": " \n"}))
+            self.assertIsNone(parse_message(empty, bot_open_id="ou_bot", require_group_mention=False))
+
+    def test_topic_metadata_survives_roundtrip_and_keeps_root_identity(self):
+        event = incoming(chat_type="group", root_id="om_root", parent_id="om_root", thread_id="omt_topic",
+                         mentions=[{"key": "@_user_1", "id": {"open_id": "ou_bot"}}])
+        message = parse_message(event, bot_open_id="ou_bot")
+        self.assertEqual((message.root_id, message.parent_id, message.thread_id),
+                         ("om_root", "om_root", "omt_topic"))
+        self.assertTrue(message.mentioned_bot)
+        self.assertEqual(message.topic_id, "om_root")
+        self.assertEqual(IncomingMessage(**json.loads(json.dumps(asdict(message)))), message)
+        first = parse_message(incoming())
+        self.assertEqual(first.topic_id, first.id)
+        self.assertFalse(first.mentioned_bot)
+        self.assertEqual((first.root_id, first.parent_id, first.thread_id), ("", "", ""))
+        for changes in ({"root_id": "om_../../secret"}, {"thread_id": "https://example.invalid/topic"},
+                        {"parent_id": "om_parent", "root_id": ""}, {"root_id": ["om_root"]}):
+            invalid = {**event, "event": {**event["event"], "message": {**event["event"]["message"], **changes}}}
+            self.assertIsNone(parse_message(invalid, bot_open_id="ou_bot"))
+
     def test_messages_filter_and_remove_mentions(self):
         self.assertEqual(parse_message(incoming()).text, "hello")
         for changes in ({"message_type": "file"}, {"content": "not-json"},
@@ -174,16 +221,129 @@ class ParserTests(unittest.TestCase):
 
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
-    def messenger(self, api=None):
+    def messenger(self, api=None, **options):
         self.logs = []
         if api is None:
             api = Mock()
             api.send.return_value = SimpleNamespace(code=0, data=SimpleNamespace(message_id="om_reply"))
             api.send_user.return_value = SimpleNamespace(code=0, data=SimpleNamespace(message_id="om_direct"))
             api.update.return_value = SimpleNamespace(code=0)
-        messenger = FeishuMessenger("cli_separate", "secret-never-log", self.logs.append, api=api)
+        messenger = FeishuMessenger("cli_separate", "secret-never-log", self.logs.append, api=api, **options)
         messenger._connection = Mock()
         return messenger, api
+
+    async def test_support_group_replies_stay_in_topic_without_changing_other_chats(self):
+        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        view = View("result", "", "处理结果")
+        await messenger.send("oc_support", view, "om_question")
+        self.assertTrue(api.send.call_args.args[4])
+        self.assertEqual(api.send.call_args.args[2], "om_question")
+        await messenger.send("oc_other", view, "om_question")
+        self.assertFalse(api.send.call_args.args[4])
+        await messenger.send("oc_support", view)
+        self.assertFalse(api.send.call_args.args[4])
+        await messenger.close()
+
+    def topic_trigger(self, **changes):
+        return replace(IncomingMessage("om_current", "oc_support", "ou_questioner", "请排查", "group", 2000,
+                                       root_id="om_root", parent_id="om_root", thread_id="omt_topic",
+                                       mentioned_bot=True), **changes)
+
+    async def test_topic_context_is_scoped_prior_human_history_with_no_image_downloads(self):
+        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        root = history("om_root", root_id="", create_time=500)
+        post = history("om_post", create_time=1200, msg_type="post", body=SimpleNamespace(content=json.dumps({
+            "content": [[{"tag": "text", "text": "截图如下"}, {"tag": "img", "image_key": "img_history"}]]})))
+        image = history("om_image", create_time=1300, msg_type="image",
+                        body=SimpleNamespace(content=json.dumps({"image_key": "img_history2"})))
+        items = [history("om_bot", sender=SimpleNamespace(sender_type="app")),
+                 history("om_deleted", deleted=True), history("om_future", create_time=2001),
+                 history("om_current", create_time=2000), history("om_later_edit", update_time=2001),
+                 post, image, history(), root]
+        api.get_message.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[root]))
+        api.list_thread.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=items, has_more=True))
+        context = await messenger.fetch_thread_context(self.topic_trigger())
+        self.assertEqual([item.id for item in context], ["om_root", "om_previous", "om_post", "om_image"])
+        self.assertTrue(all(item.image_keys == () and not item.attachment_error for item in context))
+        self.assertIn("历史图片未读取", context[-1].text)
+        self.assertIn("历史图片未读取", context[-2].text)
+        api.get_message.assert_called_once_with("om_root")
+        api.list_thread.assert_called_once_with("omt_topic")
+        api.download_image.assert_not_called()
+        await messenger.close()
+
+    async def test_new_topic_skips_history_and_unapproved_chat_never_reads_any_messages(self):
+        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        self.assertEqual(await messenger.fetch_thread_context(self.topic_trigger(root_id="", parent_id="")), ())
+        for changes in ({"chat_id": "oc_other"}, {"chat_type": "p2p"}, {"mentioned_bot": False},
+                        {"root_id": "om_../secret"}, {"thread_id": "omt_bad?secret"}):
+            with self.assertRaisesRegex(RuntimeError, THREAD_CONTEXT_UNAVAILABLE):
+                await messenger.fetch_thread_context(self.topic_trigger(**changes))
+        api.get_message.assert_not_called()
+        api.list_thread.assert_not_called()
+        await messenger.close()
+
+    async def test_topic_context_bounds_count_text_and_keeps_root_and_latest_details(self):
+        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        body = SimpleNamespace(content=json.dumps({"text": "证据" * 3000}))
+        root = history("om_root", root_id="", create_time=500, body=body)
+        api.get_message.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[root]))
+        api.list_thread.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[
+            history(f"om_history{index}", create_time=1000 + index, body=body) for index in range(20)]))
+        context = await messenger.fetch_thread_context(self.topic_trigger())
+        self.assertLessEqual(len(context), 12)
+        self.assertLessEqual(sum(len(item.text) for item in context), 12000)
+        self.assertEqual(context[0].id, "om_root")
+        self.assertEqual(context[-1].id, "om_history19")
+        self.assertTrue(all("截断" in item.text for item in context))
+        await messenger.close()
+
+    async def test_topic_context_rejects_cross_chat_cross_thread_and_wrong_root(self):
+        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        root = history("om_root", root_id="", create_time=500)
+        api.get_message.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[root]))
+        for item in (history(chat_id="oc_private"), history(root_id="om_other"),
+                     history(thread_id="omt_other"), history(thread_id=""),
+                     history(message_id="om_../outside")):
+            api.list_thread.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[item]))
+            with self.assertRaisesRegex(RuntimeError, THREAD_CONTEXT_UNAVAILABLE):
+                await messenger.fetch_thread_context(self.topic_trigger())
+        api.list_thread.reset_mock()
+        for invalid_root in (history("om_other", root_id=""), history("om_root", chat_id="oc_private"),
+                             history("om_root", thread_id="omt_other")):
+            api.get_message.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[invalid_root]))
+            with self.assertRaisesRegex(RuntimeError, THREAD_CONTEXT_UNAVAILABLE):
+                await messenger.fetch_thread_context(self.topic_trigger())
+        api.list_thread.assert_not_called()
+        await messenger.close()
+
+    async def test_topic_context_failure_is_explicit_and_does_not_leak_api_details(self):
+        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        for response in (SimpleNamespace(code=99991672, msg="private-token"),
+                         SimpleNamespace(code=0, data=SimpleNamespace(items=[]))):
+            api.get_message.return_value = response
+            with self.assertRaises(RuntimeError) as error:
+                await messenger.fetch_thread_context(self.topic_trigger())
+            self.assertEqual(str(error.exception), THREAD_CONTEXT_UNAVAILABLE)
+        api.get_message.side_effect = RuntimeError("private-token private-chat-content")
+        with self.assertRaises(RuntimeError) as error:
+            await messenger.fetch_thread_context(self.topic_trigger())
+        self.assertEqual(str(error.exception), THREAD_CONTEXT_UNAVAILABLE)
+        self.assertEqual(self.logs, [])
+        await messenger.close()
+
+    async def test_plain_reply_root_fetch_can_discover_thread_without_guessing(self):
+        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        root = history("om_root", root_id="", thread_id="", create_time=500)
+        api.get_message.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[root]))
+        context = await messenger.fetch_thread_context(self.topic_trigger(thread_id=""))
+        self.assertEqual([item.id for item in context], ["om_root"])
+        api.list_thread.assert_not_called()
+        root.thread_id = "omt_discovered"
+        api.list_thread.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[]))
+        await messenger.fetch_thread_context(self.topic_trigger(thread_id=""))
+        api.list_thread.assert_called_once_with("omt_discovered")
+        await messenger.close()
 
     async def test_send_reply_update_and_no_sensitive_error_details(self):
         messenger, api = self.messenger()
@@ -495,6 +655,24 @@ class ReactionSdkTests(unittest.TestCase):
         request = resource.reply.call_args.args[0]
         self.assertEqual(request.paths, {"message_id": "om_input"})
         self.assertEqual(request.request_body.uuid, "request2")
+        self.assertFalse(request.request_body.reply_in_thread)
+        api.send("oc_chat", "content", "om_input", "request3", True)
+        request = resource.reply.call_args.args[0]
+        self.assertEqual(request.paths, {"message_id": "om_input"})
+        self.assertTrue(request.request_body.reply_in_thread)
+
+    def test_sdk_history_reads_exact_root_and_one_bounded_thread_page(self):
+        api = _LarkApi.__new__(_LarkApi)
+        api.client = Mock()
+        resource = api.client.im.v1.message
+        api.get_message("om_root")
+        request = resource.get.call_args.args[0]
+        self.assertEqual(request.paths, {"message_id": "om_root"})
+        self.assertEqual(dict(request.queries), {"user_id_type": "open_id"})
+        api.list_thread("omt_topic")
+        request = resource.list.call_args.args[0]
+        self.assertEqual(dict(request.queries), {"container_id_type": "thread", "container_id": "omt_topic",
+                                               "sort_type": "ByCreateTimeDesc", "page_size": "20"})
 
 
 class ImageDownloadSdkTests(unittest.TestCase):

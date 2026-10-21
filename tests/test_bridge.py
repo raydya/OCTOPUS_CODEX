@@ -60,9 +60,12 @@ class MemoryStore:
     async def acquire_service_lock(self) -> bool:
         return True
 
-    async def session(self, key: str, chat_id: str, sender_id: str) -> Session:
+    async def session(self, key: str, chat_id: str, sender_id: str, *, topic_id: str = "") -> Session:
+        if topic_id:
+            sender_id = ""
         if key not in self.sessions:
-            self.sessions[key] = Session(key, chat_id, sender_id, None)
+            self.sessions[key] = Session(key, chat_id, sender_id, None,
+                                         scope="topic" if topic_id else "personal", topic_id=topic_id)
         session = self.sessions[key]
         if (session.chat_id, session.sender_id) != (chat_id, sender_id):
             raise ValueError("Session ownership mismatch")
@@ -72,8 +75,13 @@ class MemoryStore:
         return self.sessions.get(key)
 
     async def set_thread(self, key: str, thread_id: str | None) -> None:
-        self.sessions[key] = replace(self.sessions[key], thread_id=thread_id)
+        self.sessions[key] = replace(self.sessions[key], thread_id=thread_id,
+                                     data_context_restricted=self.sessions[key].data_context_restricted
+                                     if thread_id else False)
         self.changed.set()
+
+    async def restrict_session_data(self, key: str) -> None:
+        self.sessions[key] = replace(self.sessions[key], data_context_restricted=True)
 
     async def set_blocked(self, key: str, reason: str | None) -> None:
         self.sessions[key] = replace(self.sessions[key], blocked_reason=reason)
@@ -132,6 +140,14 @@ class MemoryStore:
             self.jobs[job.id] = replace(job, state="failed", error="任务已取消")
         self.changed.set()
         return len(pending)
+
+    async def cancel_queued_job(self, identifier: str) -> bool:
+        job = self.jobs[identifier]
+        if job.state != "queued":
+            return False
+        self.jobs[identifier] = replace(job, state="failed", error="任务已取消")
+        self.changed.set()
+        return True
 
     async def recover_interrupted(self) -> list[Job]:
         recovered = []

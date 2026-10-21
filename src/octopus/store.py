@@ -22,6 +22,9 @@ class Session:
     sender_id: str
     thread_id: str | None
     blocked_reason: str | None = None
+    scope: Literal["personal", "topic"] = "personal"
+    topic_id: str = ""
+    data_context_restricted: bool = False
 
 
 @dataclass(frozen=True)
@@ -37,7 +40,7 @@ class Job:
 INTERRUPTED_ERROR = "服务重启，上一任务结果未确认；不会自动重跑"
 CONTROL_INTERRUPTED_ERROR = "服务重启，控制命令结果未确认；不会自动重放，请重新发送"
 MEMBER_DISABLED_ERROR = "成员已停用，任务已取消"
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 
 def _now() -> int:
@@ -54,6 +57,23 @@ def _positive_limit(value: int, field: str, maximum: int = 1_000_000) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
         raise ValueError(f"{field} 必须是 1 至 {maximum} 的整数")
     return value
+
+
+def _support_groups(group_ids: tuple[str, ...]) -> None:
+    if (not isinstance(group_ids, tuple)
+            or any(not isinstance(group_id, str)
+                   or not re.fullmatch(r"oc_[A-Za-z0-9_-]{1,128}", group_id)
+                   for group_id in group_ids)):
+        raise ValueError("支持群必须是明确的群 ID 元组")
+
+
+def _message_authorized(message: IncomingMessage, member: dict[str, Any] | None,
+                        group_ids: tuple[str, ...]) -> bool:
+    if member is not None and not member["enabled"]:
+        return False
+    if message.chat_type == "group":
+        return bool(message.mentioned_bot and message.chat_id in group_ids)
+    return message.chat_type == "p2p" and member is not None
 
 
 class Store(AccessStore):
@@ -122,21 +142,38 @@ class Store(AccessStore):
             self._service_lock_acquired = bool(row and row["acquired"])
             return self._service_lock_acquired
 
-    async def session(self, key: str, chat_id: str, sender_id: str) -> Session:
+    async def session(self, key: str, chat_id: str, sender_id: str, *, topic_id: str = "") -> Session:
+        if not isinstance(topic_id, str):
+            raise ValueError("话题 ID 必须是文本")
+        scope = "topic" if topic_id else "personal"
+        if topic_id:
+            # A topic is a shared conversation, not a global membership grant.
+            # Keep its key namespace disjoint from all personal sessions.
+            if (not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", chat_id)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", topic_id)
+                    or not key.endswith(f":group:{chat_id}:{topic_id}")):
+                raise ValueError("群话题会话键必须绑定此群和话题")
+            sender_id = ""
         async with self._lock:
             now = _now()
             await self._db.execute(
-                "INSERT INTO sessions (key, chat_id, sender_id, created_at, updated_at) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (key) DO NOTHING",
-                (key, chat_id, sender_id, now, now),
+                """INSERT INTO sessions (key, chat_id, sender_id, scope, topic_id, created_at, updated_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (key) DO NOTHING""",
+                (key, chat_id, sender_id, scope, topic_id, now, now),
             )
             session = await self._get_session(key)
             assert session is not None
-            if session.chat_id != chat_id or session.sender_id != sender_id:
+            if (session.chat_id != chat_id or session.sender_id != sender_id
+                    or session.scope != scope or session.topic_id != topic_id):
                 raise ValueError("会话键已绑定其他聊天或用户")
             return session
 
     async def _get_session(self, key: str) -> Session | None:
-        cursor = await self._db.execute("SELECT key, chat_id, sender_id, thread_id, blocked_reason FROM sessions WHERE key = %s", (key,))
+        cursor = await self._db.execute(
+            """SELECT key, chat_id, sender_id, thread_id, blocked_reason, scope, topic_id,
+                      data_context_restricted FROM sessions WHERE key = %s""",
+            (key,),
+        )
         row = await cursor.fetchone()
         return Session(**row) if row else None
 
@@ -146,9 +183,28 @@ class Store(AccessStore):
 
     async def set_thread(self, key: str, thread_id: str | None) -> None:
         async with self._lock:
-            cursor = await self._db.execute("UPDATE sessions SET thread_id = %s, updated_at = %s WHERE key = %s", (thread_id, _now(), key))
+            cursor = await self._db.execute(
+                """UPDATE sessions SET thread_id = %s,
+                       data_context_restricted = CASE WHEN %s THEN FALSE ELSE data_context_restricted END,
+                       updated_at = %s WHERE key = %s""",
+                (thread_id, thread_id is None, _now(), key),
+            )
             if not cursor.rowcount:
                 raise ValueError("会话不存在")
+
+    async def restrict_session_data(self, key: str) -> None:
+        """Keep a shared thread's database restriction until an explicit reset.
+
+        A bounded history fetch can forget old inputs, but Codex still retains
+        its thread context. Only replacing that thread may clear this marker.
+        """
+        async with self._lock:
+            cursor = await self._db.execute(
+                "UPDATE sessions SET data_context_restricted = TRUE, updated_at = %s WHERE key = %s AND scope = 'topic'",
+                (_now(), key),
+            )
+            if not cursor.rowcount:
+                raise ValueError("群话题会话不存在")
 
     async def set_blocked(self, key: str, reason: str | None) -> None:
         async with self._lock:
@@ -181,6 +237,8 @@ class Store(AccessStore):
         max_pending: int = 3,
         daily_limit: int = 100,
         min_interval_seconds: float = 2,
+        *,
+        support_group_ids: tuple[str, ...] = (),
     ) -> str:
         """Atomically authorize and enqueue a task, limiting each sender across chats.
 
@@ -189,6 +247,7 @@ class Store(AccessStore):
         The advisory lock is shared with revocation and works across connections.
         """
         _metadata(message.sender_id, "成员 ID", 256)
+        _support_groups(support_group_ids)
         _positive_limit(max_pending, "排队上限", 1000)
         _positive_limit(daily_limit, "每日任务上限")
         if isinstance(min_interval_seconds, bool) or not isinstance(min_interval_seconds, (int, float)) or not math.isfinite(min_interval_seconds) or not 0 <= min_interval_seconds <= 86400:
@@ -197,14 +256,19 @@ class Store(AccessStore):
             async with self._db.transaction():
                 await self._member_lock(message.sender_id)
                 session = await self._get_session(session_key)
-                if session is None or session.sender_id != message.sender_id or session.chat_id != message.chat_id:
+                group = message.chat_type == "group"
+                if (session is None or session.chat_id != message.chat_id
+                        or (group and (session.scope != "topic" or session.topic_id != message.topic_id
+                                       or session.sender_id != ""))
+                        or (not group and (session.scope != "personal" or session.topic_id
+                                           or session.sender_id != message.sender_id))):
                     raise ValueError("会话未绑定此聊天和用户")
                 cursor = await self._db.execute("SELECT 1 FROM jobs WHERE id = %s", (message.id,))
                 if await cursor.fetchone():
                     return "duplicate"
                 cursor = await self._db.execute("SELECT enabled FROM users WHERE open_id = %s", (message.sender_id,))
                 member = await cursor.fetchone()
-                if not member or not member["enabled"]:
+                if not _message_authorized(message, member, support_group_ids):
                     return "disabled"
                 now = _now()
                 cursor = await self._db.execute(
@@ -238,8 +302,11 @@ class Store(AccessStore):
                        SELECT jobs.*, row_number() OVER (PARTITION BY message_json->>'sender_id' ORDER BY sequence) AS actor_rank
                        FROM jobs JOIN sessions ON sessions.key = jobs.session_key
                        WHERE jobs.state = 'queued' AND (NOT %s OR sessions.blocked_reason IS NULL)
+                         AND (NOT %s OR sessions.scope <> 'topic' OR NOT EXISTS (
+                             SELECT 1 FROM jobs AS earlier WHERE earlier.session_key = jobs.session_key
+                               AND earlier.state = 'queued' AND earlier.sequence < jobs.sequence))
                    ) AS pending ORDER BY actor_rank, sequence LIMIT 100""",
-                (eligible_only,),
+                (eligible_only, eligible_only),
             )
             return [_job(row) for row in await cursor.fetchall()]
 
@@ -297,6 +364,15 @@ class Store(AccessStore):
                 (_now(), session_key),
             )
             return cursor.rowcount
+
+    async def cancel_queued_job(self, job_id: str) -> bool:
+        """Cancel one rejected actor's job without affecting a shared topic."""
+        async with self._lock:
+            cursor = await self._db.execute(
+                "UPDATE jobs SET state = 'failed', error = '任务已取消', updated_at = %s WHERE id = %s AND state = 'queued'",
+                (_now(), job_id),
+            )
+            return cursor.rowcount == 1
 
     async def retire_legacy_jobs(self, current_prefix: str, reason: str) -> list[Job]:
         """Retire all queued jobs outside the current policy, keeping their history."""
@@ -407,7 +483,14 @@ class Store(AccessStore):
                 now = _now()
                 cursor = await self._db.execute("UPDATE users SET enabled = %s, updated_at = %s WHERE open_id = %s", (enabled, now, open_id))
                 if not cursor.rowcount:
-                    raise ValueError("成员不存在")
+                    if enabled:
+                        raise ValueError("成员不存在")
+                    # Group-only actors have no global membership. Persist an
+                    # explicit denial without ever granting private-chat access.
+                    await self._db.execute(
+                        "INSERT INTO users (open_id, role, enabled, created_at, updated_at) VALUES (%s, 'member', FALSE, %s, %s)",
+                        (open_id, now, now),
+                    )
                 if not enabled:
                     # Running work must be interrupted by the bridge: changing a
                     # database state cannot prove its external execution stopped.
@@ -470,19 +553,24 @@ class Store(AccessStore):
             cursor = await self._db.execute("INSERT INTO inbound_ids (id, created_at) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING", (id, _now()))
             return cursor.rowcount == 1
 
-    async def enqueue_control(self, message: IncomingMessage, *, max_pending: int | None = None) -> bool:
+    async def enqueue_control(self, message: IncomingMessage, *, max_pending: int | None = None,
+                              support_group_ids: tuple[str, ...] = ()) -> bool:
+        _support_groups(support_group_ids)
         if max_pending is not None:
             _positive_limit(max_pending, "控制命令排队上限", 1000)
+        check_authorization = max_pending is not None or bool(support_group_ids)
+        if check_authorization:
             _metadata(message.sender_id, "成员 ID", 256)
         async with self._lock:
             async with self._db.transaction():
                 now = _now()
-                if max_pending is not None:
+                if check_authorization:
                     await self._member_lock(message.sender_id)
                     cursor = await self._db.execute("SELECT enabled FROM users WHERE open_id = %s", (message.sender_id,))
                     member = await cursor.fetchone()
-                    if not member or not member["enabled"]:
+                    if not _message_authorized(message, member, support_group_ids):
                         return False
+                if max_pending is not None:
                     cursor = await self._db.execute(
                         """SELECT COUNT(*) FILTER (WHERE state IN ('queued', 'running')) AS pending,
                                   COUNT(*) FILTER (WHERE created_at >= %s) AS daily
@@ -549,6 +637,9 @@ _SCHEMA = (
         updated_at BIGINT NOT NULL
     )""",
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS blocked_reason TEXT",
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'personal' CHECK (scope IN ('personal', 'topic'))",
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS topic_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS data_context_restricted BOOLEAN NOT NULL DEFAULT FALSE",
     """CREATE TABLE IF NOT EXISTS jobs (
         sequence BIGSERIAL PRIMARY KEY,
         id TEXT NOT NULL UNIQUE,

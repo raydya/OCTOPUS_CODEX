@@ -14,7 +14,7 @@ import multiprocessing
 import re
 import time
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, Callable
 
 from .contracts import ActionHandler, CardAction, IncomingMessage, MessageHandler, View
@@ -32,12 +32,20 @@ TRUNCATION = "\n\n…内容较长，已截断显示。"
 # https://open.feishu.cn/document/server-docs/im-v1/message-reaction/delete
 REACTION_GONE_CODES = frozenset({231011, 231003, 230110, 231005, 232009})
 IMAGE_DEFAULT_PROMPT = "请结合当前对话，分析这张图片中的内容并回答相关业务或代码问题。"
+TOPIC_DEFAULT_PROMPT = "请结合本话题上下文分析问题并给出处理建议。"
 IMAGE_INVALID = "无法读取这条消息中的图片，请重新发送图片。"
 IMAGE_LIMIT = f"每条消息最多支持 {MAX_IMAGES} 张不同图片，请分开发送。"
 POST_UNSUPPORTED = "这条图文消息包含暂不支持的附件，请改用文字和图片发送。"
 IMAGE_DOWNLOAD_FAILED = "图片下载失败，请稍后重新发送图片；如果仍然失败，请联系管理员。"
 IMAGE_TOO_LARGE = "图片超过 5 MiB，请压缩后重新发送。"
 IMAGE_DOWNLOAD_TIMEOUT = 45.0
+THREAD_CONTEXT_PAGE_SIZE = 20
+THREAD_CONTEXT_MESSAGES = 12
+THREAD_CONTEXT_CHARS = 12_000
+THREAD_CONTEXT_ITEM_CHARS = 2_000
+THREAD_CONTEXT_UNAVAILABLE = "无法读取这个话题的上下文，请重新发送问题详情，或联系管理员检查消息读取权限。"
+HISTORY_IMAGE_NOTE = "[历史图片未读取；如需分析图片，请在 @ 机器人的当前消息中重新发送。]"
+HISTORY_TRUNCATION = "\n[历史正文已截断]"
 
 
 def _valid_image_key(value: Any) -> bool:
@@ -46,6 +54,10 @@ def _valid_image_key(value: Any) -> bool:
 
 def _valid_image_message_id(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(r"om_[A-Za-z0-9_-]{1,253}", value) is not None
+
+
+def _valid_thread_id(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"omt_[A-Za-z0-9_-]{1,252}", value) is not None
 
 
 def _object(value: Any) -> dict[str, Any]:
@@ -132,10 +144,16 @@ def parse_message(value: Any, *, require_group_mention: bool = True,
         return None
     mentions = message.get("mentions")
     mentions = [_object(item) for item in mentions] if isinstance(mentions, list) else []
-    if chat_type == "group" and require_group_mention:
-        if not bot_open_id or not any(_string(item.get("key")) and
-            _object(item.get("id")).get("open_id") == bot_open_id for item in mentions):
-            return None
+    mentioned_bot = bool(bot_open_id and any(_string(item.get("key")) and
+                         _object(item.get("id")).get("open_id") == bot_open_id for item in mentions))
+    if chat_type == "group" and require_group_mention and not mentioned_bot:
+        return None
+    root_id, parent_id, thread_id = (message.get(field) or "" for field in
+                                   ("root_id", "parent_id", "thread_id"))
+    if (any(value and not _valid_image_message_id(value) for value in (root_id, parent_id))
+            or thread_id and not _valid_thread_id(thread_id)
+            or chat_type == "group" and parent_id and not root_id):
+        return None
     try:
         created_at = int(message.get("create_time", ""))
     except (ValueError, TypeError):
@@ -168,9 +186,14 @@ def parse_message(value: Any, *, require_group_mention: bool = True,
             text = text.replace(key, "")
     text = text.strip()
     if not text and not error:
-        return None
+        if chat_type == "group" and mentioned_bot:
+            text = TOPIC_DEFAULT_PROMPT
+        else:
+            return None
     return IncomingMessage(message_id, chat_id, sender_id, text or "请分析这条消息。",
-                           chat_type, created_at, image_keys=image_keys, attachment_error=error)
+                           chat_type, created_at, image_keys=image_keys, attachment_error=error,
+                           root_id=root_id, parent_id=parent_id, thread_id=thread_id,
+                           mentioned_bot=mentioned_bot)
 
 
 def parse_action(value: Any) -> CardAction | None:
@@ -186,6 +209,62 @@ def parse_action(value: Any) -> CardAction | None:
             or not ticket_id or len(ticket_id) > 128 or decision not in ("accept", "decline")):
         return None
     return CardAction(ticket_id, decision, sender_id, chat_id, message_id)
+
+
+def _history_message(item: Any, trigger: IncomingMessage, thread_id: str) -> IncomingMessage | None:
+    """Bind every history item to the event's topic before inspecting content."""
+    message_id = _string(getattr(item, "message_id", None))
+    root_id = _string(getattr(item, "root_id", None))
+    item_thread = _string(getattr(item, "thread_id", None))
+    is_root = message_id == trigger.topic_id
+    if (not _valid_image_message_id(message_id) or getattr(item, "chat_id", None) != trigger.chat_id
+            or (is_root and root_id not in ("", trigger.topic_id))
+            or (not is_root and root_id != trigger.topic_id)
+            or (thread_id and item_thread != thread_id)):
+        raise ValueError("History item is outside the triggering topic")
+    try:
+        created_at = int(getattr(item, "create_time", 0))
+        updated_at = int(getattr(item, "update_time", 0) or 0)
+    except (ValueError, TypeError):
+        raise ValueError("History item has no valid timestamp") from None
+    if created_at <= 0:
+        raise ValueError("History item has no valid timestamp")
+    if (message_id == trigger.id or created_at > trigger.created_at or updated_at > trigger.created_at
+            or getattr(item, "deleted", False)):
+        return None
+    sender = getattr(item, "sender", None)
+    if getattr(sender, "sender_type", None) != "user":
+        return None
+    if getattr(sender, "id_type", None) != "open_id" or not _string(getattr(sender, "id", None)):
+        raise ValueError("History sender has no valid identity")
+    kind = getattr(item, "msg_type", None)
+    if kind not in ("text", "post", "image"):
+        return None
+    content = getattr(getattr(item, "body", None), "content", None)
+    if not isinstance(content, str):
+        raise ValueError("History message has no valid body")
+    if len(content) > 200_000:
+        kind, content = "text", _json({"text": "[此条历史消息过长，未读取正文。]"})
+    if kind == "image":
+        kind, content = "text", _json({"text": HISTORY_IMAGE_NOTE})
+    mentions = getattr(item, "mentions", None) or []
+    parsed = parse_message({"sender": {"sender_type": "user", "sender_id": {
+        "open_id": sender.id}}, "message": {
+        "message_id": message_id, "chat_id": trigger.chat_id, "chat_type": "group",
+        "message_type": kind, "create_time": created_at, "content": content,
+        "root_id": root_id, "thread_id": item_thread,
+        "mentions": [{"key": _string(getattr(mention, "key", None))} for mention in mentions],
+    }}, require_group_mention=False)
+    if parsed is None:
+        raise ValueError("History message could not be parsed")
+    text = parsed.text
+    if parsed.image_keys:
+        text += "\n" + HISTORY_IMAGE_NOTE
+    if parsed.attachment_error:
+        text += "\n[此条历史消息含未读取的附件。]"
+    if len(text) > THREAD_CONTEXT_ITEM_CHARS:
+        text = text[:THREAD_CONTEXT_ITEM_CHARS - len(HISTORY_TRUNCATION)] + HISTORY_TRUNCATION
+    return replace(parsed, text=text, image_keys=(), attachment_error="")
 
 
 def _json(value: Any) -> str:
@@ -342,12 +421,13 @@ class _LarkApi:
                        .timeout(15).build())
         logging.getLogger("Lark").disabled = True
 
-    def send(self, chat_id: str, content: str, reply_to: str | None, request_id: str) -> Any:
+    def send(self, chat_id: str, content: str, reply_to: str | None, request_id: str,
+             reply_in_thread: bool = False) -> Any:
         from lark_oapi.api.im.v1 import (CreateMessageRequest, CreateMessageRequestBody,
                                         ReplyMessageRequest, ReplyMessageRequestBody)
         if reply_to:
             body = (ReplyMessageRequestBody.builder().msg_type("interactive")
-                    .content(content).uuid(request_id).build())
+                    .content(content).uuid(request_id).reply_in_thread(reply_in_thread).build())
             request = ReplyMessageRequest.builder().message_id(reply_to).request_body(body).build()
             return self.client.im.v1.message.reply(request)
         body = (CreateMessageRequestBody.builder().receive_id(chat_id).msg_type("interactive")
@@ -355,6 +435,17 @@ class _LarkApi:
         request = (CreateMessageRequest.builder().receive_id_type("chat_id")
                    .request_body(body).build())
         return self.client.im.v1.message.create(request)
+
+    def get_message(self, message_id: str) -> Any:
+        from lark_oapi.api.im.v1 import GetMessageRequest
+        request = GetMessageRequest.builder().message_id(message_id).user_id_type("open_id").build()
+        return self.client.im.v1.message.get(request)
+
+    def list_thread(self, thread_id: str) -> Any:
+        from lark_oapi.api.im.v1 import ListMessageRequest
+        request = (ListMessageRequest.builder().container_id_type("thread").container_id(thread_id)
+                   .sort_type("ByCreateTimeDesc").page_size(THREAD_CONTEXT_PAGE_SIZE).build())
+        return self.client.im.v1.message.list(request)
 
     def send_user(self, open_id: str, content: str, request_id: str) -> Any:
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
@@ -459,12 +550,14 @@ class _LarkApi:
 class FeishuMessenger:
     def __init__(self, app_id: str, app_secret: str, logger: Callable[[str], None] | None = None,
                  *, require_group_mention: bool = True, bot_open_id: str | None = None,
+                 support_group_ids: tuple[str, ...] = (),
                  api: Any = None, process_context: Any = None) -> None:
         if not app_id or not app_secret:
             raise ValueError("Independent Feishu application credentials are required")
         self._app_id, self._app_secret = app_id, app_secret
         self._logger = logger
         self._require_group_mention, self._bot_open_id = require_group_mention, bot_open_id
+        self._support_group_ids = frozenset(support_group_ids)
         self._api = api
         self._api_init_lock: asyncio.Lock | None = None
         self._context = process_context
@@ -594,7 +687,8 @@ class FeishuMessenger:
 
     async def send(self, chat_id: str, view: View, reply_to: str | None = None) -> str:
         content = _json(build_card(view))
-        response = await self._request("send", chat_id, content, reply_to, uuid.uuid4().hex)
+        response = await self._request("send", chat_id, content, reply_to, uuid.uuid4().hex,
+                                       bool(reply_to and chat_id in self._support_group_ids))
         message_id = getattr(getattr(response, "data", None), "message_id", None)
         if not isinstance(message_id, str) or not message_id:
             raise RuntimeError("Feishu send returned no message ID")
@@ -651,6 +745,65 @@ class FeishuMessenger:
         if len(data) > MAX_IMAGE_BYTES:
             raise ImageInputError(IMAGE_TOO_LARGE)
         return data
+
+    async def fetch_thread_context(self, message: IncomingMessage) -> tuple[IncomingMessage, ...]:
+        """Read only this event's root and one bounded page of its topic replies.
+
+        These are partial, untrusted human history snippets, never a model tool
+        for fetching an arbitrary chat. Historical images are text placeholders.
+        """
+        if (message.chat_type != "group" or message.chat_id not in self._support_group_ids
+                or not message.mentioned_bot or not _valid_image_message_id(message.id)
+                or message.root_id and not _valid_image_message_id(message.root_id)
+                or message.thread_id and not _valid_thread_id(message.thread_id)):
+            raise RuntimeError(THREAD_CONTEXT_UNAVAILABLE)
+        if not message.root_id or message.root_id == message.id:
+            return ()  # A topic's first message has no preceding topic context.
+
+        async def fetch() -> tuple[IncomingMessage, ...]:
+            response = await self._request("get_message", message.topic_id)
+            roots = getattr(getattr(response, "data", None), "items", None)
+            if not isinstance(roots, list) or len(roots) != 1:
+                raise ValueError("Topic root was not returned")
+            root = roots[0]
+            if getattr(root, "message_id", None) != message.topic_id:
+                raise ValueError("Topic root does not match")
+            root_thread = _string(getattr(root, "thread_id", None))
+            thread_id = message.thread_id or root_thread
+            if thread_id and not _valid_thread_id(thread_id):
+                raise ValueError("Topic has no valid thread identity")
+            context_root = _history_message(root, message, thread_id)
+            candidates = [context_root] if context_root is not None else []
+            if thread_id:
+                response = await self._request("list_thread", thread_id)
+                items = getattr(getattr(response, "data", None), "items", None)
+                if not isinstance(items, list) or len(items) > THREAD_CONTEXT_PAGE_SIZE:
+                    raise ValueError("Topic page was not returned")
+                for item in items:
+                    parsed = _history_message(item, message, thread_id)
+                    if parsed is not None and parsed.id != message.topic_id:
+                        candidates.append(parsed)
+            # Preserve the root, then choose recent human messages, keeping the
+            # text budget at this boundary even if a caller forgets its own cap.
+            selected: dict[str, IncomingMessage] = {}
+            remaining = THREAD_CONTEXT_CHARS
+            for item in sorted(candidates, key=lambda item: (
+                    item.id == message.topic_id, item.created_at), reverse=True):
+                if item.id in selected:
+                    continue
+                if len(selected) >= THREAD_CONTEXT_MESSAGES or remaining <= len(HISTORY_TRUNCATION):
+                    break
+                text = item.text
+                if len(text) > remaining:
+                    text = text[:remaining - len(HISTORY_TRUNCATION)] + HISTORY_TRUNCATION
+                selected[item.id] = replace(item, text=text)
+                remaining -= len(text)
+            return tuple(sorted(selected.values(), key=lambda item: (item.created_at, item.id)))
+
+        try:
+            return await asyncio.wait_for(fetch(), timeout=35)
+        except Exception:
+            raise RuntimeError(THREAD_CONTEXT_UNAVAILABLE) from None
 
     async def _invoke(self, operation: str, *args: Any) -> Any:
         if self._api is None:
