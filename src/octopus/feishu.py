@@ -17,7 +17,8 @@ import uuid
 from dataclasses import asdict, replace
 from typing import Any, Callable
 
-from .contracts import ActionHandler, CardAction, IncomingMessage, MessageHandler, View
+from .contracts import (ActionHandler, CardAction, IncomingMessage, MessageHandler, QuotedContext,
+                        ReferenceContextError, View)
 from .images import MAX_IMAGE_BYTES, MAX_IMAGES, ImageInputError
 
 CARD_BUDGET = 28_000
@@ -46,6 +47,10 @@ THREAD_CONTEXT_ITEM_CHARS = 2_000
 THREAD_CONTEXT_UNAVAILABLE = "无法读取这个话题的上下文，请重新发送问题详情，或联系管理员检查消息读取权限。"
 HISTORY_IMAGE_NOTE = "[历史图片未读取；如需分析图片，请在 @ 机器人的当前消息中重新发送。]"
 HISTORY_TRUNCATION = "\n[历史正文已截断]"
+QUOTED_CONTEXT_UNAVAILABLE = "暂时无法读取你引用的消息内容。"
+QUOTED_BODY_BYTES = 200_000
+QUOTED_TEXT_CHARS = 12_000
+QUOTED_IMAGE_NOTE = "[引用图片未读取]"
 
 
 def _valid_image_key(value: Any) -> bool:
@@ -66,6 +71,164 @@ def _object(value: Any) -> dict[str, Any]:
 
 def _string(value: Any) -> str:
     return value if isinstance(value, str) else ""
+
+
+class _QuotedText:
+    """Extract visible text through known layouts, never arbitrary JSON values.
+
+    Card actions, callback values, URLs and resource keys are not evidence. A
+    layout we cannot read fails as a whole instead of supplying partial facts.
+    """
+
+    def __init__(self) -> None:
+        self.has_text = False
+        self.has_unread_images = False
+        self.nodes = 0
+
+    def text(self, value: Any, *, markdown: bool = False) -> str:
+        if not isinstance(value, str) or "\x00" in value:
+            raise ValueError("Invalid quoted text")
+        if markdown:
+            # Markdown image sources are never fetched or mistaken for facts.
+            pattern = r"!\[[^\]\n]*\]\([^\n)]*\)"
+            visible = re.sub(pattern, "", value)
+            self.has_unread_images = self.has_unread_images or visible != value
+            value = re.sub(pattern, QUOTED_IMAGE_NOTE, value)
+        else:
+            visible = value
+        self.has_text = self.has_text or bool(visible.strip())
+        return value
+
+    def sequence(self, values: Any, depth: int = 0, *, inline: bool = False) -> str:
+        if not isinstance(values, list) or depth > 16:
+            raise ValueError("Invalid quoted elements")
+        parts = [self.sequence(item, depth + 1, inline=True) if isinstance(item, list)
+                 else self.node(item, depth + 1) for item in values]
+        return ("" if inline else "\n").join(part for part in parts if part)
+
+    def node(self, value: Any, depth: int = 0) -> str:
+        self.nodes += 1
+        if not isinstance(value, dict) or depth > 16 or self.nodes > 4096:
+            raise ValueError("Invalid quoted element")
+        tag = value.get("tag")
+        if tag in ("text", "md", "code_block"):
+            text = self.text(value.get("text"), markdown=tag == "md")
+            return "```\n" + text + "\n```" if tag == "code_block" else text
+        if tag in ("plain_text", "lark_md", "markdown"):
+            return self.text(value.get("content"), markdown=tag != "plain_text")
+        if tag == "a":
+            return self.text(value.get("text"))  # Display label, never follow href.
+        if tag in ("img", "image", "custom_icon"):
+            self.has_unread_images = True
+            return QUOTED_IMAGE_NOTE
+        if tag == "standard_icon" and isinstance(value.get("token"), str) and value["token"]:
+            return ""  # A built-in decorative glyph contains no image resource.
+        if tag == "hr":
+            return "\n---\n"
+        if tag == "at":
+            return "[提及用户]"
+        if tag == "emotion":
+            return "[表情]"
+        if tag in ("action", "button", "select_static", "select_person", "select_img", "overflow", "input"):
+            return ""  # In particular, never traverse actions/value/behaviors.
+        if tag == "div":
+            parts = []
+            if "text" in value:
+                parts.append(self.node(value["text"], depth + 1))
+            if "fields" in value:
+                fields = value["fields"]
+                if not isinstance(fields, list):
+                    raise ValueError("Invalid quoted fields")
+                for field in fields:
+                    if not isinstance(field, dict) or "text" not in field:
+                        raise ValueError("Invalid quoted field")
+                    parts.append(self.node(field["text"], depth + 1))
+            if "extra" in value:
+                parts.append(self.node(value["extra"], depth + 1))
+            if "text" not in value and "fields" not in value:
+                raise ValueError("Missing quoted div text")
+            return "\n".join(part for part in parts if part)
+        if tag in ("note", "column"):
+            return self.sequence(value.get("elements"), depth + 1)
+        if tag == "column_set":
+            return self.sequence(value.get("columns"), depth + 1)
+        raise ValueError("Unsupported quoted element")
+
+    def card(self, content: dict[str, Any]) -> str:
+        allowed = {"schema", "config", "card_link", "header", "title", "elements", "body",
+                   "actions", "value", "callback"}
+        if content.keys() - allowed:
+            raise ValueError("Unsupported quoted card layout")
+        parts = []
+        if "title" in content:
+            title = content["title"]
+            parts.append(self.text(title) if isinstance(title, str) else self.node(title))
+        if "header" in content:
+            header = content["header"]
+            if not isinstance(header, dict):
+                raise ValueError("Invalid quoted header")
+            for key in ("title", "subtitle"):
+                if key in header:
+                    parts.append(self.node(header[key]))
+            if "icon" in header:
+                icon = header["icon"]
+                if isinstance(icon, dict) and "tag" not in icon and _valid_image_key(icon.get("img_key")):
+                    icon = {**icon, "tag": "custom_icon"}
+                parts.append(self.node(icon))
+        if "elements" in content:
+            parts.append(self.sequence(content["elements"]))
+        if "body" in content:
+            body = content["body"]
+            if not isinstance(body, dict):
+                raise ValueError("Invalid quoted body")
+            parts.append(self.sequence(body.get("elements")))
+        return "\n".join(part for part in parts if part)
+
+    def post(self, content: dict[str, Any]) -> str:
+        if "content" not in content:
+            if not content or any(re.fullmatch(r"[a-z]{2}_[a-z]{2}", key) is None for key in content):
+                raise ValueError("Unsupported quoted post layout")
+            variants = [content.get("zh_cn"), content.get("en_us"), *content.values()]
+            content = next((item for item in variants if isinstance(item, dict)), {})
+        rows = content.get("content")
+        if not isinstance(rows, list) or any(not isinstance(row, list) for row in rows):
+            raise ValueError("Invalid quoted post")
+        title = self.text(content.get("title", ""))
+        text = self.sequence(rows)
+        return "\n".join(part for part in (title, text) if part)
+
+
+def _quoted_body(item: Any) -> tuple[str, bool]:
+    raw = getattr(getattr(item, "body", None), "content", None)
+    if not isinstance(raw, str) or len(raw.encode("utf-8")) > QUOTED_BODY_BYTES:
+        raise ValueError("Invalid quoted content size")
+    content = json.loads(raw)
+    if not isinstance(content, dict):
+        raise ValueError("Invalid quoted content")
+    parser = _QuotedText()
+    kind = getattr(item, "msg_type", None)
+    if kind == "text":
+        text = parser.text(content.get("text"))
+    elif kind == "post":
+        text = parser.post(content)
+    elif kind == "interactive":
+        text = parser.card(content)
+    else:
+        raise ValueError("Unsupported quoted message type")
+    text = text.strip()
+    if not parser.has_text or not text or len(text) > QUOTED_TEXT_CHARS:
+        raise ValueError("Quoted message is empty or too long")
+    return text, parser.has_unread_images
+
+
+def _quoted_timestamp(value: Any, *, optional: bool = False) -> int:
+    if optional and value is None:
+        return 0
+    if isinstance(value, str) and value.isascii() and value.isdecimal():
+        value = int(value)
+    if type(value) is not int or value < (0 if optional else 1):
+        raise ValueError("Invalid quoted timestamp")
+    return value
 
 
 def _parse_post(content: dict[str, Any]) -> tuple[str, tuple[str, ...], str]:
@@ -808,6 +971,39 @@ class FeishuMessenger:
             return await asyncio.wait_for(fetch(), timeout=35)
         except Exception:
             raise RuntimeError(THREAD_CONTEXT_UNAVAILABLE) from None
+
+    async def fetch_quoted_context(self, message: IncomingMessage) -> QuotedContext | None:
+        """Read one directly referenced message in this private chat, never its ancestors."""
+        if message.chat_type != "p2p" or not (message.parent_id or message.root_id):
+            return None
+        target = message.parent_id or message.root_id
+        if (not _valid_image_message_id(message.id) or not _valid_image_message_id(target)
+                or target == message.id or not message.chat_id
+                or type(message.created_at) is not int or message.created_at <= 0):
+            raise ReferenceContextError(QUOTED_CONTEXT_UNAVAILABLE)
+
+        async def fetch() -> QuotedContext:
+            response = await self._request("get_message", target)
+            items = getattr(getattr(response, "data", None), "items", None)
+            if not isinstance(items, list) or len(items) != 1:
+                raise ValueError("Quoted message was not returned")
+            item = items[0]
+            if (getattr(item, "message_id", None) != target or getattr(item, "chat_id", None) != message.chat_id
+                    or getattr(item, "deleted", False)
+                    or getattr(getattr(item, "sender", None), "sender_type", None) not in ("user", "app")):
+                raise ValueError("Quoted message is unavailable or outside this chat")
+            created_at = _quoted_timestamp(getattr(item, "create_time", None))
+            updated_at = _quoted_timestamp(getattr(item, "update_time", None), optional=True)
+            if (created_at > message.created_at or updated_at > message.created_at
+                    or updated_at and updated_at < created_at):
+                raise ValueError("Quoted content is newer than the question")
+            text, has_unread_images = _quoted_body(item)
+            return QuotedContext(target, message.chat_id, text, created_at, has_unread_images=has_unread_images)
+
+        try:
+            return await asyncio.wait_for(fetch(), timeout=35)
+        except Exception:
+            raise ReferenceContextError(QUOTED_CONTEXT_UNAVAILABLE) from None
 
     async def _invoke(self, operation: str, *args: Any) -> Any:
         if self._api is None:

@@ -34,6 +34,19 @@ class IncomingMessage:
 
 
 @dataclass(frozen=True)
+class QuotedContext:
+    message_id: str
+    chat_id: str
+    text: str
+    created_at: int
+    has_unread_images: bool = False
+
+
+class ReferenceContextError(RuntimeError):
+    """The explicitly referenced message cannot be used safely as context."""
+
+
+@dataclass(frozen=True)
 class CardAction:
     ticket_id: str
     decision: Literal["accept", "decline"]
@@ -96,6 +109,7 @@ class Messenger(Protocol):
     async def remove_reaction(self, message_id: str, reaction_id: str) -> None: ...
     async def download_image(self, message_id: str, image_key: str) -> bytes: ...
     async def fetch_thread_context(self, message: IncomingMessage) -> tuple[IncomingMessage, ...]: ...
+    async def fetch_quoted_context(self, message: IncomingMessage) -> QuotedContext | None: ...
     async def close(self) -> None: ...
 
 

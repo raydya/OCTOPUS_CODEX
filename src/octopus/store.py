@@ -193,18 +193,18 @@ class Store(AccessStore):
                 raise ValueError("会话不存在")
 
     async def restrict_session_data(self, key: str) -> None:
-        """Keep a shared thread's database restriction until an explicit reset.
+        """Keep a thread's database restriction until an explicit reset.
 
         A bounded history fetch can forget old inputs, but Codex still retains
         its thread context. Only replacing that thread may clear this marker.
         """
         async with self._lock:
             cursor = await self._db.execute(
-                "UPDATE sessions SET data_context_restricted = TRUE, updated_at = %s WHERE key = %s AND scope = 'topic'",
+                "UPDATE sessions SET data_context_restricted = TRUE, updated_at = %s WHERE key = %s",
                 (_now(), key),
             )
             if not cursor.rowcount:
-                raise ValueError("群话题会话不存在")
+                raise ValueError("会话不存在")
 
     async def set_blocked(self, key: str, reason: str | None) -> None:
         async with self._lock:

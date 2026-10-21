@@ -282,10 +282,29 @@ class GroupStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((await reopened.get_session(session.key)).data_context_restricted)
         await reopened.set_thread(session.key, "fresh-thread")
         self.assertFalse((await reopened.get_session(session.key)).data_context_restricted)
-        await reopened.session("private", "oc_private", "ou_alice")
-        for invalid in ("private", "missing"):
-            with self.assertRaisesRegex(ValueError, "群话题会话不存在"):
-                await reopened.restrict_session_data(invalid)
+        with self.assertRaisesRegex(ValueError, "^会话不存在$"):
+            await reopened.restrict_session_data("missing")
+
+    async def test_personal_data_restriction_survives_restart_and_only_new_thread_clears_it(self) -> None:
+        session = await self.store.session("private-alice", "oc_private_alice", "ou_alice")
+        other = await self.store.session("private-bob", "oc_private_bob", "ou_bob")
+        topic = await self.topic()
+        await self.store.set_thread(session.key, "existing-thread")
+        await self.store.restrict_session_data(session.key)
+        await self.store.set_thread(session.key, "existing-thread")
+        await self.store.close()
+        reopened = await self.open(migrate=False)
+        restored = await reopened.get_session(session.key)
+        self.assertTrue(restored.data_context_restricted)
+        self.assertEqual(restored.thread_id, "existing-thread")
+        self.assertFalse((await reopened.get_session(other.key)).data_context_restricted)
+        self.assertFalse((await reopened.get_session(topic.key)).data_context_restricted)
+        await reopened.restrict_session_data(session.key)
+        self.assertTrue((await reopened.get_session(session.key)).data_context_restricted)
+        await reopened.set_thread(session.key, None)
+        self.assertFalse((await reopened.get_session(session.key)).data_context_restricted)
+        await reopened.set_thread(session.key, "fresh-thread")
+        self.assertFalse((await reopened.get_session(session.key)).data_context_restricted)
 
     async def test_schema_migration_preserves_existing_personal_threads(self) -> None:
         await self.store.session("legacy-personal", "oc_private", "ou_alice")
