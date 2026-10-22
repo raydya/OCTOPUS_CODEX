@@ -113,7 +113,7 @@ def _json(raw):
 
 
 def source_digest(result):
-    """Hash complete code_read lines using canonical JSON, not repository HEAD."""
+    """Hash complete trusted source lines using canonical JSON, not repository HEAD."""
     if type(result) is not dict or result.get("truncated") is not False:
         _deny("complete code evidence is required")
     path = _text(result.get("path"), maximum=2048)
@@ -392,6 +392,27 @@ class DmsBroker:
             return
 
     def record_code(self, context, result):
+        """Retain the legacy search-then-read evidence path for older clients."""
+        return self._record_code(context, result, require_search=True)
+
+    def register_code(self, context, path, start_line=1, line_count=120):
+        """Attest host-read SQL after native code discovery, without a search prerequisite.
+
+        Only a source location crosses the model boundary. The broker reads the
+        fixed shared root itself and binds those bytes to the authenticated task;
+        model-provided snippets, SQL and hashes are never accepted as evidence.
+        This bounded DMS authorization excerpt does not govern native code reads.
+        """
+        self._policy()
+        self._context(context)
+        source = self.reader.read(path, start_line, line_count)
+        token = self._record_code(context, source, require_search=False)
+        if token is None:
+            _deny("complete, current SQL source is required for database evidence")
+        return {"evidence_id": token, "path": source["path"], "start_line": source["start_line"],
+                "line_count": len(source["lines"]), "tables": sorted(_code_relations(source))}
+
+    def _record_code(self, context, result, *, require_search):
         try:
             _, fingerprint = self._policy()
             binding = self._context(context)
@@ -403,7 +424,7 @@ class DmsBroker:
                 now = time.monotonic()
                 self._prune(now)
                 search = self._searches.get(binding)
-                if (not search or search["policy"] != fingerprint
+                if require_search and (not search or search["policy"] != fingerprint
                         or not any(path == result["path"] and result["start_line"] <= line < result["start_line"] + len(result["lines"])
                                    for path, line in search["matches"])):
                     return None
@@ -613,7 +634,7 @@ class DmsBroker:
         if database_keyword and not re.fullmatch(r"[A-Za-z0-9_-]+", database_keyword):
             _deny("invalid database search keyword")
         if table not in ticket["tables"]:
-            _deny("table must occur in this task's searched and read code SQL")
+            _deny("table must occur in this task's verified source SQL")
         targets, truncated, skipped, unsupported = self._discover(policy, table, database_keyword)
         self._eligible(context, evidence_id)
         checks = []

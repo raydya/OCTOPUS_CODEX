@@ -12,9 +12,10 @@
           │ 带 Bearer 认证的 WebSocket
           ▼
 宿主机独立 Codex app-server
+          ├── 原生文件 / shell 工具 → 宿主机源码（文件系统只读）
           └── 动态查询工具 → 宿主机认证查询接口（127.0.0.1:4501）
                               ├── TLS / Grafana / 飞书文档（现有查询账号）
-                              └── ~/Projects/rere（受限源码读取）
+                              └── DMS（可信源码证据登记、pro 只读查询）
 ```
 
 机器人应用凭证只从本项目读取；文档查询复用宿主机 `lark-cli` 的现有身份。
@@ -25,7 +26,7 @@ Python 在本项目容器运行，PostgreSQL 由独立 `local-infra` Compose 管
 
 - 多轮文本对话、会话持久化、同会话任务排队和重启恢复。
 - 原消息「稍等」表情回应、完整结果分段发送、发送失败后 `/last` 补取。
-- 只读工具白名单、问题回答、停止任务；禁止命令/文件/扩展权限审批升级。
+- Codex 原生只读源码检索、线上查询工具白名单、问题回答和停止任务；禁止写入和扩展权限审批升级。
 - 管理员/成员启停、按用户的任务预算、审计和独立数据库运行账号。
 - 新应用用户配对、消息去重、审批一次性使用及操作者校验。
 - PostgreSQL advisory lock 防止两个桥接同时消费同一份队列。
@@ -62,14 +63,15 @@ bash scripts/bootstrap.sh
 
 ```dotenv
 FEISHU_APP_ID=你的新应用AppID
-CODEX_WORKSPACE=/本项目绝对路径/.data/codex-readonly/workspace
+CODEX_WORKSPACE=/Users/你的用户名/Projects/rere
 CODEX_PORT=4500
 CODEX_READ_ONLY=true
 CODEX_DIAGNOSTICS_ENABLED=false
 ```
 
-工作目录必须是本项目 `.data/codex-readonly/workspace` 的绝对路径，且保持空目录。启动器创建独立配置目录，仅通过单文件符号链接复用 Codex 登录；不继承个人 MCP、skills、hooks 或项目指令。
-代码通过受控读取器访问 `~/Projects/rere`，不挂载到容器或暴露给模型内置文件工具。
+工作目录为源码目录的绝对路径，默认 `~/Projects/rere`；宿主机和 bridge 使用同一个 `CODEX_WORKSPACE`。启动器创建独立配置目录，通过单文件符号链接复用 Codex 登录；不继承个人 MCP、skills、hooks 或自动加载项目指令。
+Codex 使用原生文件、shell 和图片工具读取宿主机内容，能自行按文件名、子目录和内容搜索，不再经过旧 `code_search` 的2500文件扫描预算。文件系统权限为全局只读，工作目录不是读取边界；不能创建、覆盖或删除文件，也不能提权。原生命令禁止联网，线上查询由下述受控接口执行。
+旧会话保留记录，每轮显式启用本地只读执行环境，覆盖之前的空环境设置。Codex 0.163.0 无法在恢复线程时更新动态工具目录，因此旧会话的 `code_read` 仅作为 DMS 证据登记兼容入口；旧搜索工具调用会提示改用原生 shell，不再执行旧扫描器。
 
 `CODEX_MODEL` 留空时使用 bot 独立 Codex 配置的默认模型。`CODEX_REASONING_EFFORT=xhigh` 设置思考强度，Docker Compose 默认使用 `xhigh`。修改后重建 bridge 容器即可；桥接每轮都显式传入思考强度，因此已有会话从下一轮开始生效。
 
@@ -133,13 +135,13 @@ CODEX_PORT=4502 bash scripts/codex-host.sh
 - TLS：现有 `ve volclog` 默认身份、profile 和地域；开放主题目录与原始日志检索。时间窗口最多24小时、最多100行，暂不开放管道 SQL。
 - Grafana：读取现有 Grafana MCP 配置的服务账号，受控调用 Grafana HTTP 查询接口；仅数据源目录、Prometheus 指标和仪表盘搜索，不把 MCP 或令牌交给模型。
 - DMS：复用宿主机 `aliyun` 的 `company-cli-user` 身份，动态发现其有权访问的全部 `pro` 库表（DMS 环境值为 `product`）；没有按服务或表制定人工白名单。数据库用于业务问题的数据补证，不能直接作为聊天 SQL 控制台。
-- 代码：固定共享根目录 `~/Projects/rere`，仅源码白名单；拒绝绝对路径、目录穿越、软硬链接、隐藏文件、配置、凭证、构建产物及二进制。额外支持 `*Mapper.xml` 中的 MyBatis 查询与 SQL 片段，保留行号，不加载 DTD/实体，不执行动态 XML 或 include。返回路径、行号和可取得的 Git HEAD；工作目录可能有未提交修改。
+- 代码：通过 Codex 原生只读工具读取，不限制文件类型、数量或读取路径；默认从 `~/Projects/rere` 开始查找。DMS 证据登记仍由可信服务在 `~/Projects/rere` 内重新读取源码，保留路径、内容哈希与轮次绑定，不信任模型提供的 SQL 文本。
 
-所有获准同事共用上述账号的数据权限，仍受 bot 的只读及隐私限制。外部资料一律作为待分析证据，不能改变工具权限。查询凭证始终留在宿主机，模型只收到有界且经过常见凭证脱敏的结果。共同账号能读取某项内容不代表可以向同事返回个人隐私。
+所有获准同事共用上述账号的数据权限，仍受 bot 的只读及隐私输出规则限制。外部资料一律作为待分析证据，不能改变工具权限。线上查询接口返回有界且经过常见凭证脱敏的结果；原生文件读取不经过该脱敏器，读取权限也不再隔离宿主机凭证文件，因此只读不等于凭证保密隔离。应用指令仍禁止向用户披露凭证、个人敏感值或他人会话内容。
 查询接口只接受固定参数，不接受任意命令、URL、认证信息、profile 或环境变量。未安装的 crane-api 暂不可查询。
 本项目不修改全局 Codex 配置或云端 IAM。`CODEX_READ_ONLY=false` 仍保留旧的个人操作模式，**不能用于同事开放场景**。
 
-当前账号模型要求通过 Codex 内置 Rust/V8 编排调用查询工具，因此保留独立编排子进程，禁止进程内回退。该环境不提供 Node、`process`、`require`、`fetch` 或模块导入；只连接白名单查询。固定辅助工具还包括时间和空 MCP 资源发现，交互式追问已关闭，未连接任何直接 MCP 服务。已实测无限循环可被任务中断；Codex 0.163.0 暂无可配置的 V8 堆硬上限，容器的内存限制不覆盖宿主机编排进程。
+当前账号模型使用 Codex 内置 Rust/V8 编排工具，因此保留独立编排子进程，禁止进程内回退。编排环境自身不提供 Node、`process`、`require`、`fetch` 或模块导入；可以调用 Codex 原生沙箱命令及白名单查询。交互式追问已关闭，未连接任何直接 MCP 服务。Codex 0.163.0 暂无可配置的 V8 堆硬上限，容器的内存限制不覆盖宿主机编排或命令进程。
 `lark-cli`、`ve` 使用宿主机 PATH 中的现有安装；本项目不安装独立 CLI。
 火山云 CLI 由用户维护，可运行 `npm install -g @volcengine/cli@latest` 更新，再运行 `ve version` 确认版本。
 `ve` 与 TLS 子工具 `volclog` 各自管理登录状态。若 TLS 报 `console login refresh failed; run: volclog login`，
@@ -158,7 +160,7 @@ TLS 认证失败会通过查询接口返回固定错误码 `tls_auth_required`�
 
 服务端约束如下：
 
-- 同一任务先 `code_search`、再 `code_read`。查询代理签发绑定用户、任务、Codex 轮次和实际代码内容的短效证据；数据查询必须关联代码 SQL 中的静态表名，执行前再次读取并校验内容。伪造、跨任务、过期或代码变更后的证据不可使用。
+- 同一任务先用原生工具找到并阅读相关实现和 SQL，再调用 `code_evidence(path, start_line, line_count)` 登记源码证据；旧会话没有该工具时使用兼容的 `code_read`。查询代理独立读取该源码片段，签发绑定用户、任务、Codex 轮次和实际内容的短效证据，不要求调用旧 `code_search`。数据查询必须关联代码 SQL 中的静态表名，执行前再次读取并校验内容。伪造、跨任务、过期或代码变更后的证据不可使用。
 - 根据当前 DMS 身份发现生产表，每次执行重新核验实例、数据库、表归属、生产环境、字段安全等级与服务端超时；未知或不满足条件时拒绝，不回退其他环境或身份。没有按服务或表设置人工白名单；当前支持 MySQL、PolarDB MySQL、MariaDB、OceanBase MySQL、PostgreSQL、PolarDB PostgreSQL 和 SQL Server，其他引擎明确报告不支持。
 - 模型只提供发现得到的查询编号、列、日期和有限的比较条件。代理生成单表 SELECT，仅内置计数聚合；禁止任意 SQL、写操作、DDL、存储过程、自选函数调用、导出、锁、跨库、JOIN 与子查询。
 - 隐私约束覆盖投影、筛选和分组。DMS 敏感或未知等级字段、明确的姓名、联系方式、地址、证件及凭证字段不可查询。`params`、`remarks`、`created_by` 等内部业务字段允许返回，仍过滤其中明确的个人敏感值与凭证。返回结果再次校验列名、类型、长度与隐私格式，不把原始 DMS 错误或未检查的数据交给模型。

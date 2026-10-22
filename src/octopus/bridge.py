@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 READ_ONLY_POLICY = "readonly:v2"
 POLICY_MIGRATION_REASON = "查询策略已更新，旧会话排队任务已取消；历史记录保留，请重新发送业务问题"
 PRIVACY_REFUSAL = "无法查询或提供个人隐私数据。请改为不含个人标识的业务规则、状态或汇总问题。"
-_BUSINESS_DATA_TOOLS = frozenset({"business_data_checks", "business_data_check"})
+_BUSINESS_DATA_TOOLS = frozenset({"code_evidence", "code_read", "business_data_checks", "business_data_check"})
 _CONTEXT_FIELDS = frozenset({"context", "actor", "job_id", "thread_id", "turn_id", "question", "policy_version"})
 
 

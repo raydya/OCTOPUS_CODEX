@@ -116,16 +116,19 @@ class QueryClientTests(unittest.IsolatedAsyncioTestCase):
             context = {"actor": "alice", "job_id": "job1", "thread_id": "thread1", "turn_id": "turn1",
                        "question": "业务问题" * 3500, "policy_version": "readonly:v2"}
             with patch("octopus.queries.build_opener", return_value=opener):
-                result = await client.call("code_read", {"path": "service/dao.py"}, context=context)
+                result = await client.call("code_evidence", {"path": "service/dao.py"}, context=context)
             self.assertTrue(result["ok"])
             request = opener.open.call_args.args[0]
             self.assertEqual(json.loads(request.data), {
-                "tool": "code_read", "arguments": {"path": "service/dao.py"}, "context": context})
+                "tool": "code_evidence", "arguments": {"path": "service/dao.py"}, "context": context})
             self.assertLess(len(request.data), 64000)
             self.assertEqual(request.headers["Authorization"], "Bearer " + "x" * 40)
 
     def test_model_cannot_select_sql_or_connection_or_supply_authorization(self):
         specs = {spec["name"]: spec["inputSchema"] for spec in TOOL_SPECS}
+        self.assertFalse({"code_repositories", "code_search", "code_read"} & specs.keys())
+        self.assertEqual(set(specs["code_evidence"]["properties"]), {"path", "start_line", "line_count"})
+        self.assertFalse(specs["code_evidence"]["additionalProperties"])
         self.assertEqual(set(specs["business_data_check"]["properties"]),
                          {"evidence_id", "check_id", "day", "time_column", "columns", "mode", "filters"})
         self.assertEqual(set(specs["business_data_checks"]["properties"]), {"evidence_id", "table", "database_keyword"})

@@ -22,7 +22,8 @@ INLINE_PNG = (
 
 
 class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
-    cwd = "/test/project/.data/codex-readonly/workspace"
+    cwd = "/test/Projects/rere"
+    home = "/test/project/.data/codex-readonly/home"
 
     def config(self):
         policy = json.loads((Path(__file__).parents[1] / "config" / "codex-readonly.json").read_text())
@@ -37,20 +38,20 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
         # Codex 0.163.0's ToolsV2 omits experimental_request_user_input.
         public["tools"] = {"web_search": None}
         return {"config": public, "layers": [
-            {"name": {"type": "user", "file": self.cwd.removesuffix("workspace") + "home/config.toml"},
+            {"name": {"type": "user", "file": self.home + "/config.toml"},
              "version": "test-user", "config": config, "disabledReason": None},
             {"name": {"type": "system", "file": "/etc/codex/config.toml"},
              "version": "test-system", "config": {}, "disabledReason": None},
         ]}
 
-    def client(self, handler=None):
+    def client(self, handler=None, tool_name="code_search"):
         client = AppServerClient(read_only=True, tool_specs=[{
-            "type": "function", "name": "code_search", "description": "Search allowed source code",
+            "type": "function", "name": tool_name, "description": "Read-only query tool",
             "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}},
         }], tool_handler=handler)
         client._transport = object()
         client._ready = True
-        client._read_only_home = self.cwd.removesuffix("workspace") + "home"
+        client._read_only_home = self.home
         client._write = AsyncMock()
         client._request = AsyncMock(return_value=self.config_response())
         return client
@@ -61,6 +62,9 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
                 "instructionSources": [], "activePermissionProfile": {"id": "octopus-readonly"},
                 "sandbox": {"type": "readOnly", "networkAccess": False}}
 
+    def native_environment(self):
+        return [{"environmentId": "local", "cwd": self.cwd, "runtimeWorkspaceRoots": []}]
+
     async def test_readonly_host_attestation_and_every_thread_turn_overrides(self):
         client = self.client()
         client.reasoning_effort = "xhigh"
@@ -69,18 +73,22 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
         client._request.return_value = self.thread_response()
         self.assertEqual(await client.create_thread(self.cwd), "thread-safe")
         params = client._request.call_args.args[1]
-        self.assertEqual(params["environments"], [])
+        self.assertEqual(params["environments"], self.native_environment())
         self.assertEqual(params["dynamicTools"], client.tool_specs)
         self.assertNotIn("sandbox", params)
         self.assertEqual(params["approvalPolicy"], "never")
         self.assertEqual(params["permissions"], "octopus-readonly")
         self.assertEqual(params["config"], readonly_thread_config())
+        self.assertTrue(params["config"]["features.shell_tool"])
+        self.assertTrue(params["config"]["features.view_image"])
         self.assertFalse(params["config"]["features.default_mode_request_user_input"])
         self.assertFalse(params["config"]["tools.experimental_request_user_input.enabled"])
         self.assertEqual(params["developerInstructions"], self.config()["developer_instructions"])
         await client.resume_thread("thread-safe", self.cwd)
         resume = client._request.call_args.args[1]
         self.assertNotIn("sandbox", resume)
+        # The pinned protocol has no thread/resume environments parameter.
+        self.assertNotIn("environments", resume)
         self.assertEqual(resume["config"], readonly_thread_config())
         self.assertEqual(resume["developerInstructions"], params["developerInstructions"])
         with self.assertRaises(ValueError):
@@ -89,7 +97,8 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
         client._request.return_value = {"turn": {"id": "turn-safe"}}
         await client.start_turn("thread-safe", "query")
         turn = client._request.call_args.args[1]
-        self.assertEqual(turn["environments"], [])
+        self.assertEqual(turn["environments"], self.native_environment())
+        self.assertEqual(turn["cwd"], self.cwd)
         self.assertEqual(turn["permissions"], "octopus-readonly")
         self.assertEqual(turn["effort"], "xhigh")
 
@@ -109,12 +118,35 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
                 {"type": "image", "url": INLINE_PNG},
             ],
             "effort": "xhigh",
-            "environments": [],
+            "environments": self.native_environment(),
+            "cwd": self.cwd,
             "approvalPolicy": "never",
             "permissions": "octopus-readonly",
             "runtimeWorkspaceRoots": [],
             "additionalContext": client._request.call_args.args[1]["additionalContext"],
         })
+
+    async def test_legacy_thread_without_environments_gets_native_readonly_tools_on_next_turn(self):
+        client = self.client()
+        await client._attest_read_only()
+        response = self.thread_response()
+        response["thread"]["environments"] = []
+        client._request.return_value = response
+        await client.resume_thread("thread-safe", self.cwd)
+        method, resume = client._request.call_args.args
+        self.assertEqual(method, "thread/resume")
+        self.assertNotIn("environments", resume)
+        self.assertTrue(resume["config"]["features.shell_tool"])
+        client.active_turn = AsyncMock(return_value=None)
+        client._request.return_value = {"turn": {"id": "turn-native"}}
+        await client.start_turn("thread-safe", "继续查 pay-service")
+        method, turn = client._request.call_args.args
+        self.assertEqual(method, "turn/start")
+        self.assertEqual(turn["environments"], self.native_environment())
+        self.assertEqual(turn["cwd"], self.cwd)
+        self.assertEqual(turn["permissions"], "octopus-readonly")
+        self.assertEqual(turn["approvalPolicy"], "never")
+        self.assertEqual(turn["runtimeWorkspaceRoots"], [])
 
     async def test_image_input_rejects_urls_paths_and_invalid_base64_before_protocol_calls(self):
         client = self.client()
@@ -157,7 +189,8 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_drifted_host_fails_closed_before_any_thread_starts(self):
         mutations = [
-            lambda c: c["features"].update(shell_tool=True),
+            lambda c: c["features"].update(shell_tool=False),
+            lambda c: c["features"].update(view_image=False),
             lambda c: c["features"].update(code_mode_host=False),
             lambda c: c["features"].pop("stable_environment_tools"),
             lambda c: c["features"].update(default_mode_request_user_input=True),
@@ -166,7 +199,9 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
             lambda c: c.update(mcp_servers={"unexpected": {"command": "private"}}),
             lambda c: c.update(plugins={"unexpected": {"enabled": True}}),
             lambda c: c["permissions"]["octopus-readonly"]["filesystem"].update({"/personal": "read"}),
-            lambda c: c["permissions"]["octopus-readonly"]["filesystem"].update({":root": "read"}),
+            lambda c: c["permissions"]["octopus-readonly"]["filesystem"].update({":root": "deny"}),
+            lambda c: c["permissions"]["octopus-readonly"]["filesystem"].update({":root": "write"}),
+            lambda c: c["permissions"]["octopus-readonly"]["filesystem"].update({self.cwd: "write"}),
             lambda c: c["permissions"]["octopus-readonly"]["network"].update(enabled=True),
             lambda c: c["permissions"]["octopus-readonly"].update(extends=":workspace"),
         ]
@@ -259,10 +294,10 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(client._read_only_cwd)
         self.assertIsNone(client._read_only_developer_instructions)
 
-    async def test_home_mismatch_does_not_publish_partially_attested_policy(self):
+    async def test_personal_home_does_not_publish_partially_attested_policy(self):
         client = self.client()
         await client._attest_read_only()
-        client._read_only_home = "/other/project/.data/codex-readonly/home"
+        client._read_only_home = "/test/.codex"
         with self.assertRaises(RuntimeError):
             await client._attest_read_only()
         self.assertIsNone(client._read_only_cwd)
@@ -283,7 +318,7 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
         transport = object()
         client._transport = transport
         client._request.side_effect = [
-            {"userAgent": "test/0.163.0", "codexHome": self.cwd.removesuffix("workspace") + "home"},
+            {"userAgent": "test/0.163.0", "codexHome": self.home},
             self.config_response(config),
             self.thread_response(),
         ]
@@ -316,6 +351,7 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_application_policy_is_complete_and_bounded_in_utf8(self):
         client = self.client()
+        await client._attest_read_only()
         client.active_turn = AsyncMock(return_value=None)
         client._request.return_value = {"turn": {"id": "turn-bounded-policy"}}
         for instructions in (self.config()["developer_instructions"], "规则🙂" * 900 + "\n安全限制末尾"):
@@ -386,6 +422,34 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
         await client._dynamic_tool(2, valid)
         self.assertFalse(client._write.call_args.args[0]["result"]["success"])
 
+    async def test_legacy_code_read_registers_dms_evidence_without_advertising_it_to_new_threads(self):
+        handler = AsyncMock(return_value={"ok": True, "data": {"evidence_id": "trusted-evidence"}})
+        client = self.client(handler, tool_name="code_evidence")
+        await client._attest_read_only()
+        client._request.return_value = self.thread_response()
+        await client.create_thread(self.cwd)
+        tools = client._request.call_args.args[1]["dynamicTools"]
+        self.assertEqual([tool["name"] for tool in tools], ["code_evidence"])
+        arguments = {"path": "payserv/PaymentMapper.xml", "start_line": 10, "line_count": 15}
+        await client._dynamic_tool(7, {"threadId": "old-thread", "turnId": "new-turn",
+                                      "tool": "code_read", "arguments": arguments})
+        handler.assert_awaited_once_with("old-thread", "new-turn", "code_read", arguments)
+        result = client._write.call_args.args[0]["result"]
+        self.assertTrue(result["success"])
+        self.assertIn("trusted-evidence", result["contentItems"][0]["text"])
+
+    async def test_legacy_bounded_search_redirects_to_native_tools_without_calling_query_host(self):
+        handler = AsyncMock()
+        client = self.client(handler, tool_name="code_evidence")
+        for tool in ("code_search", "code_repositories"):
+            with self.subTest(tool=tool):
+                await client._dynamic_tool(8, {"threadId": "old-thread", "turnId": "new-turn",
+                                              "tool": tool, "arguments": {}})
+                result = client._write.call_args.args[0]["result"]
+                self.assertFalse(result["success"])
+                self.assertIn("原生 shell", result["contentItems"][0]["text"])
+        handler.assert_not_awaited()
+
     async def test_readonly_denies_command_file_and_permission_approvals_without_cards(self):
         client = self.client()
         events = []
@@ -409,7 +473,7 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
                 request_id = message.get("id")
                 result = None
                 if method == "initialize":
-                    result = {"userAgent": "test/0.163.0", "codexHome": self.cwd.removesuffix("workspace") + "home"}
+                    result = {"userAgent": "test/0.163.0", "codexHome": self.home}
                 elif method == "config/read":
                     result = self.config_response()
                 elif method in {"thread/start", "thread/resume"}:

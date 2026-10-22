@@ -1,7 +1,8 @@
 """Trusted host-side, fixed-function read-only query broker.
 
-The model receives neither these credentials nor arbitrary shell/network access.
-This is a private loopback API for the authenticated bridge, not a public API.
+The broker accepts fixed queries rather than arbitrary commands or network targets
+and does not return provider credentials. This private loopback API authenticates
+the bridge; native Codex source reads do not pass through it.
 """
 from __future__ import annotations
 
@@ -50,6 +51,7 @@ _ALLOWED_ARGUMENTS = {
     "code_repositories": (set(), set()),
     "code_search": ({"query"}, {"repository", "limit"}),
     "code_read": ({"path"}, {"start_line", "line_count"}),
+    "code_evidence": ({"path"}, {"start_line", "line_count"}),
     "business_data_checks": ({"evidence_id", "table"}, {"database_keyword"}),
     "business_data_check": ({"evidence_id", "check_id", "day", "time_column", "columns"}, {"mode", "filters"}),
     "docs_search": ({"query"}, {"page_token", "limit"}),
@@ -322,16 +324,15 @@ class QueryHost:
             return bounded_result(self.dms.catalog(context, **arguments))
         if tool == "business_data_check":
             return bounded_result(self.dms.check(context, **arguments))
+        if tool == "code_evidence":
+            return bounded_result(self.dms.register_code(context, **arguments))
         if tool == "code_read":
-            source = self._code_read(**arguments)
-            result = bounded_result(source)
-            if context and not result["truncated"]:
-                # Bind the trusted source bytes, not their presentation after
-                # privacy masking. Only the sanitized result leaves the host.
-                evidence_id = self.dms.record_code(context, source)
-                if evidence_id:
-                    result["data"]["evidence_id"] = evidence_id
-            return result
+            if context is not None:
+                # Existing Codex threads retain their original dynamic tool
+                # registry. Treat this old name as the same evidence attestation
+                # entry point, not as a required path for ordinary source reads.
+                return bounded_result(self.dms.register_code(context, **arguments))
+            return bounded_result(self._code_read(**arguments))
         if tool == "code_search":
             result = bounded_result(self._code_search(**arguments))
             if context and not result["truncated"]:

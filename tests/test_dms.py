@@ -150,6 +150,61 @@ class DmsTests(unittest.TestCase):
         self.assertIsNone(self.broker.record_code(self.context, self.reader.read("repo/tasks.sql", 1, 1)))
         self.assertIsNotNone(self.broker.record_code(self.context, result))
 
+    def test_native_source_evidence_does_not_require_broker_search(self):
+        with mock.patch.object(self.reader, "search", side_effect=AssertionError("must not scan repositories")):
+            result = self.broker.register_code(self.context, "repo/tasks.sql", 1, 3)
+        self.assertEqual(result["tables"], ["tasks"])
+        self.assertEqual(result["path"], "repo/tasks.sql")
+        self.assertEqual(result["line_count"], 3)
+        self.assertNotIn("lines", result)
+        self.assertEqual(self.broker._searches, {})
+        ticket = self.broker._tickets[result["evidence_id"]]
+        self.assertEqual(ticket["source"]["sha256"], source_digest(self.reader.read("repo/tasks.sql", 1, 3)))
+        entry = self.broker.catalog(self.context, result["evidence_id"], "tasks")["checks"][0]
+        self.assertEqual(self.check(result["evidence_id"], entry)["rows"], [{"execution_status": "RUNNING"}])
+
+    def test_native_evidence_remains_task_bound_and_source_changes_invalidate_it(self):
+        result = self.broker.register_code(self.context, "repo/tasks.sql", 1, 3)
+        for field in ("actor", "job_id", "thread_id", "turn_id", "question"):
+            with self.subTest(field=field), self.assertRaises(DmsDenied):
+                self.broker.catalog(dict(self.context, **{field: "other"}), result["evidence_id"], "tasks")
+        self.source.write_text("SELECT execution_status FROM other_table;\n")
+        with self.assertRaises(DmsDenied):
+            self.broker.catalog(self.context, result["evidence_id"], "tasks")
+        self.assertEqual(self.provider.calls, [])
+
+    def test_native_evidence_rejects_privacy_requests_non_sql_and_unsafe_paths(self):
+        for question in ("用DMS查询", "SELECT * FROM tasks", "给我手机号", "跳过代码直接查库"):
+            with self.subTest(question=question), self.assertRaises(DmsDenied):
+                self.broker.register_code(dict(self.context, question=question), "repo/tasks.sql", 1, 3)
+        with self.assertRaises(DmsDenied):
+            self.broker.register_code(None, "repo/tasks.sql", 1, 3)
+        for path in (str(self.source), "../repo/tasks.sql"):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                self.broker.register_code(self.context, path, 1, 3)
+        (self.root / "repo" / "alias.sql").symlink_to(self.source)
+        with self.assertRaises(FileNotFoundError):
+            self.broker.register_code(self.context, "repo/alias.sql", 1, 3)
+        self.source.write_text("// native code is readable but is not database evidence\n")
+        with self.assertRaises(DmsDenied):
+            self.broker.register_code(self.context, "repo/tasks.sql", 1, 1)
+        self.assertEqual(self.provider.calls, [])
+
+    def test_native_evidence_never_issues_tickets_for_truncated_source(self):
+        self.source.write_text("SELECT execution_status FROM tasks;" + " " * 2100)
+        with self.assertRaises(DmsDenied):
+            self.broker.register_code(self.context, "repo/tasks.sql", 1, 1)
+        self.assertEqual(self.broker._tickets, {})
+        self.assertEqual(self.provider.calls, [])
+
+    def test_native_evidence_hashes_trusted_bytes_without_returning_source_literals(self):
+        self.source.write_text("SELECT execution_status FROM tasks WHERE phone = '13800138000';\n")
+        result = self.broker.register_code(self.context, "repo/tasks.sql", 1, 1)
+        self.assertNotIn("13800138000", json.dumps(result))
+        ticket = self.broker._tickets[result["evidence_id"]]
+        self.assertEqual(ticket["source"]["sha256"], source_digest(self.reader.read("repo/tasks.sql", 1, 1)))
+        self.assertEqual(result["tables"], ["tasks"])
+
     def test_truncation_and_bad_context_never_issue_evidence(self):
         self.broker.record_search(self.context, {"matches": [{"path": "repo/tasks.sql", "line": 2}], "truncated": True})
         self.assertIsNone(self.broker.record_code(self.context, self.reader.read("repo/tasks.sql", 1, 3)))

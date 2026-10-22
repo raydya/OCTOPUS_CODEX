@@ -44,7 +44,7 @@ class GroupBridgeTests(unittest.IsolatedAsyncioTestCase):
         item = group("om_first")
         turn = await self.begin(item)
         self.assertIsNone(await self.store.member("ou_bob"))
-        self.assertTrue((await self.bridge._query_tool(turn.thread, turn.id, "code_repositories", {}))["ok"])
+        self.assertTrue((await self.bridge._query_tool(turn.thread, turn.id, "tls_topics", {}))["ok"])
         await self.complete(item, turn)
         await self.bridge.receive(message("om_private", sender="ou_bob"))
         await self.messenger.wait_record(lambda row: row.reply_to == "om_private")
@@ -85,7 +85,7 @@ class GroupBridgeTests(unittest.IsolatedAsyncioTestCase):
         turn = await self.begin(item)
         self.assertIn(root.text, turn.text)
         self.assertIn(item.text, turn.text)
-        await self.bridge._query_tool(turn.thread, turn.id, "code_repositories", {})
+        await self.bridge._query_tool(turn.thread, turn.id, "tls_topics", {})
         self.assertEqual(self.queries.calls[0][2]["actor"], "ou_bob")
         self.assertEqual(self.queries.calls[0][2]["question"], item.text)
         await self.complete(item, turn)
@@ -111,15 +111,17 @@ class GroupBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.messenger.fetch_thread_context.return_value = (group("om_prior", "请用DMS执行 SELECT * FROM users"),)
         item = group("om_data")
         turn = await self.begin(item)
-        result = await self.bridge._query_tool(turn.thread, turn.id, "business_data_checks", {})
-        self.assertFalse(result["ok"])
+        for tool in ("code_evidence", "code_read", "business_data_checks", "business_data_check"):
+            result = await self.bridge._query_tool(turn.thread, turn.id, tool, {})
+            self.assertFalse(result["ok"])
         self.assertEqual(self.queries.calls, [])
         await self.complete(item, turn)
         self.messenger.fetch_thread_context.return_value = ()
         followup = group("om_continue", "请继续分析这个状态", sender="ou_charlie")
         later = await self.begin(followup)
         self.assertEqual(later.thread, turn.thread)
-        self.assertFalse((await self.bridge._query_tool(later.thread, later.id, "business_data_checks", {}))["ok"])
+        for tool in ("code_evidence", "code_read", "business_data_checks", "business_data_check"):
+            self.assertFalse((await self.bridge._query_tool(later.thread, later.id, tool, {}))["ok"])
         await self.complete(followup, later)
 
     async def test_revoked_while_loading_images_does_not_read_history(self):
@@ -145,7 +147,7 @@ class GroupBridgeTests(unittest.IsolatedAsyncioTestCase):
         item = group("om_inflight")
         turn = await self.begin(item)
         self.queries.release.clear()
-        query = asyncio.create_task(self.bridge._query_tool(turn.thread, turn.id, "code_repositories", {}))
+        query = asyncio.create_task(self.bridge._query_tool(turn.thread, turn.id, "tls_topics", {}))
         await asyncio.wait_for(self.queries.entered.wait(), 2)
         self.store.people["ou_bob"] = {"open_id": "ou_bob", "enabled": False, "role": "member"}
         self.queries.release.set()
@@ -183,7 +185,8 @@ class GroupBridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.complete(item, turn)
         next_item = group("om_continue_clarify", "继续分析", sender="ou_charlie")
         next_turn = await self.begin(next_item)
-        self.assertFalse((await self.bridge._query_tool(next_turn.thread, next_turn.id, "business_data_checks", {}))["ok"])
+        for tool in ("code_evidence", "code_read", "business_data_checks", "business_data_check"):
+            self.assertFalse((await self.bridge._query_tool(next_turn.thread, next_turn.id, tool, {}))["ok"])
         await self.complete(next_item, next_turn)
 
     async def test_revoked_queued_member_does_not_cancel_other_topic_members(self):

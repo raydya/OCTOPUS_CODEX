@@ -302,6 +302,9 @@ class CodexHostTests(unittest.TestCase):
         auth = self.directory / ".codex" / "auth.json"
         auth.parent.mkdir(exist_ok=True)
         auth.write_text('{"synthetic":"test-only-auth"}')
+        workspace = self.directory / "Projects" / "rere"
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / "service.py").write_text("business_source = True\n")
         return auth
 
     def test_readonly_isolates_config_auth_cwd_and_ambient_secrets(self):
@@ -313,7 +316,8 @@ class CodexHostTests(unittest.TestCase):
             environment={"FAKE_CLOUD_TOKEN": "test-secret", "OPENAI_API_KEY": "test-key",
                          "CODEX_SQLITE_HOME": "/personal-state"}))
         root = self.project / ".data" / "codex-readonly"
-        self.assertEqual(data["cwd"], str(root / "workspace"))
+        workspace = self.directory / "Projects" / "rere"
+        self.assertEqual(data["cwd"], str(workspace))
         self.assertEqual(data["env"]["CODEX_HOME"], str(root / "home"))
         self.assertEqual(data["env"]["HOME"], str(root))
         self.assertEqual((root / "home" / "auth.json").resolve(), auth)
@@ -323,10 +327,11 @@ class CodexHostTests(unittest.TestCase):
         config = tomllib.loads((root / "home" / "config.toml").read_text())
         self.assertNotIn("mcp_servers", config)
         self.assertEqual(config["approval_policy"], "never")
-        self.assertFalse(config["features"]["shell_tool"])
+        self.assertTrue(config["features"]["shell_tool"])
+        self.assertTrue(config["features"]["view_image"])
         self.assertFalse(config["features"]["stable_environment_tools"])
         profile = config["permissions"]["octopus-readonly"]
-        self.assertEqual(profile["filesystem"], {":root": "deny", ":minimal": "read", str(root / "workspace"): "read"})
+        self.assertEqual(profile["filesystem"], {":root": "read", ":minimal": "read", str(workspace): "read"})
         self.assertFalse(profile["network"]["enabled"])
         self.assertEqual((root / "home" / "config.toml").stat().st_mode & 0o777, 0o600)
         self.assertEqual(len(data["argv"]), 7)
@@ -342,14 +347,14 @@ class CodexHostTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.capture.exists())
 
-    def test_readonly_rejects_nonempty_workspace_and_symlinked_state(self):
+    def test_readonly_accepts_source_workspace_but_rejects_symlinked_state(self):
         self.prepare_readonly()
-        root = self.project / ".data" / "codex-readonly"
-        workspace = root / "workspace"
-        workspace.mkdir(parents=True)
-        (workspace / "AGENTS.md").write_text("do something unsafe")
-        self.assertNotEqual(self.run_host("CODEX_READ_ONLY=true").returncode, 0)
-        self.assertFalse(self.capture.exists())
+        workspace = self.directory / "source with spaces"
+        workspace.mkdir()
+        (workspace / "service.py").write_text("source = True\n")
+        data = self.captured(self.run_host(f'CODEX_READ_ONLY=true\nCODEX_WORKSPACE="{workspace}"\n'))
+        self.assertEqual(data["cwd"], str(workspace))
+        self.capture.unlink()
         shutil.rmtree(self.project / ".data")
         elsewhere = self.directory / "elsewhere"
         elsewhere.mkdir()
@@ -357,6 +362,19 @@ class CodexHostTests(unittest.TestCase):
         self.assertNotEqual(self.run_host("CODEX_READ_ONLY=true").returncode, 0)
         self.assertFalse(self.capture.exists())
         self.assertFalse(any(elsewhere.iterdir()))
+
+    def test_readonly_workspace_override_is_validated_without_shell_expansion(self):
+        self.prepare_readonly()
+        for workspace in ("relative/path", str(self.directory / "missing"), "$(touch marker)"):
+            with self.subTest(workspace=workspace):
+                result = self.run_host("CODEX_READ_ONLY=true", environment={"CODEX_WORKSPACE": workspace})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.capture.exists())
+        selected = self.directory / "selected"
+        selected.mkdir()
+        data = self.captured(self.run_host('CODEX_READ_ONLY=true\nCODEX_WORKSPACE="/missing"\n',
+                                         environment={"CODEX_WORKSPACE": str(selected)}))
+        self.assertEqual(data["cwd"], str(selected))
 
     def test_readonly_toggle_requires_boolean(self):
         for value in ("", "1", "yes", "true;echo test"):

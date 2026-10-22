@@ -44,17 +44,16 @@ class QueryHostTests(unittest.TestCase):
             self.host.execute("code_read", {"path": "../../.secrets/query_token"})
         self.runner.assert_not_called()
 
-    def test_code_evidence_binds_source_while_model_sees_masked_text(self):
-        (self.root / "orders" / "query.sql").write_text("SELECT status FROM orders WHERE phone = '13800138000';\n")
+    def test_legacy_code_read_in_existing_threads_uses_native_source_attestation(self):
         context = {"actor": "alice", "job_id": "job1", "thread_id": "thread1", "turn_id": "turn1",
                    "policy_version": "readonly:v2", "question": "订单状态为什么没有更新"}
         self.host.dms = Mock()
-        self.host.dms.record_code.return_value = "evidence-token"
+        self.host.dms.register_code.return_value = {"evidence_id": "evidence-token", "tables": ["orders"]}
         result = self.host.execute("code_read", {"path": "orders/query.sql"}, context=context)
-        source = self.host.dms.record_code.call_args.args[1]
-        self.assertIn("13800138000", source["lines"][0]["content"])
-        self.assertNotIn("13800138000", json.dumps(result))
-        self.assertEqual(result["data"]["evidence_id"], "evidence-token")
+        self.host.dms.register_code.assert_called_once_with(context, path="orders/query.sql")
+        self.assertEqual(result["data"], {"evidence_id": "evidence-token", "tables": ["orders"]})
+        self.host.dms.record_search.assert_not_called()
+        self.host.dms.record_code.assert_not_called()
 
     def test_unknown_tools_extra_parameters_and_wrong_types_are_rejected(self):
         for tool, arguments in (
@@ -62,10 +61,25 @@ class QueryHostTests(unittest.TestCase):
             ("docs_fetch", {"document": "Abc123456", "output": "/tmp/x"}),
             ("tls_topics", {"endpoint": "https://evil.test"}),
             ("grafana_query", {"query": "x"}), ("code_repositories", []),
+            ("code_evidence", {"path": "orders/query.sql", "sql": "SELECT * FROM secrets"}),
+            ("code_evidence", {"path": "orders/query.sql", "actor": "administrator"}),
+            ("code_evidence", {"path": "orders/query.sql", "sha256": "forged"}),
         ):
             with self.subTest(tool=tool), self.assertRaises(ValueError):
                 self.host.execute(tool, arguments)
         self.runner.assert_not_called()
+
+    def test_code_evidence_registers_only_location_with_bridge_task_context(self):
+        context = {"actor": "alice", "job_id": "job1", "thread_id": "thread1", "turn_id": "turn1",
+                   "policy_version": "readonly:v2", "question": "订单状态为什么没有更新"}
+        self.host.dms = Mock()
+        self.host.dms.register_code.return_value = {"evidence_id": "evidence-token", "tables": ["orders"]}
+        args = {"path": "orders/query.sql", "start_line": 1, "line_count": 3}
+        result = self.host.execute("code_evidence", args, context=context)
+        self.host.dms.register_code.assert_called_once_with(context, **args)
+        self.assertEqual(result["data"], {"evidence_id": "evidence-token", "tables": ["orders"]})
+        self.host.dms.record_search.assert_not_called()
+        self.host.dms.record_code.assert_not_called()
 
     def test_business_data_is_closed_without_a_policy_or_trusted_context(self):
         for tool, args in (

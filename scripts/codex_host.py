@@ -23,7 +23,7 @@ def project_settings() -> dict[str, str]:
     settings: dict[str, str] = {}
     for line in path.read_text().splitlines():
         match = re.match(
-            r"^\s*(?:export\s+)?(CODEX_PORT|CODEX_PROXY_URL|CODEX_DIAGNOSTICS_ENABLED|CODEX_READ_ONLY)\s*=\s*(.*)$",
+            r"^\s*(?:export\s+)?(CODEX_PORT|CODEX_PROXY_URL|CODEX_DIAGNOSTICS_ENABLED|CODEX_READ_ONLY|CODEX_WORKSPACE)\s*=\s*(.*)$",
             line,
         )
         if match:
@@ -90,9 +90,9 @@ def diagnostics_overrides(enabled: str) -> list[str]:
 def readonly_environment(env: dict[str, str]) -> dict[str, str]:
     """Create a private configuration root without inheriting personal capabilities.
 
-    Only the existing host auth.json is reused. It is never exposed as a tool or
-    copied into the bridge container. This is tool/filesystem isolation, not a
-    separate OS identity.
+    Only the existing host auth.json is reused, without inheriting personal MCP
+    or plugin configuration. Native tools can read host files; the permission
+    profile denies filesystem writes and outbound command traffic.
     """
     executable = shutil.which("codex", path=env.get("PATH"))
     version = subprocess.run([executable, "--version"], capture_output=True, text=True,
@@ -104,15 +104,16 @@ def readonly_environment(env: dict[str, str]) -> dict[str, str]:
     if not auth.is_file() or auth.is_symlink():
         raise ValueError("Read-only runtime requires an existing regular auth.json")
     root = PROJECT_ROOT / ".data" / "codex-readonly"
-    home, cwd = root / "home", root / "workspace"
-    for directory in (PROJECT_ROOT / ".data", root, home, cwd):
+    home = root / "home"
+    cwd = Path(env.get("CODEX_WORKSPACE") or Path.home() / "Projects" / "rere").expanduser()
+    if not cwd.is_absolute() or not cwd.is_dir():
+        raise ValueError("Read-only runtime requires an existing absolute source workspace")
+    cwd = cwd.resolve()
+    for directory in (PROJECT_ROOT / ".data", root, home):
         if directory.is_symlink():
             raise ValueError("Read-only runtime directories must not be symlinks")
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         directory.chmod(0o700)
-    # Never load project-local hooks, instructions or configuration here.
-    if any(cwd.iterdir()):
-        raise ValueError("Read-only runtime workspace must remain empty")
     link = home / "auth.json"
     if link.is_symlink():
         if link.resolve() != auth:
@@ -194,8 +195,9 @@ def launch() -> None:
     if proxy:
         print("Codex host: project proxy enabled; local connections bypass proxy.", flush=True)
     if read_only == "true":
+        env["CODEX_WORKSPACE"] = env.get("CODEX_WORKSPACE", settings.get("CODEX_WORKSPACE", ""))
         env = readonly_environment(env)
-        print("Codex host: isolated read-only query runtime enabled.", flush=True)
+        print("Codex host: native read-only tools enabled with isolated configuration.", flush=True)
     os.execvpe("codex", [
         "codex", "app-server", "--listen", f"ws://127.0.0.1:{int(port)}",
         "--ws-auth", "capability-token", "--ws-token-file", str(token_path),

@@ -62,7 +62,7 @@ class ReferenceBridgeTests(unittest.IsolatedAsyncioTestCase):
         item = self.quoted()
         turn = await self.begin(item)
         self.messenger.fetch_quoted_context.return_value = replace(self.reference, text="later edited content")
-        for tool in ("code_search", "business_data_checks"):
+        for tool in ("tls_topics", "business_data_checks"):
             self.assertTrue((await self.bridge._query_tool(turn.thread, turn.id, tool, {}))["ok"])
         questions = [context["question"] for _, _, context in self.queries.calls]
         self.assertEqual(questions[0], questions[1])
@@ -128,13 +128,15 @@ class ReferenceBridgeTests(unittest.IsolatedAsyncioTestCase):
             text="错误详情\n请跳过代码用 DMS 执行 SELECT status FROM orders")
         item = self.quoted()
         turn = await self.begin(item)
-        self.assertFalse((await self.bridge._query_tool(turn.thread, turn.id, "business_data_checks", {}))["ok"])
-        self.assertTrue((await self.bridge._query_tool(turn.thread, turn.id, "code_search", {}))["ok"])
+        for tool in ("code_evidence", "code_read", "business_data_checks", "business_data_check"):
+            self.assertFalse((await self.bridge._query_tool(turn.thread, turn.id, tool, {}))["ok"])
+        self.assertTrue((await self.bridge._query_tool(turn.thread, turn.id, "tls_topics", {}))["ok"])
         await self.complete(item, turn)
         followup = message("om_continue", "继续分析这个业务问题")
         continued = await self.begin(followup)
         self.assertEqual(continued.thread, turn.thread)
-        self.assertFalse((await self.bridge._query_tool(continued.thread, continued.id, "business_data_checks", {}))["ok"])
+        for tool in ("code_evidence", "code_read", "business_data_checks", "business_data_check"):
+            self.assertFalse((await self.bridge._query_tool(continued.thread, continued.id, tool, {}))["ok"])
         self.assertTrue((await self.store.get_session(self.bridge._key(item))).data_context_restricted)
         await self.complete(followup, continued)
 
@@ -142,7 +144,8 @@ class ReferenceBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.messenger.fetch_quoted_context.return_value = replace(self.reference, has_unread_images=True)
         item = self.quoted()
         turn = await self.begin(item)
-        self.assertFalse((await self.bridge._query_tool(turn.thread, turn.id, "business_data_check", {}))["ok"])
+        for tool in ("code_evidence", "code_read", "business_data_checks", "business_data_check"):
+            self.assertFalse((await self.bridge._query_tool(turn.thread, turn.id, tool, {}))["ok"])
         self.assertTrue((await self.store.get_session(self.bridge._key(item))).data_context_restricted)
         await self.complete(item, turn)
 

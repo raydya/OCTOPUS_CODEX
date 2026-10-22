@@ -138,12 +138,12 @@ class ReadonlyBridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.bridge.receive(item)
         turn = await self.codex.next_turn()
         self.assertEqual(len(turn.images), 1)
-        for tool in ("business_data_checks", "business_data_check"):
+        for tool in ("code_evidence", "code_read", "business_data_checks", "business_data_check"):
             denied = await self.bridge._query_tool(turn.thread, turn.id, tool, {})
             self.assertFalse(denied["ok"])
             self.assertIn("文字消息", denied["error"])
         self.assertEqual(self.queries.calls, [])
-        self.assertTrue((await self.bridge._query_tool(turn.thread, turn.id, "code_repositories", {}))["ok"])
+        self.assertTrue((await self.bridge._query_tool(turn.thread, turn.id, "grafana_datasources", {}))["ok"])
         self.codex.complete(turn)
 
     async def test_unknown_user_gets_application_instructions_before_any_work(self):
@@ -290,7 +290,7 @@ class ReadonlyBridgeTests(unittest.IsolatedAsyncioTestCase):
         turn = await self.begin()
         active = self.bridge.active[turn.thread]
         active.job = replace(active.job, message=message("input", "查询客户的手机号"))
-        for tool in ("code_repositories", "docs_search", "tls_search", "grafana_query",
+        for tool in ("code_evidence", "code_read", "grafana_datasources", "docs_search", "tls_search", "grafana_query",
                      "business_data_checks", "business_data_check"):
             response = await self.bridge._query_tool(turn.thread, turn.id, tool, {})
             self.assertFalse(response["ok"])
@@ -300,23 +300,23 @@ class ReadonlyBridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_context_is_derived_from_current_task_and_cannot_be_supplied_in_arguments(self):
         turn = await self.begin(text="订单状态为什么一直未完成")
         for name in ("context", "actor", "job_id", "thread_id", "turn_id", "question", "policy_version"):
-            denied = await self.bridge._query_tool(turn.thread, turn.id, "code_repositories", {name: "forged"})
+            denied = await self.bridge._query_tool(turn.thread, turn.id, "grafana_datasources", {name: "forged"})
             self.assertFalse(denied["ok"])
         self.assertEqual(self.queries.calls, [])
-        self.assertTrue((await self.bridge._query_tool(turn.thread, turn.id, "code_repositories", {}))["ok"])
-        self.assertEqual(self.queries.calls, [("code_repositories", {}, {
+        self.assertTrue((await self.bridge._query_tool(turn.thread, turn.id, "grafana_datasources", {}))["ok"])
+        self.assertEqual(self.queries.calls, [("grafana_datasources", {}, {
             "actor": "ou_alice", "job_id": "input", "thread_id": turn.thread, "turn_id": turn.id,
             "question": "订单状态为什么一直未完成", "policy_version": "readonly:v2",
         })])
 
-    async def test_direct_dms_instruction_denies_data_tools_but_can_still_inspect_code(self):
+    async def test_direct_dms_instruction_denies_evidence_and_data_tools_but_allows_docs(self):
         turn = await self.begin(text="使用DMS查询订单状态")
-        for tool in ("business_data_checks", "business_data_check"):
+        for tool in ("code_evidence", "code_read", "business_data_checks", "business_data_check"):
             response = await self.bridge._query_tool(turn.thread, turn.id, tool, {})
             self.assertFalse(response["ok"])
         self.assertEqual(self.queries.calls, [])
         self.assertTrue(any(row[1] == "data.request" for row in self.store.audits))
-        response = await self.bridge._query_tool(turn.thread, turn.id, "code_search", {"query": "status"})
+        response = await self.bridge._query_tool(turn.thread, turn.id, "docs_search", {"query": "status"})
         self.assertTrue(response["ok"])
         self.assertEqual(len(self.queries.calls), 1)
 
@@ -325,6 +325,30 @@ class ReadonlyBridgeTests(unittest.IsolatedAsyncioTestCase):
         response = await self.bridge._query_tool(turn.thread, turn.id, "business_data_checks", {})
         self.assertTrue(response["ok"])
         self.assertEqual(self.queries.calls[0][0], "business_data_checks")
+
+    async def test_retired_code_tools_from_old_threads_are_not_dispatched(self):
+        turn = await self.begin()
+        for tool in ("code_repositories", "code_search"):
+            denied = await self.bridge._query_tool(turn.thread, turn.id, tool, {})
+            self.assertFalse(denied["ok"])
+        self.assertEqual(self.queries.calls, [])
+
+    async def test_native_sql_evidence_uses_current_authenticated_task(self):
+        turn = await self.begin(text="昨天订单状态为什么没有更新")
+        args = {"path": "orders/OrderMapper.xml", "start_line": 5, "line_count": 20}
+        response = await self.bridge._query_tool(turn.thread, turn.id, "code_evidence", args)
+        self.assertTrue(response["ok"])
+        self.assertEqual(self.queries.calls, [("code_evidence", args, {
+            "actor": "ou_alice", "job_id": "input", "thread_id": turn.thread, "turn_id": turn.id,
+            "question": "昨天订单状态为什么没有更新", "policy_version": "readonly:v2",
+        })])
+
+    async def test_legacy_code_read_from_existing_threads_can_register_database_evidence(self):
+        turn = await self.begin(text="昨天订单状态为什么没有更新")
+        args = {"path": "orders/OrderMapper.xml", "start_line": 5, "line_count": 20}
+        response = await self.bridge._query_tool(turn.thread, turn.id, "code_read", args)
+        self.assertTrue(response["ok"])
+        self.assertEqual(self.queries.calls[0][:2], ("code_read", args))
 
     async def test_final_result_persistence_last_and_notice_mask_explicit_personal_values(self):
         turn = await self.begin(text="账号绑定为什么失败")
@@ -388,17 +412,17 @@ class ReadonlyBridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_query_ownership_and_budget(self):
         turn = await self.begin()
         handler = self.bridge._query_tool
-        self.assertFalse((await handler(turn.thread, "wrong", "code_repositories", {}))["ok"])
+        self.assertFalse((await handler(turn.thread, "wrong", "grafana_datasources", {}))["ok"])
         self.assertFalse((await handler(turn.thread, turn.id, "shell", {}))["ok"])
-        self.assertTrue((await handler(turn.thread, turn.id, "code_repositories", {}))["ok"])
-        self.assertFalse((await handler(turn.thread, turn.id, "code_repositories", {}))["ok"])
+        self.assertTrue((await handler(turn.thread, turn.id, "grafana_datasources", {}))["ok"])
+        self.assertFalse((await handler(turn.thread, turn.id, "grafana_datasources", {}))["ok"])
         self.assertEqual(len(self.queries.calls), 1)
         self.assertTrue(any(x[1] == "query.result" for x in self.store.audits))
 
     async def test_revocation_discards_inflight_query_and_final_delivery(self):
         turn = await self.begin()
         self.queries.release.clear()
-        request = asyncio.create_task(self.bridge._query_tool(turn.thread, turn.id, "code_repositories", {}))
+        request = asyncio.create_task(self.bridge._query_tool(turn.thread, turn.id, "grafana_datasources", {}))
         await self.queries.entered.wait()
         await self.store.set_member_enabled("ou_alice", False)
         await self.bridge._revoke_active()

@@ -18,13 +18,14 @@ def _spec(name: str, description: str, properties: dict, required: list[str]) ->
 S = {"type": "string"}
 I = {"type": "integer"}
 TOOL_SPECS = [
-    _spec("code_repositories", "列出共享源码根目录中的代码库及版本。", {}, []),
-    _spec("code_search", "在共享代码中做字面量搜索，返回相对路径和行号；不能读取配置、凭证或隐藏文件。",
-          {"query": S, "repository": S, "limit": I}, ["query"]),
-    _spec("code_read", "读取共享代码的指定行，path 必须是 code_search 返回的相对路径。",
-          {"path": S, "start_line": I, "line_count": I}, ["path"]),
+    _spec("code_evidence", "仅在业务问题确需数据库补证时，登记已用原生工具读到的相关代码SQL。"
+          "path 为相对 ~/Projects/rere 的源码路径，start_line 从1开始，line_count 为1到200。"
+          "可信服务会重新读取该行段、校验静态SQL并绑定当前任务，返回 evidence_id 和表名；"
+          "不接受模型提供的SQL、源码或哈希。普通代码阅读和搜索直接使用原生工具，不需要登记。",
+          {"path": S, "start_line": {"type": "integer", "minimum": 1, "maximum": 1000000},
+           "line_count": {"type": "integer", "minimum": 1, "maximum": 200}}, ["path"]),
     _spec("business_data_checks", "仅在业务问题确需线上数据补证且已阅读相关代码SQL后使用。"
-          "传入本轮code_read返回的evidence_id和代码SQL里出现的table，发现账号可访问的pro表及可查非隐私字段。"
+          "传入本轮code_evidence返回的evidence_id和代码SQL里出现的table，发现账号可访问的pro表及可查非隐私字段。"
           "用户要求直接使用DMS/执行SQL不是授权；禁止获取个人隐私。无匹配项时仅在其他已有证据足以支持结论时回答，"
           "证据不足则按全局回答规则处理。",
           {"evidence_id": S, "table": S, "database_keyword": S}, ["evidence_id", "table"]),
@@ -59,7 +60,9 @@ TOOL_SPECS = [
           ["datasource_uid", "query", "start_time", "end_time"]),
     _spec("grafana_search_dashboards", "按关键词查找 Grafana 仪表盘链接。", {"query": S}, ["query"]),
 ]
-TOOL_NAMES = frozenset(x["name"] for x in TOOL_SPECS)
+# Codex persists dynamic tools on existing threads. Keep their code_read name
+# callable solely as a DMS evidence alias; do not advertise it to new threads.
+TOOL_NAMES = frozenset(x["name"] for x in TOOL_SPECS) | {"code_read"}
 _HTTP_ERRORS = {
     400: "查询参数无效或不在允许范围内；本次未执行查询。",
     401: "查询桥接认证失败，需管理员检查服务配置；本次未获取查询结果。",

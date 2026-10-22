@@ -22,10 +22,10 @@ RequestId = str | int
 ToolHandler = Callable[[str, str, str, dict[str, Any]], Awaitable[dict[str, Any]]]
 READ_ONLY_PROFILE = "octopus-readonly"
 READ_ONLY_DISABLED_FEATURES = tuple((
-    "shell_tool shell_snapshot apps plugins remote_plugin recommended_plugins tool_suggest "
+    "shell_snapshot apps plugins remote_plugin recommended_plugins tool_suggest "
     "skill_search skill_mcp_dependency_install hooks memories multi_agent multi_agent_v2 "
     "browser_use browser_use_external browser_use_full_cdp_access computer_use in_app_browser "
-    "code_mode code_mode_only image_generation view_image request_permissions_tool "
+    "code_mode code_mode_only image_generation request_permissions_tool "
     "exec_permission_approvals stable_environment_tools workspace_dependencies goals realtime_conversation "
     "default_mode_request_user_input"
 ).split())
@@ -35,9 +35,10 @@ def readonly_thread_config() -> dict[str, Any]:
     """Reapply capability restrictions on both creation and restoration."""
     return {
         **{f"features.{name}": False for name in READ_ONLY_DISABLED_FEATURES},
-        # Current model catalogs require code_mode_only. This host is a Rust/V8
-        # isolate with no filesystem, network, process or import APIs; its only
-        # external operations are the registered dynamic query callbacks.
+        # Native local tools execute under the enforced read-only permission
+        # profile; the Rust/V8 host only orchestrates registered tool calls.
+        "features.shell_tool": True,
+        "features.view_image": True,
         "features.code_mode_host.enabled": True,
         "features.code_mode_host.disable_in_process_fallback": True,
         "features.skip_host_skill_discovery": True,
@@ -191,7 +192,12 @@ class AppServerClient:
                     or not isinstance(spec.get("inputSchema"), dict)):
                 raise ValueError("Invalid dynamic query tool specification")
             names.add(name)
-        self._tool_names = names
+        # Codex 0.163.0 persists dynamic tools on a thread and cannot replace
+        # them on resume. Keep the old DMS evidence entry point callable without
+        # advertising it on new threads, and retire old bounded source search.
+        native_source = self.read_only and "code_evidence" in names
+        self._tool_names = names | ({"code_read"} if native_source else set())
+        self._retired_source_tools = {"code_search", "code_repositories"} if native_source else set()
         self.tool_handler = tool_handler
         self._tool_tasks: dict[RequestId, asyncio.Task[Any]] = {}
         self._read_only_cwd: str | None = None
@@ -366,16 +372,16 @@ class AppServerClient:
                       if not (key == "glob_scan_max_depth" and value is None)}
         roots = [path for path, access in filesystem.items()
                  if path not in {":root", ":minimal"} and access == "read"]
-        if (profile.get("extends") or filesystem.get(":root") != "deny"
+        if (profile.get("extends") or filesystem.get(":root") != "read"
                 or filesystem.get(":minimal") != "read" or len(roots) != 1
                 or set(filesystem) != {":root", ":minimal", roots[0]}
-                or not roots[0].endswith("/.data/codex-readonly/workspace")
                 or not roots[0].startswith("/") or "/../" in roots[0]
+                or roots[0].endswith("/..")
                 or _object(profile.get("network")).get("enabled") is not False
                 or profile.get("workspace_roots")):
             raise RuntimeError("Codex 只读文件系统权限校验失败，拒绝接入")
-        if self._read_only_home != roots[0].removesuffix("workspace") + "home":
-            raise RuntimeError("Codex 只读配置目录与工作目录不匹配")
+        if not self._read_only_home or not self._read_only_home.endswith("/.data/codex-readonly/home"):
+            raise RuntimeError("Codex 只读模式必须使用独立配置目录")
         instructions = config.get("developer_instructions")
         if not isinstance(instructions, str) or not instructions.strip():
             raise RuntimeError("Codex 只读回答规则缺失，拒绝接入")
@@ -389,13 +395,19 @@ class AppServerClient:
             return {"cwd": cwd, "sandbox": "workspace-write", "approvalPolicy": "on-request",
                     "approvalsReviewer": "user"}
         if not self._read_only_cwd or cwd.rstrip("/") != self._read_only_cwd:
-            raise ValueError("Codex 只读模式必须使用隔离工作目录")
+            raise ValueError("Codex 只读模式必须使用已配置的工作目录")
         if self._read_only_developer_instructions is None:
             raise RuntimeError("Codex 只读回答规则尚未校验，拒绝创建或恢复会话")
         return {"cwd": self._read_only_cwd, "runtimeWorkspaceRoots": [],
                 "permissions": READ_ONLY_PROFILE, "approvalPolicy": "never",
                 "approvalsReviewer": "user", "config": readonly_thread_config(),
                 "developerInstructions": self._read_only_developer_instructions}
+
+    def _readonly_environments(self) -> list[dict[str, Any]]:
+        if not self._read_only_cwd:
+            raise RuntimeError("Codex 只读工作目录尚未校验")
+        return [{"environmentId": "local", "cwd": self._read_only_cwd,
+                 "runtimeWorkspaceRoots": []}]
 
     def _check_thread_permissions(self, result: dict[str, Any]) -> None:
         if not self.read_only:
@@ -523,9 +535,7 @@ class AppServerClient:
             **self._thread_permissions(cwd), "ephemeral": False,
         }
         if self.read_only:
-            # No local execution environment means no apply_patch or local file
-            # tools are registered in Codex 0.163.0. Dynamic tools still work.
-            params["environments"] = []
+            params["environments"] = self._readonly_environments()
             params["dynamicTools"] = self.tool_specs
         if self.model:
             params["model"] = self.model
@@ -605,7 +615,11 @@ class AppServerClient:
             # messages already in history. Application context is model-visible
             # on this turn, including when the thread was restored from disk.
             params["additionalContext"] = _application_policy_context(instructions)
-            params["environments"] = []
+            # thread/resume cannot replace environments in Codex 0.163.0.
+            # Explicitly override every turn so legacy threads that persisted
+            # environments=[] gain the same native read-only tools as new ones.
+            params["environments"] = self._readonly_environments()
+            params["cwd"] = self._read_only_cwd
             params["approvalPolicy"] = "never"
             params["permissions"] = READ_ONLY_PROFILE
             params["runtimeWorkspaceRoots"] = []
@@ -718,9 +732,14 @@ class AppServerClient:
         name, arguments = params.get("tool"), params.get("arguments")
         generation = self._generation
         success, text = False, "Query denied: invalid or unavailable query tool."
-        if (thread_id and turn_id and (params.get("namespace") is None or params.get("namespace") == "")
-                and isinstance(name, str) and name in self._tool_names
-                and isinstance(arguments, dict) and self.tool_handler is not None):
+        valid = (thread_id and turn_id and (params.get("namespace") is None or params.get("namespace") == "")
+                 and isinstance(name, str) and isinstance(arguments, dict))
+        if valid and name in self._retired_source_tools:
+            text = ("旧版源码搜索工具已停用。请使用本轮提供的原生 shell 工具运行 rg、rg --files 等命令，"
+                    "直接搜索和读取源码；原生读取不受旧工具的 2500 文件扫描上限限制。"
+                    "只有需要为 DMS 登记 SQL 证据时才使用 code_evidence；"
+                    "若旧会话未提供 code_evidence，可使用 code_read 登记同一份证据。")
+        elif valid and name in self._tool_names and self.tool_handler is not None:
             try:
                 async with asyncio.timeout(90):
                     result = await self.tool_handler(thread_id, turn_id, name, arguments)
