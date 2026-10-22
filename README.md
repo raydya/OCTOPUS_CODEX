@@ -13,6 +13,7 @@
           ▼
 宿主机独立 Codex app-server
           ├── 原生文件 / shell 工具 → 宿主机源码（文件系统只读）
+          ├── 本机 MCP → 只读工具（写操作和未标注工具拒绝）
           └── 动态查询工具 → 宿主机认证查询接口（127.0.0.1:4501）
                               ├── TLS / Grafana / 飞书文档（现有查询账号）
                               └── DMS（可信源码证据登记、pro 只读查询）
@@ -69,9 +70,17 @@ CODEX_READ_ONLY=true
 CODEX_DIAGNOSTICS_ENABLED=false
 ```
 
-工作目录为源码目录的绝对路径，默认 `~/Projects/rere`；宿主机和 bridge 使用同一个 `CODEX_WORKSPACE`。启动器创建独立配置目录，通过单文件符号链接复用 Codex 登录；不继承个人 MCP、skills、hooks 或自动加载项目指令。
-Codex 使用原生文件、shell 和图片工具读取宿主机内容，能自行按文件名、子目录和内容搜索，不再经过旧 `code_search` 的2500文件扫描预算。文件系统权限为全局只读，工作目录不是读取边界；不能创建、覆盖或删除文件，也不能提权。原生命令禁止联网，线上查询由下述受控接口执行。
+工作目录为源码目录的绝对路径，默认 `~/Projects/rere`；宿主机和 bridge 使用同一个 `CODEX_WORKSPACE`。启动器创建独立 `CODEX_HOME`，复用 Codex 登录并保留真实 `HOME`，让原生技能发现和已有 MCP OAuth 登录继续可用；不导入个人审批权限、hooks 或插件配置。
+Codex 使用原生文件、shell 和图片工具读取宿主机内容，能自行按文件名、子目录和内容搜索，不再经过旧 `code_search` 的2500文件扫描预算。文件系统权限为全局只读，工作目录不是读取边界；不能创建、覆盖或删除文件，也不能提权。原生命令禁止联网，线上查询通过只读 MCP 或下述受控接口执行，数据库补证仍仅通过受控接口。
 旧会话保留记录，每轮显式启用本地只读执行环境，覆盖之前的空环境设置。Codex 0.163.0 无法在恢复线程时更新动态工具目录，因此旧会话的 `code_read` 仅作为 DMS 证据登记兼容入口；旧搜索工具调用会提示改用原生 shell，不再执行旧扫描器。
+
+MCP、skills 和 `AGENTS.md` 的加载方式：
+
+- MCP：宿主机启动时从原 `CODEX_HOME/config.toml`（默认 `~/.codex/config.toml`）导入 `mcp_servers`，保留服务连接和已有工具选择，统一使用 `default_tools_approval_mode="writes"` 和 `approval_policy="never"`。标记 `readOnlyHint=true` 的工具可以调用，写工具和未标注工具在调用前被拒绝；继承配置中的逐工具 `approve` 不会覆盖这条规则。新增或更改服务配置后重启宿主机 Codex。
+- Grafana 额外强制 `--disable-write`，移除允许原始 SQL 或重新开放写工具的参数。通用代码执行、浏览器和电脑操作 MCP（例如本机 `node_repl`、`computer-use`）继续禁用，它们可能错误标注只读并绕过原生命令沙箱。其他 MCP 的只读判断依赖管理员配置的服务准确声明工具标注，不能把声明当成对远程实现的沙箱隔离。
+- Skills：使用 Codex 原生发现，覆盖原 `~/.codex/skills`、`~/.agents/skills`、本应用 `.agents/skills` 和工作目录作用域的技能。私有 `CODEX_HOME/skills` 下使用目录软链关联源技能，内置 `.system` 安装在私有目录，不改个人技能。每轮 `skills/list(forceReload=true)` 刷新旧会话的技能目录；技能脚本仍受只读和网络权限限制。
+- `AGENTS.md`：关联全局 `AGENTS.md` / `AGENTS.override.md`，并恢复原生工作目录作用域的项目指令加载，预算为原生默认 32 KiB。不会在开场递归加载 `~/Projects/rere` 下所有子仓库的规则；读取具体仓库时应遵循其适用规则。自动加载的指令不能扩大写权限或绕过应用的隐私、数据库规则。
+- 每轮开始前重新核验 MCP 配置，调用原生 MCP reload 并等待工具目录，使已有线程获得新增只读工具，不重置会话。原生 MCP 调用不经过应用的 30 次受控查询预算或查询结果预脱敏；最终飞书回答仍经过输出脱敏。
 
 `CODEX_MODEL` 留空时使用 bot 独立 Codex 配置的默认模型。`CODEX_REASONING_EFFORT=xhigh` 设置思考强度，Docker Compose 默认使用 `xhigh`。修改后重建 bridge 容器即可；桥接每轮都显式传入思考强度，因此已有会话从下一轮开始生效。
 
@@ -133,7 +142,7 @@ CODEX_PORT=4502 bash scripts/codex-host.sh
 
 - 飞书文档：现有 `lark-cli` 用户身份的全部可访问文档，仅搜索/读取；不开放聊天记录、通讯录或写入。
 - TLS：现有 `ve volclog` 默认身份、profile 和地域；开放主题目录与原始日志检索。时间窗口最多24小时、最多100行，暂不开放管道 SQL。
-- Grafana：读取现有 Grafana MCP 配置的服务账号，受控调用 Grafana HTTP 查询接口；仅数据源目录、Prometheus 指标和仪表盘搜索，不把 MCP 或令牌交给模型。
+- Grafana：受控接口读取现有 Grafana MCP 服务账号，提供数据源目录、Prometheus 指标和仪表盘搜索；此外原生 Grafana MCP 提供其禁写模式下的读取工具，不把令牌作为工具结果返回模型。
 - DMS：复用宿主机 `aliyun` 的 `company-cli-user` 身份，动态发现其有权访问的全部 `pro` 库表（DMS 环境值为 `product`）；没有按服务或表制定人工白名单。数据库用于业务问题的数据补证，不能直接作为聊天 SQL 控制台。
 - 代码：通过 Codex 原生只读工具读取，不限制文件类型、数量或读取路径；默认从 `~/Projects/rere` 开始查找。DMS 证据登记仍由可信服务在 `~/Projects/rere` 内重新读取源码，保留路径、内容哈希与轮次绑定，不信任模型提供的 SQL 文本。
 
@@ -141,7 +150,7 @@ CODEX_PORT=4502 bash scripts/codex-host.sh
 查询接口只接受固定参数，不接受任意命令、URL、认证信息、profile 或环境变量。未安装的 crane-api 暂不可查询。
 本项目不修改全局 Codex 配置或云端 IAM。`CODEX_READ_ONLY=false` 仍保留旧的个人操作模式，**不能用于同事开放场景**。
 
-当前账号模型使用 Codex 内置 Rust/V8 编排工具，因此保留独立编排子进程，禁止进程内回退。编排环境自身不提供 Node、`process`、`require`、`fetch` 或模块导入；可以调用 Codex 原生沙箱命令及白名单查询。交互式追问已关闭，未连接任何直接 MCP 服务。Codex 0.163.0 暂无可配置的 V8 堆硬上限，容器的内存限制不覆盖宿主机编排或命令进程。
+当前账号模型使用 Codex 内置 Rust/V8 编排工具，因此保留独立编排子进程，禁止进程内回退。编排环境自身不提供 Node、`process`、`require`、`fetch` 或模块导入；可以调用 Codex 原生沙箱命令、只读 MCP 和受控查询。交互式追问、MCP 授权交互及提权均不会放行。Codex 0.163.0 暂无可配置的 V8 堆硬上限，容器的内存限制不覆盖宿主机编排、MCP 或命令进程。
 `lark-cli`、`ve` 使用宿主机 PATH 中的现有安装；本项目不安装独立 CLI。
 火山云 CLI 由用户维护，可运行 `npm install -g @volcengine/cli@latest` 更新，再运行 `ve version` 确认版本。
 `ve` 与 TLS 子工具 `volclog` 各自管理登录状态。若 TLS 报 `console login refresh failed; run: volclog login`，

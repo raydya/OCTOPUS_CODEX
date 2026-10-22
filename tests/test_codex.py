@@ -111,7 +111,11 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
         client._request.return_value = {"turn": {"id": "turn-image"}}
         self.assertEqual(await client.start_turn("thread-safe", "解释截图", (INLINE_PNG,)), "turn-image")
         client.active_turn.assert_awaited_once_with("thread-safe")
-        client._request.assert_awaited_once_with("turn/start", {
+        self.assertEqual(client._request.await_count, 2)
+        self.assertEqual(client._request.await_args_list[0].args, (
+            "skills/list", {"cwds": [self.cwd], "forceReload": True},
+        ))
+        client._request.assert_awaited_with("turn/start", {
             "threadId": "thread-safe",
             "input": [
                 {"type": "text", "text": "解释截图", "text_elements": []},
@@ -214,6 +218,70 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
                 await client._attest_read_only()
             self.assertIsNone(client._read_only_cwd)
             self.assertIsNone(client._read_only_developer_instructions)
+
+    async def test_readonly_host_accepts_mcp_reads_skills_and_instruction_sources(self):
+        client = self.client()
+        config = self.config()
+        config["mcp_servers"] = {
+            "docs": {"url": "https://example.test/mcp", "default_tools_approval_mode": "writes"},
+            "node_repl": {"command": "node", "enabled": False, "default_tools_approval_mode": "writes"},
+        }
+        client._request.return_value = self.config_response(config)
+        await client._attest_read_only()
+        response = self.thread_response()
+        response["instructionSources"] = [self.home + "/AGENTS.md", self.cwd + "/AGENTS.md"]
+        client._request.return_value = response
+        self.assertEqual(await client.create_thread(self.cwd), "thread-safe")
+        params = client._request.call_args.args[1]
+        self.assertTrue(params["config"]["skills.include_instructions"])
+        self.assertFalse(params["config"]["features.skip_host_skill_discovery"])
+        self.assertEqual(params["config"]["project_doc_max_bytes"], 32768)
+
+    async def test_mcp_write_override_and_execution_server_cannot_pass_attestation(self):
+        for servers in (
+            {"docs": {"default_tools_approval_mode": "approve"}},
+            {"docs": {"default_tools_approval_mode": "writes", "tools": {
+                "update": {"approval_mode": "approve"}}}},
+            {"node_repl": {"command": "node", "default_tools_approval_mode": "writes"}},
+        ):
+            client = self.client()
+            config = self.config()
+            config["mcp_servers"] = servers
+            client._request.return_value = self.config_response(config)
+            with self.assertRaises(RuntimeError):
+                await client._attest_read_only()
+
+    async def test_mcp_elicitation_is_declined_without_user_prompt(self):
+        client = self.client()
+        for mode in ("form", "url", "userVerification"):
+            await client._server_request(71, "mcpServer/elicitation/request", {
+                "threadId": "thread-safe", "serverName": "docs", "mode": mode,
+            })
+            client._write.assert_awaited_with({"id": 71, "result": {
+                "action": "decline", "content": None, "_meta": None,
+            }})
+        self.assertFalse(client._prompts)
+
+    async def test_restored_thread_refreshes_mcp_and_skills_before_model_turn(self):
+        client = self.client()
+        config = self.config()
+        config["mcp_servers"] = {"docs": {"url": "https://example.test/mcp",
+                                          "default_tools_approval_mode": "writes"}}
+        client._request.return_value = self.config_response(config)
+        await client._attest_read_only()
+        client._request.reset_mock()
+        client._request.side_effect = [self.config_response(config), {}, {"data": []},
+                                       {"data": []}, {"turn": {"id": "new-turn"}}]
+        client.active_turn = AsyncMock(return_value=None)
+        await client.start_turn("old-thread", "继续")
+        self.assertEqual([call.args[0] for call in client._request.await_args_list], [
+            "config/read", "config/mcpServer/reload", "mcpServerStatus/list", "skills/list", "turn/start",
+        ])
+        self.assertEqual(client._request.await_args_list[2].args[1], {
+            "threadId": "old-thread", "serverName": "docs",
+        })
+        self.assertEqual(client._request.call_args.args[1]["threadId"], "old-thread")
+        self.assertEqual(client._request.call_args.args[1]["approvalPolicy"], "never")
 
     async def test_missing_or_invalid_host_instructions_cannot_reuse_attested_policy(self):
         missing = object()
@@ -377,7 +445,7 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_thread_response_must_confirm_actual_restrictions(self):
         client = self.client()
         await client._attest_read_only()
-        for changes in ({"approvalPolicy": "on-request"}, {"instructionSources": ["/private/AGENTS.md"]},
+        for changes in ({"approvalPolicy": "on-request"}, {"instructionSources": [{"path": "/private/AGENTS.md"}]},
                         {"sandbox": {"type": "readOnly", "networkAccess": True}},
                         {"activePermissionProfile": {"id": ":read-only"}}, {"runtimeWorkspaceRoots": ["/"]}):
             client._request.return_value = {**self.thread_response(), **changes}
@@ -480,6 +548,8 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
                     result = self.thread_response()
                 elif method == "thread/read":
                     result = {"thread": {"status": {"type": "idle"}}}
+                elif method == "skills/list":
+                    result = {"data": []}
                 elif method == "turn/start":
                     await socket.send(json.dumps({"id": request_id, "result": {"turn": {"id": "turn-safe"}}}))
                     await socket.send(json.dumps({"id": "query-rpc", "method": "item/tool/call", "params": {

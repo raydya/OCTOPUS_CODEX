@@ -32,6 +32,9 @@ class CodexHostTests(unittest.TestCase):
         for name in ("codex-host.sh", "codex_host.py"):
             source = PROJECT_ROOT / "scripts" / name
             shutil.copy2(source, scripts / name)
+        module = self.project / "src" / "octopus"
+        module.mkdir(parents=True)
+        shutil.copy2(PROJECT_ROOT / "src" / "octopus" / "codex_extensions.py", module)
         self.script = scripts / "codex-host.sh"
         self.token = self.project / ".secrets" / "codex_token"
         self.token.parent.mkdir()
@@ -319,13 +322,18 @@ class CodexHostTests(unittest.TestCase):
         workspace = self.directory / "Projects" / "rere"
         self.assertEqual(data["cwd"], str(workspace))
         self.assertEqual(data["env"]["CODEX_HOME"], str(root / "home"))
-        self.assertEqual(data["env"]["HOME"], str(root))
+        self.assertEqual(data["env"]["HOME"], str(self.directory))
         self.assertEqual((root / "home" / "auth.json").resolve(), auth)
         self.assertIn("mcp_servers.unsafe", personal_config.read_text())
         for key in ("FAKE_CLOUD_TOKEN", "OPENAI_API_KEY", "CODEX_SQLITE_HOME"):
             self.assertIsNone(data["env"][key])
         config = tomllib.loads((root / "home" / "config.toml").read_text())
-        self.assertNotIn("mcp_servers", config)
+        self.assertEqual(config["mcp_servers"]["unsafe"]["command"], "not-executed")
+        self.assertEqual(config["mcp_servers"]["unsafe"]["default_tools_approval_mode"], "writes")
+        self.assertTrue(config["skills"]["include_instructions"])
+        self.assertTrue(config["skills"]["bundled"]["enabled"])
+        self.assertFalse(config["features"]["skip_host_skill_discovery"])
+        self.assertEqual(config["project_doc_max_bytes"], 32768)
         self.assertEqual(config["approval_policy"], "never")
         self.assertTrue(config["features"]["shell_tool"])
         self.assertTrue(config["features"]["view_image"])
@@ -337,6 +345,36 @@ class CodexHostTests(unittest.TestCase):
         self.assertEqual(len(data["argv"]), 7)
         self.assertEqual(data["env"]["HTTP_PROXY"], "http://127.0.0.1:7890")
 
+    def test_readonly_loads_personal_and_project_guidance_without_copying_private_config(self):
+        auth = self.prepare_readonly()
+        source = auth.parent
+        (source / "AGENTS.md").write_text("Global guidance")
+        (source / "AGENTS.override.md").write_text("Global override")
+        (source / "skills").mkdir()
+        bot_skills = self.project / ".agents" / "skills"
+        bot_skills.mkdir(parents=True)
+        original = ('approval_policy="on-request"\nfeatures.hooks=true\n'
+                    '[mcp_servers.grafana]\ncommand="uvx"\nargs=["mcp-grafana"]\n'
+                    'default_tools_approval_mode="approve"\n'
+                    '[mcp_servers.node_repl]\ncommand="node"\n')
+        (source / "config.toml").write_text(original)
+        self.captured(self.run_host("CODEX_READ_ONLY=true"))
+        home = self.project / ".data" / "codex-readonly" / "home"
+        for name in ("AGENTS.md", "AGENTS.override.md"):
+            self.assertEqual((home / name).resolve(), source / name)
+        self.assertFalse((home / "skills").is_symlink())
+        self.assertEqual((home / "skills" / "host").resolve(), source / "skills")
+        self.assertEqual((home / "skills" / "octopus").resolve(), bot_skills)
+        effective = tomllib.loads((home / "config.toml").read_text())
+        self.assertEqual(effective["mcp_servers"]["grafana"]["args"], ["mcp-grafana", "--disable-write"])
+        self.assertFalse(effective["mcp_servers"]["node_repl"]["enabled"])
+        self.assertFalse(effective["features"]["hooks"])
+        self.assertEqual(effective["approval_policy"], "never")
+        self.assertEqual((source / "config.toml").read_text(), original)
+        (source / "AGENTS.override.md").unlink()
+        self.captured(self.run_host("CODEX_READ_ONLY=true"))
+        self.assertFalse((home / "AGENTS.override.md").is_symlink())
+
     def test_readonly_fails_closed_for_unverified_version_or_missing_auth(self):
         self.prepare_readonly()
         result = self.run_host("CODEX_READ_ONLY=true", environment={"TEST_CODEX_VERSION": "codex-cli 9.0.0"})
@@ -346,6 +384,20 @@ class CodexHostTests(unittest.TestCase):
         result = self.run_host("CODEX_READ_ONLY=true")
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.capture.exists())
+
+    def test_mcp_credential_references_cannot_reintroduce_codex_or_model_overrides(self):
+        auth = self.prepare_readonly()
+        (auth.parent / "config.toml").write_text(
+            '[mcp_servers.docs]\ncommand="not-executed"\n'
+            'env_vars=["FAKE_CLOUD_TOKEN","CODEX_SQLITE_HOME","OPENAI_API_KEY"]\n')
+        result = self.run_host("CODEX_READ_ONLY=true", environment={
+            "FAKE_CLOUD_TOKEN": "synthetic-mcp-token", "CODEX_SQLITE_HOME": "/personal-state",
+            "OPENAI_API_KEY": "synthetic-model-override",
+        })
+        data = self.captured(result)
+        self.assertEqual(data["env"]["FAKE_CLOUD_TOKEN"], "synthetic-mcp-token")
+        self.assertIsNone(data["env"]["CODEX_SQLITE_HOME"])
+        self.assertIsNone(data["env"]["OPENAI_API_KEY"])
 
     def test_readonly_accepts_source_workspace_but_rejects_symlinked_state(self):
         self.prepare_readonly()

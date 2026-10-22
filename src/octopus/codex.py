@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 from .contracts import CodexEvent, EventHandler, Question
 from .images import MAX_IMAGES, MAX_TOTAL_IMAGE_BYTES, ImageInputError
+from .codex_extensions import validate_readonly_mcp_servers
 
 logger = logging.getLogger(__name__)
 RequestId = str | int
@@ -23,7 +24,7 @@ ToolHandler = Callable[[str, str, str, dict[str, Any]], Awaitable[dict[str, Any]
 READ_ONLY_PROFILE = "octopus-readonly"
 READ_ONLY_DISABLED_FEATURES = tuple((
     "shell_snapshot apps plugins remote_plugin recommended_plugins tool_suggest "
-    "skill_search skill_mcp_dependency_install hooks memories multi_agent multi_agent_v2 "
+    "skill_mcp_dependency_install hooks memories multi_agent multi_agent_v2 "
     "browser_use browser_use_external browser_use_full_cdp_access computer_use in_app_browser "
     "code_mode code_mode_only image_generation request_permissions_tool "
     "exec_permission_approvals stable_environment_tools workspace_dependencies goals realtime_conversation "
@@ -41,9 +42,10 @@ def readonly_thread_config() -> dict[str, Any]:
         "features.view_image": True,
         "features.code_mode_host.enabled": True,
         "features.code_mode_host.disable_in_process_fallback": True,
-        "features.skip_host_skill_discovery": True,
-        "web_search": "disabled", "project_doc_max_bytes": 0,
-        "skills.include_instructions": False, "skills.bundled.enabled": False,
+        "features.skip_host_skill_discovery": False,
+        "features.skill_search": True,
+        "web_search": "disabled", "project_doc_max_bytes": 32768,
+        "skills.include_instructions": True, "skills.bundled.enabled": True,
         "cloud.skills.enabled": False, "orchestrator.mcp.enabled": False,
         "apps._default.enabled": False, "agents.enabled": False,
         "tools.experimental_request_user_input.enabled": False,
@@ -202,6 +204,7 @@ class AppServerClient:
         self._tool_tasks: dict[RequestId, asyncio.Task[Any]] = {}
         self._read_only_cwd: str | None = None
         self._read_only_home: str | None = None
+        self._read_only_mcp_servers: tuple[str, ...] = ()
         self._read_only_developer_instructions: str | None = None
         if url:
             parsed = urlsplit(url)
@@ -349,6 +352,7 @@ class AppServerClient:
         """Refuse a personal or drifted host before any colleague thread loads."""
         self._read_only_cwd = None
         self._read_only_developer_instructions = None
+        self._read_only_mcp_servers = ()
         result = _object(await self._request("config/read", {"includeLayers": True}, require_ready=False))
         config = _object(result.get("config"))
         for key, expected in readonly_thread_config().items():
@@ -364,7 +368,8 @@ class AppServerClient:
                 raise RuntimeError("Codex 只读隔离配置校验失败，拒绝接入")
         if (config.get("approval_policy") != "never"
                 or config.get("default_permissions") != READ_ONLY_PROFILE
-                or _object(config.get("mcp_servers")) or _object(config.get("plugins"))):
+                or not validate_readonly_mcp_servers(config.get("mcp_servers"))
+                or _object(config.get("plugins"))):
             raise RuntimeError("Codex 只读隔离配置校验失败，拒绝接入")
         profile = _object(_object(config.get("permissions")).get(READ_ONLY_PROFILE))
         filesystem = _object(profile.get("filesystem"))
@@ -389,6 +394,10 @@ class AppServerClient:
         # application context below also updates model-visible restored history.
         self._read_only_cwd = roots[0]
         self._read_only_developer_instructions = instructions
+        self._read_only_mcp_servers = tuple(
+            name for name, server in _object(config.get("mcp_servers")).items()
+            if server.get("enabled") is not False
+        )
 
     def _thread_permissions(self, cwd: str) -> dict[str, Any]:
         if not self.read_only:
@@ -414,8 +423,11 @@ class AppServerClient:
             return
         profile = _object(result.get("activePermissionProfile"))
         sandbox = _object(result.get("sandbox"))
+        sources = result.get("instructionSources")
         if (result.get("approvalPolicy") != "never" or result.get("cwd") != self._read_only_cwd
-                or result.get("runtimeWorkspaceRoots") != [] or result.get("instructionSources") != []
+                or result.get("runtimeWorkspaceRoots") != []
+                or not isinstance(sources, list)
+                or any(not isinstance(path, str) or not path for path in sources)
                 or profile.get("id") != READ_ONLY_PROFILE or profile.get("extends")
                 or sandbox.get("type") != "readOnly" or sandbox.get("networkAccess") is not False):
             raise RuntimeError("Codex 会话只读权限校验失败，任务未提交")
@@ -485,6 +497,7 @@ class AppServerClient:
         self._tool_tasks.clear()
         self._read_only_cwd = None
         self._read_only_home = None
+        self._read_only_mcp_servers = ()
         self._read_only_developer_instructions = None
         if not self._closed:
             self._emit(CodexEvent("disconnect", error=reason, text=reason))
@@ -608,6 +621,15 @@ class AppServerClient:
             # Apply on every turn so resumed conversations use the current setting.
             params["effort"] = self.reasoning_effort
         if self.read_only:
+            if self._read_only_mcp_servers:
+                # Reload uses host configuration, so attest it before activating
+                # any new server. Native reload updates restored thread catalogs;
+                # listing metadata waits for their optional startup to finish.
+                await self._attest_read_only()
+                await self._request("config/mcpServer/reload", {})
+                await asyncio.gather(*(self._request("mcpServerStatus/list", {
+                    "threadId": thread_id, "serverName": name,
+                }) for name in self._read_only_mcp_servers))
             instructions = self._read_only_developer_instructions
             if not isinstance(instructions, str) or not instructions.strip():
                 raise RuntimeError("Codex 只读回答规则尚未校验，拒绝开始任务")
@@ -623,6 +645,10 @@ class AppServerClient:
             params["approvalPolicy"] = "never"
             params["permissions"] = READ_ONLY_PROFILE
             params["runtimeWorkspaceRoots"] = []
+            # Older threads can retain the previously disabled skill catalog.
+            # Use native discovery to refresh it without replacing the thread
+            # or copying skill bodies into the application's instructions.
+            await self._request("skills/list", {"cwds": [self._read_only_cwd], "forceReload": True})
         result = _object(await self._request("turn/start", params))
         turn_id = _string(_object(result.get("turn")).get("id"))
         if not turn_id:
@@ -690,6 +716,11 @@ class AppServerClient:
             return
         if method == "item/permissions/requestApproval":
             await self._write({"id": request_id, "result": {"permissions": {}, "scope": "turn"}})
+            return
+        if method == "mcpServer/elicitation/request" and self.read_only:
+            await self._write({"id": request_id, "result": {
+                "action": "decline", "content": None, "_meta": None,
+            }})
             return
         if thread_id and turn_id and method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}:
             if self.read_only:
