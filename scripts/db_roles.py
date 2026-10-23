@@ -23,6 +23,11 @@ from octopus.store import Store
 
 TABLE_GRANTS = {
     "meta": "SELECT",
+    "topics": "SELECT, INSERT, UPDATE, DELETE",
+    "topic_routes": "SELECT, INSERT, UPDATE, DELETE",
+    "topic_messages": "SELECT, INSERT, UPDATE, DELETE",
+    "topic_actors": "SELECT, INSERT, UPDATE, DELETE",
+    "topic_pending": "SELECT, INSERT, UPDATE, DELETE",
     "sessions": "SELECT, INSERT, UPDATE, DELETE",
     "jobs": "SELECT, INSERT, UPDATE, DELETE",
     "owners": "SELECT, INSERT",

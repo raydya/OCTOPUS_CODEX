@@ -71,6 +71,7 @@ class Config:
     max_tool_calls: int = 30
     database_migrate: bool = True
     support_group_ids: tuple[str, ...] = ()
+    topic_routing: bool = False
 
     @classmethod
     def from_env(cls) -> Config:
@@ -122,6 +123,9 @@ class Config:
         if read_only_value not in {"true", "false"}:
             raise ConfigurationError("CODEX_READ_ONLY 必须为 true 或 false")
         read_only = read_only_value == "true"
+        routing_value = os.environ.get("CODEX_TOPIC_ROUTING", "true" if read_only else "false").strip().lower()
+        if routing_value not in {"true", "false"} or (routing_value == "true" and not read_only):
+            raise ConfigurationError("CODEX_TOPIC_ROUTING 必须为 true 或 false，且仅支持只读模式")
         reasoning_effort = os.environ.get("CODEX_REASONING_EFFORT", "").strip() or None
         if reasoning_effort is not None and reasoning_effort not in {
             "low", "medium", "high", "xhigh", "max", "ultra",
@@ -163,4 +167,5 @@ class Config:
             max_tool_calls=_integer("MAX_TOOL_CALLS", 30, 1, 100),
             database_migrate=os.environ.get("DATABASE_MIGRATE", "true").lower() == "true",
             support_group_ids=support_group_ids,
+            topic_routing=routing_value == "true",
         )

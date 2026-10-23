@@ -163,6 +163,10 @@ def readonly_environment(env: dict[str, str]) -> dict[str, str]:
     ):
         raise ValueError("Invalid read-only policy")
     policy['permissions.octopus-readonly.filesystem.' + json.dumps(str(cwd.resolve()))] = "read"
+    # Topic classifiers unsubscribe after every message. Codex otherwise keeps
+    # those ephemeral threads loaded for 30 minutes. Subscribed business threads
+    # stay loaded; their persisted history can still resume after disconnect.
+    policy["thread_unload_delay_secs"] = 0
     config = home / "config.toml"
     if config.is_symlink():
         raise ValueError("Read-only configuration must not be a symlink")

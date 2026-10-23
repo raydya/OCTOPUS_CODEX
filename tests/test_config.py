@@ -55,6 +55,19 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigurationError, "CODEX_REASONING_EFFORT"):
                 Config.from_env()
 
+    def test_topic_routing_is_readonly_default_and_explicitly_switchable(self):
+        readonly = {**self.env, "CODEX_READ_ONLY": "true", "QUERY_TOKEN_FILE": str(self.token)}
+        with patch.dict(os.environ, readonly, clear=True):
+            self.assertTrue(Config.from_env().topic_routing)
+        with patch.dict(os.environ, {**readonly, "CODEX_TOPIC_ROUTING": "false"}, clear=True):
+            self.assertFalse(Config.from_env().topic_routing)
+        with patch.dict(os.environ, self.env, clear=True):
+            self.assertFalse(Config.from_env().topic_routing)
+        for env in ({**readonly, "CODEX_TOPIC_ROUTING": "treu"},
+                    {**self.env, "CODEX_TOPIC_ROUTING": "true"}):
+            with patch.dict(os.environ, env, clear=True), self.assertRaisesRegex(ConfigurationError, "CODEX_TOPIC_ROUTING"):
+                Config.from_env()
+
     def test_remote_plaintext_and_url_credentials_are_rejected(self):
         for url in ("ws://external.example:4500", "wss://user:secret@external.example"):
             with patch.dict(os.environ, {**self.env, "CODEX_URL": url}, clear=True):

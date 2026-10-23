@@ -38,6 +38,7 @@ services:
       CODEX_MODEL: ${CODEX_MODEL:-}
       CODEX_REASONING_EFFORT: ${CODEX_REASONING_EFFORT:-xhigh}
       CODEX_READ_ONLY: ${CODEX_READ_ONLY:-true}
+      CODEX_TOPIC_ROUTING: ${CODEX_TOPIC_ROUTING:-true}
       QUERY_HOST_URL: http://host.docker.internal:${OCTOPUS_QUERY_PORT:-4501}
       QUERY_TOKEN_FILE: /run/octopus/query_token
       MAX_PENDING_PER_USER: ${MAX_PENDING_PER_USER:-3}

@@ -6,7 +6,7 @@ import logging
 import secrets
 import time
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .config import Config
@@ -18,6 +18,7 @@ from .queries import QueryClient, TOOL_NAMES
 from .privacy import dms_request_allowed, privacy_request_denied, redact_private_text
 from .access import ACCESS_COMMANDS, AccessRequests
 from .images import MAX_IMAGES, MAX_TOTAL_IMAGE_BYTES, ImageInputError, prepare_image
+from .topic_routing import TopicRouter, RoutingInputError
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +115,10 @@ class Bridge:
         self.events: asyncio.Queue[CodexEvent] = asyncio.Queue()
         self.wakeup = asyncio.Event()
         self.control_wakeup = asyncio.Event()
+        self.routing_wakeup = asyncio.Event()
+        self.router = TopicRouter(store, codex, messenger, config.workspace) if config.topic_routing else None
+        self._scope_locks: dict[str, asyncio.Lock] = {}
+        self.routing_jobs: dict[str, Any] = {}
         self._state_lock = asyncio.Lock()
         self.idle = asyncio.Event()
         self.idle.set()
@@ -172,6 +177,9 @@ class Bridge:
             self._background(self._notice(message, "上次命令状态未确认",
                 "服务在处理此命令时退出，未自动重放。请查看 /status，并按需要重新发送命令。"))
         self._background(self._scheduler(), critical=True)
+        if self.router:
+            self._background(self._routing_worker(), critical=True)
+            self.routing_wakeup.set()
         self._background(self._control_worker(), critical=True)
         if self.config.read_only:
             self._background(self._revocation_worker(), critical=True)
@@ -184,8 +192,14 @@ class Bridge:
         Read/interrupt the existing thread only; never resume it with old tools.
         Combine running and queued recovery into one notice per legacy session.
         """
-        affected = {job.session_key: job for job in [*recovered, *retired]
-                    if job.session_key != self._key(job.message)}
+        affected = {}
+        for job in [*recovered, *retired]:
+            if job.session_key == self._key(job.message):
+                continue
+            route = await self.store.get_route(job.id) if self.router else None
+            if route and route.scope_key == self._key(job.message) and route.session_key == job.session_key:
+                continue
+            affected[job.session_key] = job
         for key, job in affected.items():
             uncertain = False
             try:
@@ -243,6 +257,9 @@ class Bridge:
                 return
         if not authorized:
             return
+        if (self.router and message.text.strip() in {"换个问题", "新问题", "另一个问题"}
+                and not message.image_keys and not message.attachment_error):
+            message = replace(message, text="/new")
         key = self._key(message)
         if self.config.read_only and len(message.text) > 16000:
             self._background(self._notice(message, "消息过长", "请将问题缩短至16000字以内。"))
@@ -292,7 +309,9 @@ class Bridge:
         if accepted:
             self._acknowledgement(message)
             self.wakeup.set()
-            if key in self.blocked:
+            if self.router:
+                self.routing_wakeup.set()
+            if key in self.blocked and not self.router:
                 self._background(self._notice(message, "会话已暂停", "消息已保存。请检查上次中断的任务，再 /resume 恢复队列。"))
 
     def _acknowledgement(self, message: IncomingMessage) -> asyncio.Task[None]:
@@ -379,14 +398,40 @@ class Bridge:
 
     async def _command(self, message: IncomingMessage) -> None:
         parts = message.text.strip().split(maxsplit=2)
-        command, key = parts[0].lower(), self._key(message)
+        command, scope = parts[0].lower(), self._key(message)
+        key = scope
+        if self.router:
+            reference = message.parent_id or (message.root_id if message.chat_type == "p2p" else "")
+            linked = await self.store.topic_for_message(scope, reference) if reference else None
+            key = linked or await self.store.current_topic(scope, message.sender_id) or scope
         active = next((x for x in self.active.values() if x.job.session_key == key), None)
-        if self._support_group(message) and command in {"/new", "/stop", "/resume"}:
+        if self._support_group(message) and command in ({"/stop", "/resume"} if self.router else {"/new", "/stop", "/resume"}):
             member = await self.store.member(message.sender_id)
             if not member or not member["enabled"] or member["role"] != "admin":
                 await self._notice(message, "", "这是多人共享的话题会话，重置、停止和恢复任务仅限管理员操作。")
                 return
-        if self.access and command in ACCESS_COMMANDS:
+        if self.router and command == "/topics":
+            topics = await self.store.topic_candidates(scope, message.sender_id, limit=20)
+            lines = [f"{'当前 · ' if t.session_key == key else ''}{t.session_key.rsplit(':', 1)[-1][-8:]}  {t.title}" for t in topics]
+            await self._notice(message, "", "\n".join(lines) + "\n用 /switch 编号切换；回复旧答案也可以回到对应问题。" if lines else "还没有业务主题。")
+        elif self.router and command == "/switch":
+            topics = await self.store.topic_candidates(scope, message.sender_id, limit=30)
+            matches = [t for t in topics if len(parts) == 2 and t.session_key.rsplit(':', 1)[-1][-8:] == parts[1]]
+            if len(matches) != 1:
+                await self._notice(message, "", "请用 /topics 查看主题，再发送 /switch 编号。")
+            else:
+                await self.store.select_topic(scope, message.sender_id, matches[0].session_key)
+                await self._notice(message, "", "已切换到：" + matches[0].title)
+        elif self.router and command == "/new":
+            await self.store.new_topic(scope, message.sender_id)
+            await self._notice(message, "", "下一条消息将作为新问题处理，原问题的记录保留。")
+        elif self.router and command == "/help":
+            await self._notice(message, "", "消息会按业务问题自动选择会话；回复某条机器人答案可以继续那个问题。"
+                "可以说“另一个问题：……”或“接着上一题”纠正归属。\n"
+                "/topics 查看主题；/switch 编号切换；/new 开启新问题；/status 查看当前主题状态；/last 查看最近结果。\n"
+                "/stop 停止当前主题；/resume 恢复暂停队列。群内停止、恢复仅限管理员，追问仍需 @机器人。\n"
+                "各用户私聊、不同群和飞书话题相互隔离。只读查询和个人隐私限制保持生效。")
+        elif self.access and command in ACCESS_COMMANDS:
             await self._notice(message, "", await self.access.command(message))
         elif self.config.read_only and command in {"/members", "/member-add", "/member-disable", "/member-enable"}:
             await self._member_command(message, command, parts)
@@ -413,7 +458,9 @@ class Bridge:
             status = active.activity if active else ("任务正在启动" if key in self.busy else "空闲")
             if key in self.blocked:
                 status = "暂停：" + (session.blocked_reason or "上次执行状态待确认")
-            await self._notice(message, "会话状态", f"状态：{status}\n排队：{queued}\n会话：{session.thread_id or '尚未创建'}")
+            topic = await self.store.topic_by_key(scope, key) if self.router else None
+            routing = "\n正在判断新消息的主题" if scope in self.routing_jobs else ""
+            await self._notice(message, "会话状态", (f"主题：{topic.title}\n" if topic else "") + f"状态：{status}\n排队：{queued}\n会话：{session.thread_id or '尚未创建'}" + routing)
         elif command == "/new":
             if key in self.busy or await self.store.pending_count(key):
                 await self._notice(message, "当前仍有任务", "请先 /stop 并等待任务停止，再使用 /new。")
@@ -437,7 +484,12 @@ class Bridge:
             self.wakeup.set()
             await self._notice(message, "已恢复队列", "将继续原会话；若 Codex 仍有任务运行，会暂停并提示处理。")
         elif command == "/stop":
-            cancelled = await self.store.cancel_queued(key)
+            if self.router:
+                cancelled = await self.store.cancel_pending_routes(scope, message.sender_id)
+                if key != scope or await self.store.topic_by_key(scope, key):
+                    cancelled += await self.store.cancel_routed_jobs(key)
+            else:
+                cancelled = await self.store.cancel_queued(key)
             self._reaction_cleanup_wakeup.set()
             if active:
                 active.stopping = True
@@ -461,12 +513,14 @@ class Bridge:
         elif command == "/last":
             result = await self.store.last_result(key)
             if result:
-                await self._send_parts(message, "", result["text"])
+                await self._send_parts(message, "", result["text"], session_key=key)
             else:
                 await self._notice(message, "暂无结果", "当前聊天尚未保存执行结果。")
         elif command in {"/approve", "/deny", "/answer"}:
             ticket = self.tickets.get(parts[1]) if len(parts) >= 2 else None
-            if (not ticket or ticket.consumed or ticket.active.job.session_key != key
+            ticket_scope = self._key(ticket.active.job.message) if ticket else None
+            matching = ticket_scope == scope if self.router else bool(ticket and ticket.active.job.session_key == key)
+            if (not ticket or ticket.consumed or not matching
                     or ticket.active.job.message.sender_id != message.sender_id):
                 await self._notice(message, "请求不可用", "编号不存在、已处理或已过期。请使用当前会话中最新的卡片。")
                 return
@@ -609,6 +663,75 @@ class Bridge:
             answers[key] = [value]
         return answers
 
+    def _scope_lock(self, key: str) -> asyncio.Lock:
+        return self._scope_locks.setdefault(key, asyncio.Lock())
+
+    async def _routing_worker(self) -> None:
+        """Durable inbox -> immutable topic assignment -> business queue.
+
+        One classifier runs at a time independently of business turns. Scope
+        locks serialize user corrections with assignment; no lock is held by a
+        long-running business task.
+        """
+        while not self.closed:
+            await self.routing_wakeup.wait()
+            self.routing_wakeup.clear()
+            if self.closed or not self.connected:
+                continue
+            jobs = await self.store.pending_routes()
+            for job in jobs:
+                if self.closed or not self.connected:
+                    break
+                scope = self._key(job.message)
+                async with self._scope_lock(scope):
+                    self.routing_jobs[scope] = job
+                    try:
+                        if job.session_key != scope or not await self._authorized(job.message):
+                            await self.store.reject_topic_route(job.id, "member_disabled_or_wrong_scope")
+                            continue
+                        if privacy_request_denied(job.message.text):
+                            raise RoutingInputError(PRIVACY_REFUSAL)
+                        await asyncio.shield(self._acknowledgement(job.message))
+                        images = await self._image_inputs(job)
+                        if images is None or self.closed or not await self._authorized(job.message):
+                            await self.store.reject_topic_route(job.id, "member_disabled")
+                            continue
+                        decision = await self.router.decide(job.message, scope, images)
+                        del images
+                        if self.closed or not await self._authorized(job.message):
+                            await self.store.reject_topic_route(job.id, "member_disabled")
+                            continue
+                        if decision.action == "clarify":
+                            if await self.store.defer_topic_route(job.id, scope, decision.pending):
+                                await self._notice(job.message, "", decision.clarification)
+                        else:
+                            route = await self.store.freeze_route(job.id, scope, decision.topic_id,
+                                title=decision.title, summary=decision.summary, prompt=decision.prompt,
+                                question=decision.question, data_allowed=decision.data_allowed,
+                                action=decision.action, reason=decision.reason, context_ids=decision.context_ids,
+                                image_sources=decision.image_sources)
+                            if route:
+                                await self._audit(job.message.sender_id, "topic.route", decision=decision.action,
+                                                  job_id=job.id)
+                                if route.session_key in self.blocked:
+                                    await self._notice(job.message, "", "这个问题的会话已暂停，消息已保存。请检查后 /resume 恢复。")
+                    except asyncio.CancelledError:
+                        raise
+                    except (RoutingInputError, ImageInputError, ReferenceContextError) as exc:
+                        if await self.store.reject_topic_route(job.id, "routing_input_failed"):
+                            await self._notice(job.message, "", str(exc), "error")
+                    except Exception as exc:
+                        log.error("主题判断失败 (%s)", type(exc).__name__)
+                        if await self.store.reject_topic_route(job.id, "routing_failed"):
+                            await self._notice(job.message, "", "暂时无法确定这条消息属于哪个问题。请回复对应答案，或补充完整问题后重发。", "error")
+                    finally:
+                        self.routing_jobs.pop(scope, None)
+                        self._reaction_cleanup_wakeup.set()
+                        self.wakeup.set()
+                        self.control_wakeup.set()
+            if len(jobs) >= 100:
+                self.routing_wakeup.set()
+
     async def _scheduler(self) -> None:
         while not self.closed:
             await self.wakeup.wait()
@@ -617,10 +740,16 @@ class Bridge:
                 return
             if not self.connected:
                 continue
-            jobs = (await self.store.next_jobs(eligible_only=True) if self.config.read_only
+            jobs = (await self.store.next_routed_jobs() if self.router else
+                    await self.store.next_jobs(eligible_only=True) if self.config.read_only
                     else await self.store.next_jobs())
             for job in jobs:
-                if self.config.read_only and (job.session_key != self._key(job.message)
+                route = await self.store.get_route(job.id) if self.router else None
+                if self.router and not route:
+                    continue
+                valid_scope = (route.scope_key == self._key(job.message) and route.session_key == job.session_key
+                               if route else job.session_key == self._key(job.message))
+                if self.config.read_only and (not valid_scope
                         or not await self._authorized(job.message)):
                     await self.store.cancel_queued_job(job.id)
                     self._reaction_cleanup_wakeup.set()
@@ -646,41 +775,60 @@ class Bridge:
                 return
             controls = await self.store.next_controls()
             for message in controls:
+                if self.router and not await self.store.topic_control_ready(message.id):
+                    continue
                 if not await self.store.start_control(message.id):
                     continue
-                try:
-                    async with self._state_lock:
-                        if await self._authorized(message):
-                            await self._command(message)
-                            await self._audit(message.sender_id, "command", message.text.split()[0], job_id=message.id)
-                except Exception as exc:
-                    await self.store.finish_control(message.id, type(exc).__name__)
-                    log.error("控制命令未完成 (%s)", type(exc).__name__)
-                    try:
-                        await self._notice(message, "命令未完成", "请检查连接状态后重新发送命令。")
-                    except Exception:
-                        pass
-                else:
-                    await self.store.finish_control(message.id)
+                self._background(self._run_control(message))
             if len(controls) >= 100:
                 self.control_wakeup.set()
 
-    async def _image_inputs(self, job: Any) -> tuple[str, ...] | None:
+    async def _run_control(self, message: IncomingMessage) -> None:
+        async def execute() -> None:
+            async with self._state_lock:
+                if await self._authorized(message):
+                    await self._command(message)
+                    await self._audit(message.sender_id, "command", message.text.split()[0], job_id=message.id)
+        try:
+            # Selecting a topic must serialize with routing; status and stop
+            # must remain responsive while an image/classifier is pending.
+            if self.router and message.text.strip().split()[0].lower() in {"/new", "/switch"}:
+                async with self._scope_lock(self._key(message)):
+                    await execute()
+            else:
+                await execute()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self.store.finish_control(message.id, type(exc).__name__)
+            log.error("控制命令未完成 (%s)", type(exc).__name__)
+            try:
+                await self._notice(message, "命令未完成", "请检查连接状态后重新发送命令。")
+            except Exception:
+                pass
+        else:
+            await self.store.finish_control(message.id)
+        finally:
+            if self.router:
+                self.routing_wakeup.set()
+
+    async def _image_inputs(self, job: Any, sources: tuple[dict, ...] = ()) -> tuple[str, ...] | None:
         """Prepare only this accepted message's attachments, outside the inbox ACK."""
         if job.message.attachment_error:
             raise ImageInputError(job.message.attachment_error)
-        if len(job.message.image_keys) > MAX_IMAGES:
+        messages = [IncomingMessage(**source) for source in sources] + [job.message]
+        if sum(len(message.image_keys) for message in messages) > MAX_IMAGES:
             raise ImageInputError("每条消息最多支持4张图片，请分开发送。")
         inputs: list[str] = []
         downloaded_size = encoded_size = 0
         try:
             async with asyncio.timeout(60):
-                for image_key in job.message.image_keys:
+                for source_id, image_key in [(message.id, key) for message in messages for key in message.image_keys]:
                     if (self.closed or job.session_key in self._stop_starting
                             or not await self._authorized(job.message)):
                         return None
                     try:
-                        raw = await self.messenger.download_image(job.message.id, image_key)
+                        raw = await self.messenger.download_image(source_id, image_key)
                     except ImageInputError:
                         raise
                     except Exception:
@@ -796,14 +944,21 @@ class Bridge:
             if not await self._authorized(job.message):
                 await self.store.finish_job(job.id, "member_disabled")
                 return
-            images = await self._image_inputs(job)
+            route = await self.store.get_route(job.id) if self.router else None
+            images = await self._image_inputs(job, route.image_sources if route else ())
             if (images is None or self.closed or job.session_key in self._stop_starting
                     or not await self._authorized(job.message)):
                 await self.store.finish_job(job.id, "任务已取消或成员已停用")
                 return
             prompt, context_data_allowed = job.message.text, True
             question = None
-            if self._support_group(job.message):
+            if self.router:
+                if not route or route.scope_key != self._key(job.message) or route.session_key != job.session_key:
+                    raise RoutingInputError("消息缺少已确认的主题归属，未提交任务。")
+                prompt, context_data_allowed, question = route.prompt, route.data_allowed, route.question
+                if not context_data_allowed or job.message.image_keys:
+                    await self.store.restrict_session_data(job.session_key)
+            elif self._support_group(job.message):
                 prompt, context_data_allowed = await self._group_prompt(job.message)
                 if (job.message.image_keys or not context_data_allowed
                         or not dms_request_allowed(job.message.text)):
@@ -853,11 +1008,12 @@ class Bridge:
             await self._audit(job.message.sender_id, "task.finish", decision=result.status, job_id=job.id)
             await self._clear_tickets(active)
             await self._send_parts(job.message, "" if result.status == "completed" else "任务已结束",
-                                   text, kind="result" if result.status == "completed" else "error")
+                                   text, kind="result" if result.status == "completed" else "error",
+                                   session_key=job.session_key)
         except asyncio.CancelledError:
             # Leave durable running state for restart recovery; never auto-replay it.
             raise
-        except (ImageInputError, GroupContextError, ReferenceContextError) as exc:
+        except (ImageInputError, GroupContextError, ReferenceContextError, RoutingInputError) as exc:
             # Input/context validation fails before a model turn is sent.
             # Keep the existing conversation usable for a corrected next message.
             reason = str(exc)
@@ -909,14 +1065,16 @@ class Bridge:
             self.wakeup.set()
 
     async def _send_parts(self, message: IncomingMessage, title: str, text: str,
-                          kind: str = "result") -> None:
+                          kind: str = "result", *, session_key: str | None = None) -> None:
         parts = split_text(redact_private_text(redact(text))[:32000] if self.config.read_only else text)
         for index, part in enumerate(parts):
             if self.config.read_only and not await self._authorized(message):
                 return
             suffix = f"（{index + 1}/{len(parts)}）" if len(parts) > 1 else ""
             view = View(kind, title + suffix if title else "", part)
-            await self.messenger.send(message.chat_id, view, message.id)
+            sent_id = await self.messenger.send(message.chat_id, view, message.id)
+            if self.router and session_key and await self.store.topic_by_key(self._key(message), session_key):
+                await self.store.map_topic_message(self._key(message), session_key, sent_id)
 
     async def _block(self, key: str, reason: str) -> None:
         self.blocked.add(key)
@@ -1008,6 +1166,8 @@ class Bridge:
                 self.tickets.pop(ticket.id, None)
                 return
         ticket.card_id = await self.messenger.send(active.job.message.chat_id, view, active.job.message.id)
+        if self.router:
+            await self.store.map_topic_message(self._key(active.job.message), active.job.session_key, ticket.card_id)
         active.activity = "等待你在飞书中回复"
         ticket.expiry = self._background(self._expire(ticket))
 
@@ -1033,7 +1193,7 @@ class Bridge:
             answer_text = "\n".join(value for values in answers.values() for value in values)
             if privacy_request_denied(answer_text):
                 ticket.active.data_checks_allowed = False
-                if self._support_group(ticket.active.job.message):
+                if self.router or self._support_group(ticket.active.job.message):
                     await self.store.restrict_session_data(ticket.active.job.session_key)
                 ticket.active.stopping = True
                 await self._audit(ticket.active.job.message.sender_id, "privacy.answer", decision="deny",
@@ -1044,7 +1204,7 @@ class Bridge:
                 return
             # Clarification can narrow authority, never restore it within a turn.
             ticket.active.data_checks_allowed &= dms_request_allowed(answer_text)
-            if self._support_group(ticket.active.job.message) and not ticket.active.data_checks_allowed:
+            if (self.router or self._support_group(ticket.active.job.message)) and not ticket.active.data_checks_allowed:
                 await self.store.restrict_session_data(ticket.active.job.session_key)
         try:
             if decision:
@@ -1078,6 +1238,7 @@ class Bridge:
         self.closed = True
         self.wakeup.set()
         self.control_wakeup.set()
+        self.routing_wakeup.set()
         for active in list(self.active.values()):
             if active.turn_id and self.connected:
                 try:

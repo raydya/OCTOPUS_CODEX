@@ -13,6 +13,7 @@ from psycopg.types.json import Jsonb
 from .access_store import ACCESS_SCHEMA, AccessStore
 from .contracts import IncomingMessage
 from .database import connect_database
+from .topic_store import TOPIC_SCHEMA, TopicStore
 
 
 @dataclass(frozen=True)
@@ -40,7 +41,7 @@ class Job:
 INTERRUPTED_ERROR = "服务重启，上一任务结果未确认；不会自动重跑"
 CONTROL_INTERRUPTED_ERROR = "服务重启，控制命令结果未确认；不会自动重放，请重新发送"
 MEMBER_DISABLED_ERROR = "成员已停用，任务已取消"
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 
 
 def _now() -> int:
@@ -76,7 +77,7 @@ def _message_authorized(message: IncomingMessage, member: dict[str, Any] | None,
     return message.chat_type == "p2p" and member is not None
 
 
-class Store(AccessStore):
+class Store(AccessStore, TopicStore):
     def __init__(self, connection: AsyncConnection[dict[str, Any]], schema: str):
         self._db = connection
         self._schema = schema
@@ -545,6 +546,9 @@ class Store(AccessStore):
                 cursor = await self._db.execute("DELETE FROM audit_events WHERE created_at < %s", (audit_cutoff,))
                 counts["audit_events"] = cursor.rowcount
                 counts.update(await self._purge_access(cutoff))
+                # Clarification input is transient routing state, not an
+                # indefinitely retained copy of a conversation payload.
+                await self._db.execute("DELETE FROM topic_pending WHERE created_at <= %s", (_now() - 30 * 60_000,))
         return counts
 
     async def claim_message(self, id: str) -> bool:
@@ -692,4 +696,4 @@ _SCHEMA = (
         created_at BIGINT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS audit_events_created ON audit_events (created_at)",
-) + ACCESS_SCHEMA
+) + ACCESS_SCHEMA + TOPIC_SCHEMA

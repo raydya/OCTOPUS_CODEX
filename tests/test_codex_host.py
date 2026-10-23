@@ -313,7 +313,7 @@ class CodexHostTests(unittest.TestCase):
     def test_readonly_isolates_config_auth_cwd_and_ambient_secrets(self):
         auth = self.prepare_readonly()
         personal_config = auth.parent / "config.toml"
-        personal_config.write_text('[mcp_servers.unsafe]\ncommand = "not-executed"\n')
+        personal_config.write_text('thread_unload_delay_secs = 1800\n[mcp_servers.unsafe]\ncommand = "not-executed"\n')
         data = self.captured(self.run_host(
             "CODEX_READ_ONLY=true\nCODEX_DIAGNOSTICS_ENABLED=true\nCODEX_PROXY_URL=http://127.0.0.1:7890\n",
             environment={"FAKE_CLOUD_TOKEN": "test-secret", "OPENAI_API_KEY": "test-key",
@@ -334,6 +334,8 @@ class CodexHostTests(unittest.TestCase):
         self.assertTrue(config["skills"]["bundled"]["enabled"])
         self.assertFalse(config["features"]["skip_host_skill_discovery"])
         self.assertEqual(config["project_doc_max_bytes"], 32768)
+        self.assertEqual(config["thread_unload_delay_secs"], 0)
+        self.assertIn("thread_unload_delay_secs = 1800", personal_config.read_text())
         self.assertEqual(config["approval_policy"], "never")
         self.assertTrue(config["features"]["shell_tool"])
         self.assertTrue(config["features"]["view_image"])
