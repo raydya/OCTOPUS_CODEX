@@ -233,7 +233,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         return messenger, api
 
     async def test_support_group_replies_stay_in_topic_without_changing_other_chats(self):
-        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        messenger, api = self.messenger(allow_groups=True, support_group_ids=("oc_support",))
         view = View("result", "", "处理结果")
         await messenger.send("oc_support", view, "om_question")
         self.assertTrue(api.send.call_args.args[4])
@@ -244,13 +244,40 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(api.send.call_args.args[4])
         await messenger.close()
 
+    async def test_received_group_marks_reply_type_without_treating_private_as_group(self):
+        messenger, api = self.messenger(allow_groups=True)
+        messenger._on_message = AsyncMock()
+        await messenger._deliver({"type": "message", "payload": asdict(self.topic_trigger(chat_id="oc_new"))})
+        private = replace(self.topic_trigger(chat_id="oc_private"), chat_type="p2p", root_id="", parent_id="")
+        await messenger._deliver({"type": "message", "payload": asdict(private)})
+        await messenger.send("oc_new", View("result", "", "结果"), "om_question")
+        self.assertTrue(api.send.call_args.args[4])
+        await messenger.send("oc_private", View("result", "", "结果"), "om_private")
+        self.assertFalse(api.send.call_args.args[4])
+        await messenger.close()
+
+    async def test_replayed_group_restores_thread_reply_type_without_new_delivery(self):
+        messenger, api = self.messenger(allow_groups=True)
+        messenger.remember_group("oc_replayed")
+        messenger.remember_group("oc_../invalid")
+        await messenger.send("oc_replayed", View("result", "", "结果"), "om_control")
+        self.assertTrue(api.send.call_args.args[4])
+        await messenger.send("oc_private", View("result", "", "结果"), "om_private")
+        self.assertFalse(api.send.call_args.args[4])
+        self.assertNotIn("oc_../invalid", messenger._known_group_ids)
+        await messenger.close()
+        disabled, _ = self.messenger()
+        disabled.remember_group("oc_replayed")
+        self.assertFalse(disabled._known_group_ids)
+        await disabled.close()
+
     def topic_trigger(self, **changes):
         return replace(IncomingMessage("om_current", "oc_support", "ou_questioner", "请排查", "group", 2000,
                                        root_id="om_root", parent_id="om_root", thread_id="omt_topic",
                                        mentioned_bot=True), **changes)
 
     async def test_topic_context_is_scoped_prior_human_history_with_no_image_downloads(self):
-        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        messenger, api = self.messenger(allow_groups=True, support_group_ids=("oc_support",))
         root = history("om_root", root_id="", create_time=500)
         post = history("om_post", create_time=1200, msg_type="post", body=SimpleNamespace(content=json.dumps({
             "content": [[{"tag": "text", "text": "截图如下"}, {"tag": "img", "image_key": "img_history"}]]})))
@@ -272,10 +299,10 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         api.download_image.assert_not_called()
         await messenger.close()
 
-    async def test_new_topic_skips_history_and_unapproved_chat_never_reads_any_messages(self):
-        messenger, api = self.messenger(support_group_ids=("oc_support",))
+    async def test_new_topic_skips_thread_history_and_invalid_trigger_never_reads_messages(self):
+        messenger, api = self.messenger(allow_groups=True, support_group_ids=("oc_support",))
         self.assertEqual(await messenger.fetch_thread_context(self.topic_trigger(root_id="", parent_id="")), ())
-        for changes in ({"chat_id": "oc_other"}, {"chat_type": "p2p"}, {"mentioned_bot": False},
+        for changes in ({"chat_id": "oc_../bad"}, {"chat_type": "p2p"}, {"mentioned_bot": False},
                         {"root_id": "om_../secret"}, {"thread_id": "omt_bad?secret"}):
             with self.assertRaisesRegex(RuntimeError, THREAD_CONTEXT_UNAVAILABLE):
                 await messenger.fetch_thread_context(self.topic_trigger(**changes))
@@ -284,7 +311,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         await messenger.close()
 
     async def test_topic_context_ignores_valid_empty_history_and_preserves_other_messages(self):
-        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        messenger, api = self.messenger(allow_groups=True, support_group_ids=("oc_support",))
         root = history("om_root", root_id="", create_time=500)
         api.get_message.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[root]))
         mention = SimpleNamespace(key="@_user_1")
@@ -307,7 +334,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         await messenger.close()
 
     async def test_topic_context_empty_root_preserves_substantive_replies(self):
-        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        messenger, api = self.messenger(allow_groups=True, support_group_ids=("oc_support",))
         root = history("om_root", root_id="", create_time=500,
                        body=SimpleNamespace(content=json.dumps({"text": "@_user_1"})),
                        mentions=[SimpleNamespace(key="@_user_1")])
@@ -318,7 +345,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         await messenger.close()
 
     async def test_topic_context_does_not_ignore_invalid_text_as_empty_history(self):
-        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        messenger, api = self.messenger(allow_groups=True, support_group_ids=("oc_support",))
         root = history("om_root", root_id="", create_time=500)
         api.get_message.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[root]))
         for content in ("{", "[]", "{}", '{"text": null}', '{"text": 123}', '{"text": []}'):
@@ -330,7 +357,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         await messenger.close()
 
     async def test_topic_context_does_not_ignore_out_of_scope_empty_history(self):
-        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        messenger, api = self.messenger(allow_groups=True, support_group_ids=("oc_support",))
         root = history("om_root", root_id="", create_time=500)
         api.get_message.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[root]))
         for changes in ({"chat_id": "oc_other"}, {"root_id": "om_other"}, {"thread_id": "omt_other"}):
@@ -342,7 +369,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         await messenger.close()
 
     async def test_topic_context_bounds_count_text_and_keeps_root_and_latest_details(self):
-        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        messenger, api = self.messenger(allow_groups=True, support_group_ids=("oc_support",))
         body = SimpleNamespace(content=json.dumps({"text": "证据" * 3000}))
         root = history("om_root", root_id="", create_time=500, body=body)
         api.get_message.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[root]))
@@ -357,7 +384,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         await messenger.close()
 
     async def test_topic_context_rejects_cross_chat_cross_thread_and_wrong_root(self):
-        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        messenger, api = self.messenger(allow_groups=True, support_group_ids=("oc_support",))
         root = history("om_root", root_id="", create_time=500)
         api.get_message.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[root]))
         for item in (history(chat_id="oc_private"), history(root_id="om_other"),
@@ -376,7 +403,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         await messenger.close()
 
     async def test_topic_context_failure_is_explicit_and_does_not_leak_api_details(self):
-        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        messenger, api = self.messenger(allow_groups=True, support_group_ids=("oc_support",))
         for response in (SimpleNamespace(code=99991672, msg="private-token"),
                          SimpleNamespace(code=0, data=SimpleNamespace(items=[]))):
             api.get_message.return_value = response
@@ -391,7 +418,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         await messenger.close()
 
     async def test_plain_reply_root_fetch_can_discover_thread_without_guessing(self):
-        messenger, api = self.messenger(support_group_ids=("oc_support",))
+        messenger, api = self.messenger(allow_groups=True, support_group_ids=("oc_support",))
         root = history("om_root", root_id="", thread_id="", create_time=500)
         api.get_message.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[root]))
         context = await messenger.fetch_thread_context(self.topic_trigger(thread_id=""))
@@ -401,6 +428,147 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         api.list_thread.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[]))
         await messenger.fetch_thread_context(self.topic_trigger(thread_id=""))
         api.list_thread.assert_called_once_with("omt_discovered")
+        await messenger.close()
+
+    async def test_recent_group_context_reads_before_trigger_and_expands_original_discussion(self):
+        messenger, api = self.messenger(allow_groups=True)
+        trigger = self.topic_trigger(chat_id="oc_new", root_id="", parent_id="", thread_id="", created_at=100_000_500)
+        root = history("om_prior_root", chat_id="oc_new", root_id="", thread_id="omt_prior",
+                       create_time=99_999_000)
+        plain = history("om_plain", chat_id="oc_new", root_id="", thread_id="", create_time=100_000_100)
+        reply = history("om_detail", chat_id="oc_new", root_id="om_prior_root", thread_id="omt_prior",
+                        create_time=100_000_200)
+        ignored = [history("om_future", chat_id="oc_new", root_id="", create_time=100_000_501),
+                   history("om_edited", chat_id="oc_new", root_id="", create_time=99_999_000,
+                           update_time=100_000_501),
+                   history("om_deleted", chat_id="oc_new", root_id="", deleted=True),
+                   history("om_bot", chat_id="oc_new", root_id="", sender=SimpleNamespace(sender_type="app")),
+                   history("om_old", chat_id="oc_new", root_id="", create_time=1),
+                   history("om_current", chat_id="oc_new", root_id="", create_time=100_000_500)]
+        api.list_chat.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[plain, root, *ignored]))
+        api.list_thread.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[reply, root]))
+        context = await messenger.fetch_group_context(trigger)
+        self.assertEqual([item.id for item in context], ["om_prior_root", "om_plain", "om_detail"])
+        self.assertEqual(context[-1].topic_id, "om_prior_root")
+        self.assertEqual(context[0].topic_id, "om_prior_root")
+        api.list_chat.assert_called_once_with("oc_new", "13600", "100001")
+        api.list_thread.assert_called_once_with("omt_prior")
+        api.get_message.assert_not_called()
+        api.download_image.assert_not_called()
+        await messenger.send("oc_new", View("result", "", "结果"), trigger.id)
+        self.assertTrue(api.send.call_args.args[4])
+        await messenger.send("oc_private", View("result", "", "结果"), "om_private")
+        self.assertFalse(api.send.call_args.args[4])
+        await messenger.close()
+
+    async def test_group_context_reply_stays_in_own_thread_and_accepts_new_group(self):
+        messenger, api = self.messenger(allow_groups=True)
+        root = history("om_root", chat_id="oc_new", root_id="", create_time=500)
+        api.get_message.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[root]))
+        api.list_thread.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[]))
+        context = await messenger.fetch_group_context(self.topic_trigger(chat_id="oc_new"))
+        self.assertEqual([item.id for item in context], ["om_root"])
+        api.list_chat.assert_not_called()
+        await messenger.close()
+
+    async def test_group_context_requires_enabled_groups_and_exact_trigger(self):
+        for enabled, changes in ((False, {}), (True, {"mentioned_bot": False}),
+                                 (True, {"chat_type": "p2p"}), (True, {"created_at": 0})):
+            messenger, api = self.messenger(allow_groups=enabled)
+            with self.assertRaisesRegex(RuntimeError, THREAD_CONTEXT_UNAVAILABLE):
+                await messenger.fetch_group_context(self.topic_trigger(root_id="", **changes))
+            api.list_chat.assert_not_called()
+            api.get_message.assert_not_called()
+            await messenger.close()
+
+    async def test_recent_group_context_rejects_foreign_chat_or_thread_and_hides_errors(self):
+        messenger, api = self.messenger(allow_groups=True)
+        trigger = self.topic_trigger(root_id="", parent_id="", thread_id="")
+        root = history("om_prior_root", root_id="", thread_id="omt_prior")
+        for invalid in (history("om_invalid", chat_id="oc_other"),
+                        history("om_invalid", root_id="om_../bad"),
+                        history("om_invalid", thread_id="omt_bad?secret")):
+            api.list_chat.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[invalid]))
+            with self.assertRaisesRegex(RuntimeError, THREAD_CONTEXT_UNAVAILABLE):
+                await messenger.fetch_group_context(trigger)
+        api.list_chat.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[root]))
+        for invalid in (history("om_invalid", chat_id="oc_other", root_id="om_prior_root", thread_id="omt_prior"),
+                        history("om_invalid", root_id="om_elsewhere", thread_id="omt_prior"),
+                        history("om_invalid", root_id="om_prior_root", thread_id="omt_other")):
+            api.list_thread.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[invalid]))
+            with self.assertRaisesRegex(RuntimeError, THREAD_CONTEXT_UNAVAILABLE):
+                await messenger.fetch_group_context(trigger)
+        api.list_chat.side_effect = RuntimeError("private-token private-chat-content")
+        with self.assertRaisesRegex(RuntimeError, THREAD_CONTEXT_UNAVAILABLE):
+            await messenger.fetch_group_context(trigger)
+        self.assertEqual(self.logs, [])
+        await messenger.close()
+
+    async def test_recent_group_context_bounds_expansion_count_text_and_keeps_roots(self):
+        messenger, api = self.messenger(allow_groups=True)
+        roots = [history(f"om_root{index}", root_id="", thread_id=f"omt_{index}",
+                         create_time=500 + index) for index in range(5)]
+        api.list_chat.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=roots))
+        def replies(thread_id):
+            index = int(thread_id.split("_")[1])
+            items = [history(f"om_reply{index}_{number}", root_id=f"om_root{index}", thread_id=thread_id,
+                             create_time=1000 + number,
+                             body=SimpleNamespace(content=json.dumps({"text": "详细证据" * 1000})))
+                     for number in range(20)]
+            return SimpleNamespace(code=0, data=SimpleNamespace(items=items))
+        api.list_thread.side_effect = replies
+        context = await messenger.fetch_group_context(self.topic_trigger(root_id="", parent_id="", thread_id=""))
+        self.assertEqual(api.list_thread.call_count, 3)
+        self.assertEqual({c.args[0] for c in api.list_thread.call_args_list}, {"omt_2", "omt_3", "omt_4"})
+        self.assertTrue({"om_root2", "om_root3", "om_root4"}.issubset({item.id for item in context}))
+        self.assertLessEqual(len(context), 24)
+        self.assertLessEqual(sum(len(item.text) for item in context), 12000)
+        self.assertTrue(all(len(item.text) <= 2000 for item in context))
+        await messenger.close()
+
+    async def test_unavailable_thread_keeps_verified_roots_and_other_discussions_with_partial_note(self):
+        messenger, api = self.messenger(allow_groups=True)
+        roots = [history("om_good", root_id="", thread_id="omt_good"),
+                 history("om_failed", root_id="", thread_id="omt_failed",
+                         body=SimpleNamespace(content=json.dumps({"text": "已确认的问题" * 1000})))]
+        api.list_chat.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=roots))
+        def replies(thread_id):
+            if thread_id == "omt_failed":
+                raise RuntimeError("private-token server failure")
+            return SimpleNamespace(code=0, data=SimpleNamespace(items=[
+                history("om_detail", root_id="om_good", thread_id="omt_good", create_time=1500)]))
+        api.list_thread.side_effect = replies
+        context = await messenger.fetch_group_context(self.topic_trigger(root_id="", parent_id="", thread_id=""))
+        self.assertEqual({item.id for item in context}, {"om_good", "om_failed", "om_detail"})
+        failed = next(item for item in context if item.id == "om_failed")
+        self.assertIn("该话题回复未完整读取", failed.text)
+        self.assertLessEqual(len(failed.text), 2000)
+        self.assertNotIn("private-token", str(context))
+        self.assertEqual(self.logs, [])
+        await messenger.close()
+
+    async def test_slow_thread_marks_partial_without_exhausting_group_history_timeout(self):
+        messenger, api = self.messenger(allow_groups=True)
+        root = history("om_slow", root_id="", thread_id="omt_slow")
+        original = messenger._request
+        async def request(operation, *args):
+            if operation == "list_thread":
+                await asyncio.sleep(10)
+            return await original(operation, *args)
+        messenger._request = request
+        api.list_chat.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[root]))
+        with patch("octopus.feishu.GROUP_CONTEXT_THREAD_TIMEOUT", 0.01):
+            context = await asyncio.wait_for(messenger.fetch_group_context(
+                self.topic_trigger(root_id="", parent_id="", thread_id="")), 1)
+        self.assertEqual([item.id for item in context], ["om_slow"])
+        self.assertIn("该话题回复未完整读取", context[0].text)
+        await messenger.close()
+
+    async def test_recent_group_history_empty_is_not_an_error(self):
+        messenger, api = self.messenger(allow_groups=True)
+        api.list_chat.return_value = SimpleNamespace(code=0, data=SimpleNamespace(items=[]))
+        self.assertEqual(await messenger.fetch_group_context(self.topic_trigger(root_id="")), ())
+        api.list_thread.assert_not_called()
         await messenger.close()
 
     async def test_send_reply_update_and_no_sensitive_error_details(self):
@@ -731,6 +899,11 @@ class ReactionSdkTests(unittest.TestCase):
         request = resource.list.call_args.args[0]
         self.assertEqual(dict(request.queries), {"container_id_type": "thread", "container_id": "omt_topic",
                                                "sort_type": "ByCreateTimeDesc", "page_size": "20"})
+        api.list_chat("oc_group", "123", "456")
+        request = resource.list.call_args.args[0]
+        self.assertEqual(dict(request.queries), {"container_id_type": "chat", "container_id": "oc_group",
+                                               "start_time": "123", "end_time": "456",
+                                               "sort_type": "ByCreateTimeDesc", "page_size": "50"})
 
 
 class ImageDownloadSdkTests(unittest.TestCase):

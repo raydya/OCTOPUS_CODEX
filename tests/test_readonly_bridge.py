@@ -46,6 +46,9 @@ class MembersStore(MemoryStore):
     async def audit(self, *args):
         self.audits.append(args)
 
+    async def group_context_restrictions(self, chat_id, message_ids):
+        return set()
+
     async def enqueue_control(self, item, **kwargs):
         return await super().enqueue_control(item)
 

@@ -60,20 +60,17 @@ def _positive_limit(value: int, field: str, maximum: int = 1_000_000) -> int:
     return value
 
 
-def _support_groups(group_ids: tuple[str, ...]) -> None:
-    if (not isinstance(group_ids, tuple)
-            or any(not isinstance(group_id, str)
-                   or not re.fullmatch(r"oc_[A-Za-z0-9_-]{1,128}", group_id)
-                   for group_id in group_ids)):
-        raise ValueError("支持群必须是明确的群 ID 元组")
+def _group_access(allow_groups: bool) -> None:
+    if type(allow_groups) is not bool:
+        raise ValueError("群聊开关必须是布尔值")
 
 
 def _message_authorized(message: IncomingMessage, member: dict[str, Any] | None,
-                        group_ids: tuple[str, ...]) -> bool:
+                        allow_groups: bool) -> bool:
     if member is not None and not member["enabled"]:
         return False
     if message.chat_type == "group":
-        return bool(message.mentioned_bot and message.chat_id in group_ids)
+        return bool(allow_groups and message.mentioned_bot)
     return message.chat_type == "p2p" and member is not None
 
 
@@ -239,7 +236,7 @@ class Store(AccessStore, TopicStore):
         daily_limit: int = 100,
         min_interval_seconds: float = 2,
         *,
-        support_group_ids: tuple[str, ...] = (),
+        allow_groups: bool = False,
     ) -> str:
         """Atomically authorize and enqueue a task, limiting each sender across chats.
 
@@ -248,7 +245,7 @@ class Store(AccessStore, TopicStore):
         The advisory lock is shared with revocation and works across connections.
         """
         _metadata(message.sender_id, "成员 ID", 256)
-        _support_groups(support_group_ids)
+        _group_access(allow_groups)
         _positive_limit(max_pending, "排队上限", 1000)
         _positive_limit(daily_limit, "每日任务上限")
         if isinstance(min_interval_seconds, bool) or not isinstance(min_interval_seconds, (int, float)) or not math.isfinite(min_interval_seconds) or not 0 <= min_interval_seconds <= 86400:
@@ -269,7 +266,7 @@ class Store(AccessStore, TopicStore):
                     return "duplicate"
                 cursor = await self._db.execute("SELECT enabled FROM users WHERE open_id = %s", (message.sender_id,))
                 member = await cursor.fetchone()
-                if not _message_authorized(message, member, support_group_ids):
+                if not _message_authorized(message, member, allow_groups):
                     return "disabled"
                 now = _now()
                 cursor = await self._db.execute(
@@ -558,11 +555,11 @@ class Store(AccessStore, TopicStore):
             return cursor.rowcount == 1
 
     async def enqueue_control(self, message: IncomingMessage, *, max_pending: int | None = None,
-                              support_group_ids: tuple[str, ...] = ()) -> bool:
-        _support_groups(support_group_ids)
+                              allow_groups: bool = False) -> bool:
+        _group_access(allow_groups)
         if max_pending is not None:
             _positive_limit(max_pending, "控制命令排队上限", 1000)
-        check_authorization = max_pending is not None or bool(support_group_ids)
+        check_authorization = max_pending is not None or allow_groups
         if check_authorization:
             _metadata(message.sender_id, "成员 ID", 256)
         async with self._lock:
@@ -572,7 +569,7 @@ class Store(AccessStore, TopicStore):
                     await self._member_lock(message.sender_id)
                     cursor = await self._db.execute("SELECT enabled FROM users WHERE open_id = %s", (message.sender_id,))
                     member = await cursor.fetchone()
-                    if not _message_authorized(message, member, support_group_ids):
+                    if not _message_authorized(message, member, allow_groups):
                         return False
                 if max_pending is not None:
                     cursor = await self._db.execute(

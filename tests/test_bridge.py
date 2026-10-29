@@ -261,6 +261,12 @@ class FakeMessenger:
     async def start(self, on_message: Any, on_action: Any) -> None:
         self.on_message, self.on_action = on_message, on_action
 
+    async def fetch_group_context(self, item: IncomingMessage) -> tuple[IncomingMessage, ...]:
+        return await self.fetch_thread_context(item)
+
+    def remember_group(self, chat_id: str) -> None:
+        pass
+
     async def add_reaction(self, message_id: str, emoji_type: str = "Typing") -> str:
         self.reaction_calls.append((message_id, emoji_type))
         self.reaction_entered.put_nowait(message_id)

@@ -49,7 +49,7 @@ class GroupStoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def admit(self, message: IncomingMessage, **kwargs: object) -> str:
         return await self.store.admission(topic_key(message.chat_id, message.topic_id), message,
-                                          support_group_ids=(SUPPORT_GROUP,), min_interval_seconds=0, **kwargs)
+                                          allow_groups=True, min_interval_seconds=0, **kwargs)
 
     async def job_states(self) -> list[tuple[str, str, str | None]]:
         async with await AsyncConnection.connect(self.database_url, autocommit=True) as connection:
@@ -82,15 +82,39 @@ class GroupStoreTests(unittest.IsolatedAsyncioTestCase):
         await self.store.session("private-alice", "oc_private", "ou_alice")
         private = replace(first, id="om_private", chat_id="oc_private", chat_type="p2p", root_id="")
         self.assertEqual(await self.store.admission("private-alice", private,
-                         support_group_ids=(SUPPORT_GROUP,), min_interval_seconds=0), "disabled")
+                         allow_groups=True, min_interval_seconds=0), "disabled")
         self.assertEqual([job.message.sender_id for job in await self.store.next_jobs()], ["ou_alice", "ou_bob"])
 
-    async def test_allowlist_is_required_even_for_enabled_members(self) -> None:
+    async def test_recent_group_context_inherits_restrictions_without_private_or_other_group_leak(self) -> None:
+        scope = await self.topic()
+        key = await self.store.new_topic(scope.key, "ou_alice", "受限问题", "含图片")
+        await self.store.restrict_session_data(key)
+        await self.store.map_topic_message(scope.key, key, "om_mapped")
+        await self.store.enqueue(key, group_message("om_job"))
+        unrestricted = await self.store.new_topic(scope.key, "ou_alice", "普通问题", "规则说明")
+        await self.store.map_topic_message(scope.key, unrestricted, "om_public")
+
+        elsewhere = await self.topic(chat="oc_other")
+        other_key = await self.store.new_topic(elsewhere.key, "ou_alice", "别的群", "受限")
+        await self.store.restrict_session_data(other_key)
+        await self.store.map_topic_message(elsewhere.key, other_key, "om_other")
+        await self.store.session("private-same-chat", SUPPORT_GROUP, "ou_alice")
+        private_key = await self.store.new_topic("private-same-chat", "ou_alice", "私聊", "受限")
+        await self.store.restrict_session_data(private_key)
+        await self.store.map_topic_message("private-same-chat", private_key, "om_private")
+
+        ids = ("om_mapped", "om_job", "om_public", "om_other", "om_private", "om_unknown")
+        self.assertEqual(await self.store.group_context_restrictions(SUPPORT_GROUP, ids),
+                         {"om_mapped", "om_job"})
+        self.assertEqual(await self.store.group_context_restrictions("oc_other", ids), {"om_other"})
+        self.assertEqual(await self.store.group_context_restrictions(SUPPORT_GROUP, ()), set())
+
+    async def test_any_group_is_accepted_but_master_switch_and_mention_are_required(self) -> None:
         await self.topic()
         await self.topic(chat="oc_other")
         await self.store.ensure_member("ou_alice")
         self.assertEqual(await self.store.admission(topic_key(), group_message("om_no_scope")), "disabled")
-        self.assertEqual(await self.admit(group_message("om_wrong_group", chat="oc_other")), "disabled")
+        self.assertEqual(await self.admit(group_message("om_new_group", chat="oc_other")), "accepted")
         self.assertEqual(await self.admit(replace(group_message("om_not_mentioned"), mentioned_bot=False)), "disabled")
         self.assertEqual(await self.admit(group_message("om_allowed")), "accepted")
 
@@ -99,63 +123,68 @@ class GroupStoreTests(unittest.IsolatedAsyncioTestCase):
                     for index, text in enumerate(("/status", "/help", "/answer ticket 答案"))]
         for item in controls:
             self.assertTrue(await self.store.enqueue_control(item, max_pending=5,
-                                                             support_group_ids=(SUPPORT_GROUP,)))
+                                                             allow_groups=True))
         self.assertFalse(await self.store.enqueue_control(controls[0], max_pending=5,
-                                                          support_group_ids=(SUPPORT_GROUP,)))
+                                                          allow_groups=True))
         self.assertEqual(await self.store.next_controls(), controls)
         self.assertEqual(await self.store.members(), [])
         reopened = await self.open(migrate=False)
         self.assertEqual(await reopened.next_controls(), controls)
 
-    async def test_group_control_scope_fails_closed_for_private_other_group_or_missing_mention(self) -> None:
+    async def test_group_control_scope_fails_closed_for_private_missing_mention_or_disabled_member(self) -> None:
         control = replace(group_message("om_control"), text="/status")
         for invalid in (replace(control, chat_type="p2p", chat_id="oc_private"),
-                        replace(control, chat_id="oc_other"), replace(control, mentioned_bot=False)):
+                        replace(control, mentioned_bot=False)):
             self.assertFalse(await self.store.enqueue_control(invalid, max_pending=5,
-                                                              support_group_ids=(SUPPORT_GROUP,)))
+                                                              allow_groups=True))
         self.assertFalse(await self.store.enqueue_control(control, max_pending=5))
         await self.store.ensure_member("ou_alice")
-        for invalid in (replace(control, chat_id="oc_other"), replace(control, mentioned_bot=False)):
+        for invalid in (replace(control, mentioned_bot=False),):
             self.assertFalse(await self.store.enqueue_control(invalid, max_pending=5,
-                                                              support_group_ids=(SUPPORT_GROUP,)))
+                                                              allow_groups=True))
         self.assertFalse(await self.store.enqueue_control(control, max_pending=5))
         await self.store.set_member_enabled("ou_alice", False)
         self.assertFalse(await self.store.enqueue_control(control, max_pending=5,
-                                                          support_group_ids=(SUPPORT_GROUP,)))
+                                                          allow_groups=True))
         self.assertEqual(await self.store.next_controls(), [])
         # Supplying scoped authorization must not depend on a quota argument.
-        self.assertFalse(await self.store.enqueue_control(control, support_group_ids=(SUPPORT_GROUP,)))
+        self.assertFalse(await self.store.enqueue_control(control, allow_groups=True))
+
+    async def test_new_group_controls_need_no_list_or_private_membership(self) -> None:
+        control = replace(group_message("om_new_group", chat="oc_new"), text="/status")
+        self.assertTrue(await self.store.enqueue_control(control, allow_groups=True))
+        self.assertEqual(await self.store.next_controls(), [control])
+        self.assertEqual(await self.store.members(), [])
 
     async def test_group_controls_keep_atomic_per_actor_pending_budget(self) -> None:
         first = replace(group_message("om_control_one"), text="/status")
         second_item = replace(group_message("om_control_two", chat="oc_other"), text="/help")
-        groups = (SUPPORT_GROUP, "oc_other")
         second = await self.open()
         results = await asyncio.gather(
-            self.store.enqueue_control(first, max_pending=1, support_group_ids=groups),
-            second.enqueue_control(second_item, max_pending=1, support_group_ids=groups))
+            self.store.enqueue_control(first, max_pending=1, allow_groups=True),
+            second.enqueue_control(second_item, max_pending=1, allow_groups=True))
         self.assertEqual(sorted(results), [False, True])
         accepted = (await self.store.next_controls())[0]
         await self.store.start_control(accepted.id)
         self.assertFalse(await self.store.enqueue_control(replace(first, id="om_while_running"),
-                                                          max_pending=1, support_group_ids=groups))
+                                                          max_pending=1, allow_groups=True))
         self.assertTrue(await self.store.enqueue_control(replace(first, id="om_bob_control", sender_id="ou_bob"),
-                                                         max_pending=1, support_group_ids=groups))
+                                                         max_pending=1, allow_groups=True))
         await self.store.finish_control(accepted.id)
         self.assertTrue(await self.store.enqueue_control(replace(first, id="om_next_control"),
-                                                         max_pending=1, support_group_ids=groups))
+                                                         max_pending=1, allow_groups=True))
 
     async def test_group_control_revocation_race_cancels_only_disabled_actor(self) -> None:
         first = replace(group_message("om_racing_control"), text="/status")
         bob = replace(first, id="om_bob_control", sender_id="ou_bob")
-        await self.store.enqueue_control(bob, max_pending=5, support_group_ids=(SUPPORT_GROUP,))
+        await self.store.enqueue_control(bob, max_pending=5, allow_groups=True)
         second = await self.open()
         await asyncio.gather(
-            self.store.enqueue_control(first, max_pending=5, support_group_ids=(SUPPORT_GROUP,)),
+            self.store.enqueue_control(first, max_pending=5, allow_groups=True),
             second.set_member_enabled("ou_alice", False))
         self.assertEqual(await self.store.next_controls(), [bob])
         self.assertFalse(await self.store.enqueue_control(replace(first, id="om_after_disable"),
-                                                          max_pending=5, support_group_ids=(SUPPORT_GROUP,)))
+                                                          max_pending=5, allow_groups=True))
 
     async def test_group_control_daily_budget_is_shared_and_expires(self) -> None:
         async with await AsyncConnection.connect(self.database_url, autocommit=True) as connection:
@@ -167,15 +196,15 @@ class GroupStoreTests(unittest.IsolatedAsyncioTestCase):
         control = replace(group_message("om_daily_first"), text="/status")
         with patch("octopus.store._now", return_value=100_001_000):
             results = await asyncio.gather(
-                self.store.enqueue_control(control, max_pending=5, support_group_ids=(SUPPORT_GROUP,)),
+                self.store.enqueue_control(control, max_pending=5, allow_groups=True),
                 second.enqueue_control(replace(control, id="om_daily_second"), max_pending=5,
-                                       support_group_ids=(SUPPORT_GROUP,)))
+                                       allow_groups=True))
             self.assertEqual(sorted(results), [False, True])
             self.assertTrue(await self.store.enqueue_control(replace(control, id="om_daily_bob", sender_id="ou_bob"),
-                                                             max_pending=5, support_group_ids=(SUPPORT_GROUP,)))
+                                                             max_pending=5, allow_groups=True))
         with patch("octopus.store._now", return_value=186_400_001):
             self.assertTrue(await self.store.enqueue_control(replace(control, id="om_after_window"),
-                                                             max_pending=5, support_group_ids=(SUPPORT_GROUP,)))
+                                                             max_pending=5, allow_groups=True))
 
     async def test_root_and_reply_use_same_topic_and_invalid_scope_cannot_be_rebound(self) -> None:
         first = group_message("om_topic", root="")
@@ -186,7 +215,7 @@ class GroupStoreTests(unittest.IsolatedAsyncioTestCase):
         for invalid in (replace(reply, root_id="om_other"), replace(reply, chat_id="oc_other"),
                         replace(reply, chat_type="p2p")):
             with self.assertRaisesRegex(ValueError, "会话未绑定"):
-                await self.store.admission(session.key, invalid, support_group_ids=(SUPPORT_GROUP,))
+                await self.store.admission(session.key, invalid, allow_groups=True)
         with self.assertRaisesRegex(ValueError, "会话键"):
             await self.store.session(session.key, first.chat_id, first.sender_id)
         with self.assertRaisesRegex(ValueError, "群话题会话键"):
@@ -197,7 +226,7 @@ class GroupStoreTests(unittest.IsolatedAsyncioTestCase):
         await self.store.session("personal", first.chat_id, first.sender_id)
         with self.assertRaisesRegex(ValueError, "会话未绑定"):
             await self.store.admission("personal", group_message("om_scope_confusion"),
-                                       support_group_ids=(SUPPORT_GROUP,))
+                                       allow_groups=True)
 
     async def test_unknown_actor_can_be_denied_without_any_global_enabled_state(self) -> None:
         await self.topic()
@@ -326,10 +355,10 @@ class GroupStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await cursor.fetchone(), (SCHEMA_VERSION,))
         self.assertIsNotNone(await (await self.open(migrate=False)).get_session("legacy-personal"))
 
-    async def test_allowlist_cannot_be_a_substring_container(self) -> None:
+    async def test_group_switch_cannot_use_truthy_nonboolean_values(self) -> None:
         await self.topic()
-        for invalid in (SUPPORT_GROUP, ("bad:group",), (None,), [SUPPORT_GROUP]):
-            with self.assertRaisesRegex(ValueError, "支持群"):
-                await self.store.admission(topic_key(), group_message("om_invalid"), support_group_ids=invalid)
-            with self.assertRaisesRegex(ValueError, "支持群"):
-                await self.store.enqueue_control(group_message("om_invalid"), max_pending=5, support_group_ids=invalid)
+        for invalid in ("false", 1, None, (SUPPORT_GROUP,)):
+            with self.assertRaisesRegex(ValueError, "群聊开关"):
+                await self.store.admission(topic_key(), group_message("om_invalid"), allow_groups=invalid)
+            with self.assertRaisesRegex(ValueError, "群聊开关"):
+                await self.store.enqueue_control(group_message("om_invalid"), max_pending=5, allow_groups=invalid)

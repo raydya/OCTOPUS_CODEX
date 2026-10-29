@@ -77,6 +77,31 @@ _SELECTION_CONTROL = "lower(c.message_json->>'text') ~ '^[[:space:]]*/(new|switc
 class TopicStore:
     """Uses Store's connection and lock; methods compose SQL in one transaction."""
 
+    async def group_context_restrictions(self, chat_id: str, message_ids: tuple[str, ...]) -> set[str]:
+        """Inherit restrictions from original group inputs without sharing threads."""
+        _text(chat_id, 256, "group chat ID")
+        if not isinstance(message_ids, tuple) or len(message_ids) > 50:
+            raise ValueError("Invalid group context message IDs")
+        for message_id in message_ids:
+            _text(message_id, 256, "group context message ID")
+        if not message_ids:
+            return set()
+        async with self._lock:
+            cursor = await self._db.execute(
+                """SELECT m.message_id FROM topic_messages m
+                   JOIN sessions s ON s.key = m.session_key
+                   WHERE s.scope = 'topic' AND s.chat_id = %s AND s.data_context_restricted
+                     AND m.message_id = ANY(%s)
+                   UNION
+                   SELECT j.id AS message_id FROM jobs j
+                   JOIN sessions s ON s.key = j.session_key
+                   WHERE s.scope = 'topic' AND s.chat_id = %s AND s.data_context_restricted
+                     AND j.message_json->>'chat_type' = 'group'
+                     AND j.message_json->>'chat_id' = %s AND j.id = ANY(%s)""",
+                (chat_id, list(message_ids), chat_id, chat_id, list(message_ids)),
+            )
+            return {row["message_id"] for row in await cursor.fetchall()}
+
     async def _topic_scope(self, scope_key: str, actor_id: str | None = None,
                            message: IncomingMessage | None = None) -> dict:
         cursor = await self._db.execute("SELECT * FROM sessions WHERE key = %s", (scope_key,))

@@ -40,7 +40,7 @@ class GroupBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.codex.complete(turn, "已根据证据定位问题")
         await self.messenger.wait_record(lambda row: row.reply_to == item.id and row.view.kind == "result")
 
-    async def test_group_grant_does_not_create_member_or_unlock_private_and_other_groups(self):
+    async def test_joined_groups_are_open_without_granting_private_membership(self):
         item = group("om_first")
         turn = await self.begin(item)
         self.assertIsNone(await self.store.member("ou_bob"))
@@ -48,10 +48,18 @@ class GroupBridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.complete(item, turn)
         await self.bridge.receive(message("om_private", sender="ou_bob"))
         await self.messenger.wait_record(lambda row: row.reply_to == "om_private")
-        await self.bridge.receive(group("om_other", chat="oc_other"))
-        await self.bridge.receive(group("om_other_admin", chat="oc_other", sender="ou_alice"))
-        self.assertEqual(set(self.store.jobs), {"om_first"})
-        self.assertEqual(len(self.codex.turns), 1)
+        other = group("om_other", chat="oc_other")
+        other_turn = await self.begin(other)
+        self.assertNotEqual(turn.thread, other_turn.thread)
+        await self.complete(other, other_turn)
+        self.assertEqual(set(self.store.jobs), {"om_first", "om_other"})
+        self.assertIsNone(await self.store.member("ou_bob"))
+
+    async def test_group_master_switch_disables_even_legacy_configured_groups(self):
+        self.bridge.config = replace(self.config, allow_groups=False)
+        await self.bridge.receive(group("om_disabled_group"))
+        self.assertEqual(self.store.jobs, {})
+        self.assertEqual(self.codex.turns, [])
 
     async def test_no_mention_and_disabled_member_never_start_work(self):
         await self.bridge.receive(group("om_no_mention", mentioned=False))
@@ -95,7 +103,7 @@ class GroupBridgeTests(unittest.IsolatedAsyncioTestCase):
         item = group("om_failed_context")
         await self.bridge.receive(item)
         reply = await self.messenger.wait_record(lambda row: row.reply_to == item.id)
-        self.assertIn("上下文", reply.view.text)
+        self.assertIn("群消息", reply.view.text)
         self.assertNotIn("secret", reply.view.text)
         self.assertEqual(self.codex.turns, [])
         self.assertEqual(self.bridge.blocked, set())

@@ -81,7 +81,8 @@ async def run(wait_for_config: bool) -> None:
         if stop.is_set():
             return
         messenger = FeishuMessenger(config.app_id, config.app_secret, logger=log.info,
-                                    bot_open_id=config.bot_open_id, support_group_ids=config.support_group_ids)
+                                    bot_open_id=config.bot_open_id,
+                                    allow_groups=config.read_only and config.allow_groups)
         queries = QueryClient(config.query_url, config.query_token_file) if config.read_only else None
         bridge = Bridge(config, store, messenger, codex_client(config), queries=queries)
         await bridge.start()

@@ -24,6 +24,21 @@ class TopicMemoryStore(MembersStore):
         self.job_order: dict[str, int] = {}
         self.control_order: dict[str, int] = {}
 
+    async def group_context_restrictions(self, chat_id, message_ids):
+        restricted = set()
+        for (_, message_id), key in self.topic_messages.items():
+            session = self.sessions[key]
+            if (message_id in message_ids and session.scope == "topic"
+                    and session.chat_id == chat_id and session.data_context_restricted):
+                restricted.add(message_id)
+        for job in self.jobs.values():
+            session = self.sessions[job.session_key]
+            if (job.id in message_ids and session.scope == "topic" and session.chat_id == chat_id
+                    and session.data_context_restricted and job.message.chat_type == "group"
+                    and job.message.chat_id == chat_id):
+                restricted.add(job.id)
+        return restricted
+
     async def enqueue(self, session_key, item):
         accepted = await super().enqueue(session_key, item)
         if accepted:
