@@ -616,7 +616,9 @@ class _LarkApi:
 
     def get_message(self, message_id: str) -> Any:
         from lark_oapi.api.im.v1 import GetMessageRequest
-        request = GetMessageRequest.builder().message_id(message_id).user_id_type("open_id").build()
+        # The default format can replace a 2.0 card with an upgrade placeholder.
+        request = (GetMessageRequest.builder().message_id(message_id).user_id_type("open_id")
+                   .card_msg_content_type("user_card_content").build())
         return self.client.im.v1.message.get(request)
 
     def list_thread(self, thread_id: str) -> Any:

@@ -894,7 +894,8 @@ class ReactionSdkTests(unittest.TestCase):
         api.get_message("om_root")
         request = resource.get.call_args.args[0]
         self.assertEqual(request.paths, {"message_id": "om_root"})
-        self.assertEqual(dict(request.queries), {"user_id_type": "open_id"})
+        self.assertEqual(dict(request.queries), {"user_id_type": "open_id",
+                                               "card_msg_content_type": "user_card_content"})
         api.list_thread("omt_topic")
         request = resource.list.call_args.args[0]
         self.assertEqual(dict(request.queries), {"container_id_type": "thread", "container_id": "omt_topic",

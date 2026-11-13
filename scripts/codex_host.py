@@ -7,7 +7,6 @@ from pathlib import Path
 import re
 import shlex
 import shutil
-import subprocess
 import sys
 import tomllib
 from urllib.parse import urlsplit
@@ -129,11 +128,6 @@ def readonly_environment(env: dict[str, str]) -> dict[str, str]:
     MCP tools require read-only annotations; native commands remain sandboxed.
     Personal approvals, hooks, plugins and permission settings are not imported.
     """
-    executable = shutil.which("codex", path=env.get("PATH"))
-    version = subprocess.run([executable, "--version"], capture_output=True, text=True,
-                             timeout=10, check=True)
-    if version.stdout.strip() != "codex-cli 0.163.0":
-        raise ValueError("Read-only runtime requires the verified Codex version")
     source_home = Path(env.get("CODEX_HOME") or Path.home() / ".codex").expanduser().resolve()
     auth = source_home / "auth.json"
     if not auth.is_file() or auth.is_symlink():
@@ -263,7 +257,7 @@ def launch() -> None:
 if __name__ == "__main__":
     try:
         launch()
-    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+    except (ValueError, OSError) as exc:
         # A parsing/OS error can include configuration values; do not echo them.
         print(f"Cannot launch Codex host ({type(exc).__name__}); check CODEX_PORT, "
               "CODEX_PROXY_URL, CODEX_DIAGNOSTICS_ENABLED, CODEX_READ_ONLY, the policies, "

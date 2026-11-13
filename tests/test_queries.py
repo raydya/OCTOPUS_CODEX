@@ -34,7 +34,8 @@ class QueryClientTests(unittest.IsolatedAsyncioTestCase):
     def test_tls_auth_failure_is_identifiable_without_exposing_provider_message(self):
         payload = json.dumps({"ok": False, "error_code": "tls_auth_required",
                               "error": "private-provider-message"}).encode()
-        expected = {"ok": False, "error": "TLS 查询身份已失效，需管理员在宿主机重新登录 TLS；本次未获取日志。"}
+        expected = {"ok": False, "error_code": "tls_auth_required",
+                    "error": "TLS 查询身份已失效，需要管理员重新授权；本次未获取日志。"}
         self.assertEqual(self.http_failure(502, payload), expected)
         opener = Mock()
         opener.open.return_value = io.BytesIO(payload)
@@ -133,6 +134,51 @@ class QueryClientTests(unittest.IsolatedAsyncioTestCase):
                          {"evidence_id", "check_id", "day", "time_column", "columns", "mode", "filters"})
         self.assertEqual(set(specs["business_data_checks"]["properties"]), {"evidence_id", "table", "database_keyword"})
         self.assertFalse(specs["business_data_check"]["additionalProperties"])
+        self.assertFalse(any("auth" in name or "login" in name for name in specs))
+
+    async def test_authorization_control_plane_is_separate_and_sanitized(self):
+        payload = {"provider": "tls", "request_id": "request1", "state": "pending", "expires_in": 120,
+                   "verification_url": "https://signin.volcengine.com/device?user_code=TEST-CODE",
+                   "user_code": "TEST-CODE", "token": "private-token", "error": "private-error"}
+        opener = Mock()
+        opener.open.return_value = io.BytesIO(json.dumps(payload).encode())
+        with patch("octopus.queries.build_opener", return_value=opener):
+            result = await self.client.auth_start("tls", "admin", "request1")
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, self.client.url + "/v1/auth/start")
+        self.assertEqual(json.loads(request.data), {"provider": "tls", "actor": "admin", "request_id": "request1"})
+        self.assertEqual(result["verification_url"], payload["verification_url"])
+        self.assertNotIn("private", json.dumps(result))
+
+    async def test_auth_response_cannot_redirect_or_leak_terminal_credentials(self):
+        for url in ("http://signin.volcengine.com/", "https://signin.volcengine.com.evil.test/",
+                    "https://evil@signin.volcengine.com/", "https://signin.volcengine.com:444/",
+                    "https://signin.volcengine.com/\nsecret", "https://signin.volcengine.com/#secret"):
+            payload = {"provider": "tls", "request_id": "request1", "state": "pending", "verification_url": url}
+            opener = Mock()
+            opener.open.return_value = io.BytesIO(json.dumps(payload).encode())
+            with self.subTest(url=url), patch("octopus.queries.build_opener", return_value=opener):
+                result = await self.client.auth_status("tls", "admin", "request1")
+                self.assertEqual(result["state"], "failed")
+                self.assertNotIn("verification_url", result)
+        payload.update(state="succeeded", verification_url="private-url", user_code="private-code")
+        opener.open.return_value = io.BytesIO(json.dumps(payload).encode())
+        with patch("octopus.queries.build_opener", return_value=opener):
+            self.assertEqual(await self.client.auth_status("tls", "admin", "request1"),
+                             {"provider": "tls", "request_id": "request1", "state": "succeeded"})
+
+    async def test_auth_identity_and_errors_fail_closed(self):
+        opener = Mock()
+        opener.open.return_value = io.BytesIO(b'{"provider":"tls","request_id":"another","state":"succeeded"}')
+        with patch("octopus.queries.build_opener", return_value=opener):
+            self.assertEqual((await self.client.auth_status("tls", "admin", "request1"))["state"], "failed")
+            with self.assertRaises(ValueError):
+                await self.client.auth_start("arbitrary-command", "admin", "request1")
+        opener.open.side_effect = HTTPError(self.client.url, 403, "private-error", {}, io.BytesIO(b"private"))
+        with patch("octopus.queries.build_opener", return_value=opener):
+            result = await self.client.auth_cancel("tls", "admin", "request1")
+            self.assertEqual(result["state"], "failed")
+            self.assertNotIn("private", json.dumps(result))
 
 
 if __name__ == "__main__":

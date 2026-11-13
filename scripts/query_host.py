@@ -2,6 +2,7 @@
 """Start the host's authenticated, fixed-function read-only query broker."""
 from pathlib import Path
 import os
+import signal
 import sys
 
 if sys.version_info < (3, 12):
@@ -21,6 +22,10 @@ def main():
     if not 1 <= port <= 65535:
         raise ValueError("query broker port must be between 1 and 65535")
     host = QueryHost(code_root, dms_policy_path=PROJECT_ROOT / ".secrets" / "dms-policy.json")
+    def stop(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop)
     try:
         with QueryHTTPServer(("127.0.0.1", port), host, read_token(token_path)) as server:
             print("Read-only query broker listening on 127.0.0.1:%d" % port, flush=True)

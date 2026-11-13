@@ -45,7 +45,8 @@ def codex_client(config: Config) -> AppServerClient:
     return AppServerClient(executable=config.codex_executable, model=config.model,
                            reasoning_effort=config.reasoning_effort,
                            url=config.codex_url, token_file=config.codex_token_file,
-                           read_only=config.read_only, tool_specs=TOOL_SPECS if config.read_only else None)
+                           read_only=config.read_only, tool_specs=TOOL_SPECS if config.read_only else None,
+                           tool_timeout=max(90, min(config.task_timeout, 450)) if config.read_only else 90)
 
 
 async def run(wait_for_config: bool) -> None:

@@ -1,4 +1,4 @@
-"""Private stdio Codex app-server transport, compatible with Codex 0.163.0."""
+"""Private Codex app-server transport with runtime permission attestation."""
 
 from __future__ import annotations
 
@@ -279,13 +279,17 @@ class AppServerClient:
                  request_timeout: float = 30, extra_args: list[str] | None = None,
                  url: str | None = None, token_file: str | None = None,
                  read_only: bool = False, tool_specs: list[dict[str, Any]] | None = None,
-                 tool_handler: ToolHandler | None = None, reasoning_effort: str | None = None):
+                 tool_handler: ToolHandler | None = None, reasoning_effort: str | None = None,
+                 tool_timeout: float = 90):
         if not math.isfinite(request_timeout) or request_timeout <= 0:
             raise ValueError("request_timeout 必须是正数")
+        if not math.isfinite(tool_timeout) or not 0 < tool_timeout <= 900:
+            raise ValueError("tool_timeout 必须在 0 到 900 秒之间")
         self.executable = executable
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.request_timeout = request_timeout
+        self.tool_timeout = tool_timeout
         self.extra_args = list(extra_args or [])
         self.read_only = read_only
         self.tool_specs = json.loads(json.dumps(tool_specs or []))
@@ -444,13 +448,14 @@ class AppServerClient:
             "capabilities": {"experimentalApi": True, "requestAttestation": False},
         }, require_ready=False))
         if self.read_only:
-            product = _string(initialized.get("userAgent")).split(" ", 1)[0]
             home = _string(initialized.get("codexHome"))
-            if not product.endswith("/0.163.0") or not home.endswith("/.data/codex-readonly/home"):
-                raise RuntimeError("Codex 只读模式需要经过验证的版本和独立配置目录")
+            if not home.endswith("/.data/codex-readonly/home"):
+                raise RuntimeError("Codex 只读模式需要独立配置目录")
             self._read_only_home = home
         await self._write({"method": "initialized"})
         if self.read_only:
+            # Accept the installed CLI by its effective permissions and protocol
+            # behavior, rather than a fixed release number.
             await self._attest_read_only()
         if self._transport is not transport or self._closed:
             raise RuntimeError("Codex 初始化期间连接中断")
@@ -1006,7 +1011,7 @@ class AppServerClient:
                     "若旧会话未提供 code_evidence，可使用 code_read 登记同一份证据。")
         elif valid and name in self._tool_names and self.tool_handler is not None:
             try:
-                async with asyncio.timeout(90):
+                async with asyncio.timeout(self.tool_timeout):
                     result = await self.tool_handler(thread_id, turn_id, name, arguments)
                 if not isinstance(result, dict):
                     raise ValueError("Invalid query result")

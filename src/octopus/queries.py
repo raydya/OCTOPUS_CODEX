@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
+from urllib.parse import urlsplit
 from urllib.request import Request, build_opener, ProxyHandler, HTTPRedirectHandler
 
 
@@ -79,7 +81,8 @@ def _query_failure(status: int | None = None, result: Any = None) -> dict[str, A
     # Only interpret a known machine code; provider messages may contain secrets.
     if (status in (None, 502) and isinstance(result, dict) and result.get("ok") is False
             and result.get("error_code") == "tls_auth_required"):
-        message = "TLS 查询身份已失效，需管理员在宿主机重新登录 TLS；本次未获取日志。"
+        return {"ok": False, "error_code": "tls_auth_required",
+                "error": "TLS 查询身份已失效，需要管理员重新授权；本次未获取日志。"}
     else:
         message = _HTTP_ERRORS.get(status, "查询服务请求失败；本次未获取查询结果。")
     return {"ok": False, "error": message}
@@ -148,3 +151,60 @@ class QueryClient:
         if tool not in TOOL_NAMES or not isinstance(arguments, dict):
             raise ValueError("Unknown query tool")
         return await asyncio.to_thread(self._request, tool, arguments, context)
+
+    def _authorization_request(self, operation: str, provider: str, actor: str, request_id: str) -> dict:
+        """Private control plane: never expose these methods as model tools."""
+        failure = {"provider": "tls", "request_id": request_id, "state": "failed"}
+        if (operation not in {"start", "status", "cancel"} or provider != "tls"
+                or any(not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value)
+                       for value in (actor, request_id))):
+            raise ValueError("Invalid authorization request")
+        request = Request(self.url + "/v1/auth/" + operation,
+                          data=json.dumps({"provider": provider, "actor": actor,
+                                           "request_id": request_id}).encode(),
+                          headers={"Authorization": "Bearer " + self.token,
+                                   "Content-Type": "application/json"})
+        try:
+            with build_opener(ProxyHandler({}), NoRedirect()).open(request, timeout=10) as response:
+                raw = response.read(8193)
+            if len(raw) > 8192:
+                return failure
+            result = json.loads(raw)
+            if (type(result) is not dict or result.get("provider") != provider
+                    or result.get("request_id") != request_id
+                    or result.get("state") not in {"starting", "pending", "succeeded", "failed", "expired",
+                                                   "cancelled", "forbidden", "busy"}):
+                return failure
+            clean = {key: result[key] for key in ("provider", "request_id", "state")}
+            if type(result.get("expires_in")) is int and 0 <= result["expires_in"] <= 300:
+                clean["expires_in"] = result["expires_in"]
+            if result["state"] == "pending":
+                url = result.get("verification_url")
+                if url is not None:
+                    parsed = urlsplit(url)
+                    if (not isinstance(url, str) or len(url) > 4096 or any(ord(c) <= 32 for c in url)
+                            or parsed.scheme != "https" or parsed.hostname != "signin.volcengine.com"
+                            or parsed.username or parsed.password or parsed.port not in (None, 443)
+                            or parsed.fragment):
+                        return failure
+                    clean["verification_url"] = url
+                code = result.get("user_code")
+                if code is not None:
+                    if not isinstance(code, str) or not re.fullmatch(r"[A-Za-z0-9-]{4,32}", code):
+                        return failure
+                    clean["user_code"] = code
+            return clean
+        except HTTPError as exc:
+            exc.close()
+            return failure
+        except Exception:
+            return failure
+
+    async def auth_start(self, provider: str, actor: str, request_id: str) -> dict:
+        return await asyncio.to_thread(self._authorization_request, "start", provider, actor, request_id)
+
+    async def auth_status(self, provider: str, actor: str, request_id: str) -> dict:
+        return await asyncio.to_thread(self._authorization_request, "status", provider, actor, request_id)
+
+    async def auth_cancel(self, provider: str, actor: str, request_id: str) -> dict:
+        return await asyncio.to_thread(self._authorization_request, "cancel", provider, actor, request_id)

@@ -40,7 +40,7 @@ Python 在本项目容器运行，PostgreSQL 由独立 `local-infra` Compose 管
 ## 1. 准备配置
 
 宿主机需要 Docker Desktop、Docker Compose、Python 3.12+（宿主机脚本只用标准库）和已登录的 Codex CLI。
-本项目已按 `codex-cli 0.163.0` 核对协议。app-server 的 WebSocket 接口仍为实验性接口，只读启动器锁定此已验证版本，升级后需重新验证工具注册与权限策略。
+本项目直接使用宿主机 `PATH` 中已有的 Codex CLI，不固定版本号，也不下载或安装独立 CLI。app-server 的 WebSocket 接口仍为实验性接口；桥接在连接及每轮任务时核验独立配置、只读权限和工具策略，协议不支持或权限核验失败时拒绝执行。升级本机 CLI 后应运行连接检查并验证模型任务。
 
 ```bash
 bash scripts/bootstrap.sh
@@ -147,17 +147,24 @@ CODEX_PORT=4502 bash scripts/codex-host.sh
 - 代码：通过 Codex 原生只读工具读取，不限制文件类型、数量或读取路径；默认从 `~/Projects/rere` 开始查找。DMS 证据登记仍由可信服务在 `~/Projects/rere` 内重新读取源码，保留路径、内容哈希与轮次绑定，不信任模型提供的 SQL 文本。
 
 所有获准同事共用上述账号的数据权限，仍受 bot 的只读及隐私输出规则限制。外部资料一律作为待分析证据，不能改变工具权限。线上查询接口返回有界且经过常见凭证脱敏的结果；原生文件读取不经过该脱敏器，读取权限也不再隔离宿主机凭证文件，因此只读不等于凭证保密隔离。应用指令仍禁止向用户披露凭证、个人敏感值或他人会话内容。
-查询接口只接受固定参数，不接受任意命令、URL、认证信息、profile 或环境变量。未安装的 crane-api 暂不可查询。
+查询接口只接受固定参数，不接受任意命令、URL、认证信息、profile 或环境变量。`crane-api` 是现有 `cockpit` CLI 的 Crane 查询能力；2026-11-13 已验证宿主机可以查询生产 workload 和 Pod，但尚未接入本项目的受控查询工具。线上排障时的发现顺序、命令和边界见 [Cockpit / Crane 查询说明](docs/operations/cockpit-crane.md)。
 本项目不修改全局 Codex 配置或云端 IAM。`CODEX_READ_ONLY=false` 仍保留旧的个人操作模式，**不能用于同事开放场景**。
 
 当前账号模型使用 Codex 内置 Rust/V8 编排工具，因此保留独立编排子进程，禁止进程内回退。编排环境自身不提供 Node、`process`、`require`、`fetch` 或模块导入；可以调用 Codex 原生沙箱命令、只读 MCP 和受控查询。交互式追问、MCP 授权交互及提权均不会放行。Codex 0.163.0 暂无可配置的 V8 堆硬上限，容器的内存限制不覆盖宿主机编排、MCP 或命令进程。
 `lark-cli`、`ve` 使用宿主机 PATH 中的现有安装；本项目不安装独立 CLI。
 火山云 CLI 由用户维护，可运行 `npm install -g @volcengine/cli@latest` 更新，再运行 `ve version` 确认版本。
-`ve` 与 TLS 子工具 `volclog` 各自管理登录状态。若 TLS 报 `console login refresh failed; run: volclog login`，
-需刷新 TLS 的原有登录：`ve volclog login --no-browser`；只完成 `ve login` 不代表 TLS 认证已恢复。
-保留原 profile、地域和 endpoint，登录后通过最小 TLS 项目查询验证。
-TLS 认证失败会通过查询接口返回固定错误码 `tls_auth_required`，模型能明确知道本次未取得日志，
-不再把登录失效误报为结果超限。CLI 原始错误、登录链接和凭证不会传给模型。
+`ve` 与 TLS 子工具 `volclog` 各自管理登录状态；只完成 `ve login` 不代表 TLS 认证已恢复。
+TLS 查询返回固定错误码 `tls_auth_required` 时，桥接暂停该次查询，在原对话提示等待授权，
+并向启用的管理员私聊发送“开始授权 / 取消”卡片（提问者是管理员时优先只通知本人）。
+管理员确认更新共享 TLS 查询身份后，宿主机运行现有 `ve volclog login --no-browser`，
+在该管理员的私聊卡片展示火山引擎官方授权入口；无需回贴密码、令牌或验证码。
+登录后用最小 TLS 项目查询验证，成功才按原参数重试刚才的只读查询一次，不重跑整轮任务。
+保留原 profile、地域和 endpoint。授权等待最多5分钟，每轮模型任务只发起一次；
+取消、成员撤权、任务停止或服务重启后不会自动重试旧任务。并发已有授权时提示等待后重新查询。
+授权入口属于独立的认证控制接口，不向模型注册工具；链接和一次性授权码只在选定管理员的私聊卡片短暂展示，
+结束时清除，原始 CLI 错误和凭证不进入模型、群聊或审计。管理员重新登录更新的是本机共享身份，不修改云端 IAM。
+当前自动续授覆盖受控 TLS 查询；普通 HTTP 502、桥接自身的401/403及原生 MCP 错误不会被误当作 TLS 登录失效。
+需要手动维护时，仍可在宿主机运行 `ve volclog login --no-browser`。
 `tls_topics.query` 搜索项目/主题目录，不搜索日志内容；服务名无匹配时应先查目录，
 选择实际项目中的 `error`、`warn`、`info` 等主题，再通过 `tls_search` 检索服务或错误内容。
 
@@ -236,6 +243,8 @@ docker compose up -d --force-recreate bridge
 
 收到任务消息后，机器人先在原消息上添加「打字中」（`Typing`）表情，再开始执行；排队消息也会先收到表情回应。
 执行期间不发送进度卡，使用 `/status` 查看当前进度和排队数。结束时移除表情，直接回复回答正文，不显示“Codex 已完成”等结果标题；`/last` 和长回答分段也只显示正文。补充信息和错误仍会发消息提示。查询和最终输出均有大小上限。
+
+回答优先用一至两句给出结论及必要限制；复杂诊断再分列关键证据、响应口径和尚未确认的事实，简单问题不套固定模板。段落和列表留白，避免整段加粗及密集行内代码；必要的长接口、trace 或调用链单独展示。排版由 `config/codex-readonly.json` 中的应用规则控制，保留原生 Markdown 卡片及引用读取能力。修改规则后需重启 Codex 宿主服务；重新连接后的历史会话会在下一轮使用新规则，无需 `/new`。
 表情 ID 保存在 PostgreSQL，取消排队或重启后也会清理已结束任务的表情。若表情接口暂时失败，任务仍会继续；排查容器日志及新应用的 `im:message.reactions:write_only` 权限。
 从旧版升级时，需在飞书后台为新应用补充此权限并发布版本。表情使用机器人的应用身份，和本机 `lark-cli` 查询身份无关。
 

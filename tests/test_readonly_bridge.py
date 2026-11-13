@@ -420,6 +420,52 @@ class ReadonlyBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await handler(turn.thread, turn.id, "grafana_datasources", {}))["ok"])
         self.assertFalse((await handler(turn.thread, turn.id, "grafana_datasources", {}))["ok"])
         self.assertEqual(len(self.queries.calls), 1)
+
+    async def test_tls_authorization_retries_only_the_failed_read_with_same_context(self):
+        turn = await self.begin(text="检查服务错误日志")
+        auth = {"ok": False, "error_code": "tls_auth_required", "error": "登录失效"}
+        success = {"ok": True, "data": {"logs": []}}
+        self.queries.call = AsyncMock(side_effect=[auth, success])
+        self.bridge.provider_authorization.recover = AsyncMock(return_value=True)
+        result = await self.bridge._query_tool(turn.thread, turn.id, "tls_topics", {"query": "service"})
+        self.assertEqual(result, success)
+        self.assertEqual(self.queries.call.await_count, 2)
+        self.assertEqual(*self.queries.call.await_args_list)
+        self.bridge.provider_authorization.recover.assert_awaited_once()
+        self.assertTrue(self.bridge.active[turn.thread].tls_authorization_attempted)
+        self.assertEqual(self.bridge.active[turn.thread].tool_calls, 1)
+
+    async def test_cancelled_auth_or_stopped_task_does_not_retry(self):
+        turn = await self.begin()
+        self.queries.call = AsyncMock(return_value={"ok": False, "error_code": "tls_auth_required"})
+        async def stop_task(*args, **kwargs):
+            self.bridge.active[turn.thread].stopping = True
+            self.assertFalse(await kwargs["still_allowed"]())
+            return True
+        self.bridge.provider_authorization.recover = AsyncMock(side_effect=stop_task)
+        self.assertFalse((await self.bridge._query_tool(turn.thread, turn.id, "tls_topics", {}))["ok"])
+        self.queries.call.assert_awaited_once()
+
+    async def test_service_errors_and_other_sources_do_not_start_tls_login(self):
+        turn = await self.begin()
+        self.bridge.config = replace(self.config, max_tool_calls=10)
+        self.bridge.provider_authorization.recover = AsyncMock(return_value=True)
+        for tool, result in (("tls_topics", {"ok": False, "error": "502"}),
+                             ("tls_topics", {"ok": False, "error_code": "unknown"}),
+                             ("grafana_query", {"ok": False, "error_code": "tls_auth_required"})):
+            self.queries.call = AsyncMock(return_value=result)
+            self.assertEqual(await self.bridge._query_tool(turn.thread, turn.id, tool, {}), result)
+        self.bridge.provider_authorization.recover.assert_not_awaited()
+
+    async def test_repeated_failed_queries_do_not_prompt_again_in_same_turn(self):
+        turn = await self.begin()
+        self.bridge.config = replace(self.config, max_tool_calls=10)
+        self.queries.call = AsyncMock(return_value={"ok": False, "error_code": "tls_auth_required"})
+        self.bridge.provider_authorization.recover = AsyncMock(return_value=False)
+        for _ in range(2):
+            self.assertFalse((await self.bridge._query_tool(turn.thread, turn.id, "tls_topics", {}))["ok"])
+        self.bridge.provider_authorization.recover.assert_awaited_once()
+        self.assertEqual(self.queries.call.await_count, 2)
         self.assertTrue(any(x[1] == "query.result" for x in self.store.audits))
 
     async def test_revocation_discards_inflight_query_and_final_delivery(self):

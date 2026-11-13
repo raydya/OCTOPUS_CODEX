@@ -433,6 +433,31 @@ class QueryHTTPTests(unittest.TestCase):
         self.assertEqual(data, {"ok": False, "error": "TLS authentication failed",
                                 "error_code": "tls_auth_required"})
 
+    def test_authorization_requires_private_auth_and_fixed_control_envelope(self):
+        body = json.dumps({"provider": "tls", "actor": "admin", "request_id": "request1"})
+        self.assertEqual(self.request(path="/v1/auth/start", body=body)[0], 401)
+        self.assertEqual(self.authorized(path="/v1/auth/start", body=body,
+                                        headers={"Origin": "https://evil.test"})[0], 403)
+        self.host.authorization.start.assert_not_called()
+        for name in ("start", "status", "cancel"):
+            handler = getattr(self.host.authorization, name)
+            handler.return_value = {"provider": "tls", "request_id": "request1", "state": "starting"}
+            self.assertEqual(self.authorized(path="/v1/auth/" + name, body=body)[0], 200)
+            handler.assert_called_once_with("tls", "admin", "request1")
+        self.host.execute.assert_not_called()
+
+    def test_authorization_rejects_model_arguments_and_arbitrary_commands(self):
+        for body in (
+            {"provider": "grafana", "actor": "admin", "request_id": "request1"},
+            {"provider": "tls", "actor": "admin", "request_id": "request1", "command": "anything"},
+            {"provider": "tls", "actor": "admin", "request_id": "../session"},
+            {"tool": "tls_auth", "arguments": {}},
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(self.authorized(path="/v1/auth/start", body=json.dumps(body))[0], 400)
+        self.assertEqual(self.authorized(path="/v1/auth/start?redirect=evil")[0], 404)
+        self.host.authorization.start.assert_not_called()
+
     def test_concurrency_is_bounded_before_thread_creation(self):
         sockets = []
         self.addCleanup(lambda: [sock.close() for sock in sockets])

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from octopus.contracts import IncomingMessage, ReferenceContextError
-from octopus.feishu import FeishuMessenger, parse_message
+from octopus.feishu import FeishuMessenger, _LarkApi, parse_message
 
 
 UNAVAILABLE = "暂时无法读取你引用的消息内容。"
@@ -72,6 +72,44 @@ class QuotedContextTests(unittest.IsolatedAsyncioTestCase):
         context = await self.messenger.fetch_quoted_context(trigger(parent_id=""))
         self.assertEqual(context.message_id, "om_root")
         self.api.get_message.assert_called_once_with("om_root")
+
+    async def test_sdk_fetches_original_card_reply_instead_of_upgrade_placeholder(self):
+        from lark_oapi.api.im.v1 import GetMessageResponse
+
+        answer = "**型号变更处理获取共享锁失败**\n\n日志显示 `LockException`。\n暂未确认锁的持有者。"
+        placeholder = {"title": None, "elements": [[
+            {"tag": "img", "image_key": "img_placeholder"},
+            {"tag": "text", "text": "请升级至最新版本客户端，以查看内容"},
+        ]]}
+        api = _LarkApi.__new__(_LarkApi)
+        api.client = Mock()
+        resource = api.client.im.v1.message
+        messenger = FeishuMessenger("cli_test", "secret", api=api)
+        try:
+            for card in (
+                    {"config": {"update_multi": True},
+                     "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": answer}}]},
+                    {"schema": "2.0", "config": {"update_multi": True},
+                     "body": {"elements": [{"tag": "markdown", "content": answer}]}}):
+                with self.subTest(schema=card.get("schema", "1.0")):
+                    def get_response(request):
+                        content = (card if dict(request.queries).get("card_msg_content_type")
+                                   == "user_card_content" else placeholder)
+                        return GetMessageResponse({"code": 0, "data": {"items": [{
+                            "message_id": "om_card", "chat_id": "oc_private", "msg_type": "interactive",
+                            "create_time": "1000", "update_time": "1000", "deleted": False,
+                            "sender": {"sender_type": "app"},
+                            "body": {"content": json.dumps(content)},
+                        }]}})
+
+                    resource.get.side_effect = get_response
+                    context = await messenger.fetch_quoted_context(trigger(text="现在 TLS 有权限了吗？"))
+                    self.assertEqual(context.text, answer)
+                    self.assertFalse(context.has_unread_images)
+                    resource.create.assert_not_called()
+                    resource.reply.assert_not_called()
+        finally:
+            await messenger.close()
 
     async def test_no_reference_and_group_inputs_do_not_fetch(self):
         for message in (trigger(parent_id="", root_id=""), trigger(chat_type="group")):

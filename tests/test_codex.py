@@ -371,6 +371,38 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(client._read_only_cwd)
         self.assertIsNone(client._read_only_developer_instructions)
 
+    async def test_handshake_accepts_local_versions_only_with_attested_isolation(self):
+        for version in ("0.168.0", "1.0.0", "1.1.0-alpha.1"):
+            for unsafe in (False, True):
+                with self.subTest(version=version, unsafe=unsafe):
+                    client = self.client()
+                    client._ready = False
+                    config = self.config()
+                    if unsafe:
+                        config["permissions"]["octopus-readonly"]["network"]["enabled"] = True
+                    client._request.side_effect = [
+                        {"userAgent": f"test/{version}", "codexHome": self.home},
+                        self.config_response(config),
+                    ]
+                    if unsafe:
+                        with self.assertRaises(RuntimeError):
+                            await client._handshake(client._transport)
+                        self.assertFalse(client._ready)
+                        self.assertIsNone(client._read_only_cwd)
+                    else:
+                        await client._handshake(client._transport)
+                        self.assertTrue(client._ready)
+                        self.assertEqual(client._read_only_cwd, self.cwd)
+
+    async def test_handshake_rejects_personal_home_before_reading_config(self):
+        client = self.client()
+        client._ready = False
+        client._request.return_value = {"userAgent": "test/0.168.0", "codexHome": "/test/.codex"}
+        with self.assertRaises(RuntimeError):
+            await client._handshake(client._transport)
+        self.assertFalse(client._ready)
+        self.assertEqual(client._request.await_count, 1)
+
     async def test_reconnection_refreshes_complete_instructions_for_existing_thread(self):
         client = self.client()
         await client._attest_read_only()
@@ -473,6 +505,19 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["contentItems"][0]["type"], "inputText")
         self.assertIn("safe evidence", result["contentItems"][0]["text"])
+
+    async def test_dynamic_tool_respects_its_separate_bounded_wait_budget(self):
+        async def handler(*_):
+            await asyncio.sleep(.03)
+            return {"ok": True}
+        client = self.client(AsyncMock(side_effect=handler))
+        params = {"threadId": "t", "turnId": "u", "tool": "code_search", "arguments": {}}
+        client.tool_timeout = .001
+        await client._dynamic_tool(1, params)
+        self.assertFalse(client._write.call_args.args[0]["result"]["success"])
+        client.tool_timeout = 1
+        await client._dynamic_tool(2, params)
+        self.assertTrue(client._write.call_args.args[0]["result"]["success"])
 
     async def test_unknown_tools_malformed_arguments_and_errors_are_sanitized(self):
         handler = AsyncMock(side_effect=ValueError("SECRET_TOKEN_DO_NOT_ECHO"))

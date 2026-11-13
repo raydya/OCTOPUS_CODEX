@@ -31,6 +31,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from .code_reader import CodeReader, redact
 from .dms import DmsBroker
 from .privacy import privacy_request_denied, redact_private_text
+from .provider_auth import ProviderAuth
 
 MAX_REQUEST_BYTES = 65536
 MAX_PROVIDER_BYTES = 1024 * 1024
@@ -306,8 +307,10 @@ class QueryHost:
         self._grafana_config = grafana_config
         self._opener = build_opener(_NoRedirect())
         self.dms = DmsBroker(dms_policy_path, self.reader, runner)
+        self.authorization = ProviderAuth()
 
     def close(self) -> None:
+        self.authorization.close()
         self.reader.close()
 
     def execute(self, tool: str, arguments: Dict[str, Any], *, context: Optional[dict] = None) -> Dict[str, Any]:
@@ -568,7 +571,8 @@ class QueryHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._authorized():
             return
-        if self.path != "/v1/query":
+        auth_operations = {"/v1/auth/" + name: name for name in ("start", "status", "cancel")}
+        if self.path != "/v1/query" and self.path not in auth_operations:
             self._send(404, {"ok": False, "error": "unknown endpoint"})
             return
         sizes = self.headers.get_all("Content-Length", [])
@@ -586,6 +590,15 @@ class QueryHandler(BaseHTTPRequestHandler):
             if len(raw) != size:
                 raise ValueError()
             request = _json(raw)
+            if self.path in auth_operations:
+                if (type(request) is not dict or set(request) != {"provider", "actor", "request_id"}
+                        or request["provider"] != "tls"):
+                    raise ValueError("invalid authorization operation")
+                actor, request_id = _identifier(request["actor"]), _identifier(request["request_id"])
+                result = getattr(self.server.host.authorization, auth_operations[self.path])(
+                    "tls", actor, request_id)
+                self._send(200, result)
+                return
             if (type(request) is not dict or not {"tool", "arguments"} <= request.keys()
                     or request.keys() - {"tool", "arguments", "context"}):
                 raise ValueError()

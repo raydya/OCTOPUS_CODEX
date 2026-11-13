@@ -17,6 +17,7 @@ from .code_reader import redact
 from .queries import QueryClient, TOOL_NAMES
 from .privacy import dms_request_allowed, privacy_request_denied, redact_private_text
 from .access import ACCESS_COMMANDS, AccessRequests
+from .provider_authorization import ProviderAuthorization
 from .images import MAX_IMAGES, MAX_TOTAL_IMAGE_BYTES, ImageInputError, prepare_image
 from .topic_routing import TopicRouter, RoutingInputError
 
@@ -80,6 +81,7 @@ class Active:
     data_checks_allowed: bool = True
     turn_ready: asyncio.Event = field(default_factory=asyncio.Event)
     question: str | None = None
+    tls_authorization_attempted: bool = False
 
 
 @dataclass
@@ -99,6 +101,8 @@ class Bridge:
         self.allowed = set(config.allowed_users)
         self.queries = queries
         self.access = AccessRequests(store, messenger) if config.read_only else None
+        self.provider_authorization = (ProviderAuthorization(store, messenger, queries)
+                                       if config.read_only and queries is not None else None)
         self._control_times: dict[str, float] = {}
         if config.read_only:
             if queries is None:
@@ -368,6 +372,9 @@ class Bridge:
 
     async def receive_action(self, action: CardAction) -> None:
         if self.closed:
+            return
+        if self.provider_authorization and action.ticket_id.startswith("provider-auth:"):
+            await self.provider_authorization.receive_action(action)
             return
         if self.access and action.ticket_id.startswith("access-test:"):
             decision = await self.access.self_test.decide(action)
@@ -640,6 +647,29 @@ class Bridge:
                    "turn_id": turn_id, "question": question,
                    "policy_version": READ_ONLY_POLICY}
         result = await self.queries.call(tool, arguments, context=context)
+        if (tool in {"tls_topics", "tls_search"} and result.get("ok") is False
+                and result.get("error_code") == "tls_auth_required" and self.provider_authorization
+                and not active.tls_authorization_attempted):
+            active.tls_authorization_attempted = True
+
+            async def still_allowed() -> bool:
+                authorized = await self._authorized(active.job.message)
+                return (authorized and not self.closed and self.connected and not active.stopping
+                        and not active.done.done() and self.active.get(thread_id) is active)
+
+            if await still_allowed():
+                active.activity = "等待管理员重新授权 TLS"
+                await self._audit(actor, "provider.auth.request", "tls", "requested", active.job.id)
+                restored = await self.provider_authorization.recover(active.job.message, still_allowed=still_allowed)
+                await self._audit(actor, "provider.auth.result", "tls", "success" if restored else "unavailable",
+                                  active.job.id)
+                if restored and await still_allowed():
+                    active.activity = "TLS 已授权，重新查询"
+                    # Replay only this read, with its original trusted context.
+                    # Auth recovery is bounded to one attempt per model turn.
+                    result = await self.queries.call(tool, arguments, context=context)
+                else:
+                    result = {"ok": False, "error": "TLS 授权未完成或当前任务已停止；本次未获取日志。"}
         if (active.stopping or active.done.done() or self.active.get(thread_id) is not active
                 or not await self._authorized(active.job.message)
                 or (tool in _BUSINESS_DATA_TOOLS and not active.data_checks_allowed)):
@@ -1246,6 +1276,8 @@ class Bridge:
 
     async def close(self) -> None:
         self.closed = True
+        if self.provider_authorization:
+            await self.provider_authorization.close()
         self.wakeup.set()
         self.control_wakeup.set()
         self.routing_wakeup.set()

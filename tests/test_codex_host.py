@@ -54,6 +54,7 @@ class CodexHostTests(unittest.TestCase):
             "'FAKE_CLOUD_TOKEN', 'OPENAI_API_KEY', 'CODEX_SQLITE_HOME')\n"
             f"Path({str(self.capture)!r}).write_text(json.dumps({{\n"
             "    'argv': sys.argv[1:],\n"
+            "    'executable': sys.argv[0],\n"
             "    'env': {key: os.environ.get(key) for key in keys},\n"
             "    'cwd': os.getcwd(),\n"
             "}), encoding='utf-8')\n",
@@ -377,15 +378,29 @@ class CodexHostTests(unittest.TestCase):
         self.captured(self.run_host("CODEX_READ_ONLY=true"))
         self.assertFalse((home / "AGENTS.override.md").is_symlink())
 
-    def test_readonly_fails_closed_for_unverified_version_or_missing_auth(self):
-        self.prepare_readonly()
-        result = self.run_host("CODEX_READ_ONLY=true", environment={"TEST_CODEX_VERSION": "codex-cli 9.0.0"})
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(self.capture.exists())
-        (self.directory / ".codex" / "auth.json").unlink()
-        result = self.run_host("CODEX_READ_ONLY=true")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(self.capture.exists())
+    def test_readonly_uses_path_cli_without_pinning_its_version(self):
+        auth = self.prepare_readonly()
+        for version in ("codex-cli 0.168.0", "codex-cli 0.169.0-alpha.1", "codex-cli 9.0.0"):
+            with self.subTest(version=version):
+                data = self.captured(self.run_host("CODEX_READ_ONLY=true", environment={
+                    "TEST_CODEX_VERSION": version,
+                }))
+                self.assertEqual(data["executable"], str(self.directory / "bin" / "codex"))
+                self.assertEqual(data["argv"][0], "app-server")
+                home = self.project / ".data" / "codex-readonly" / "home"
+                self.assertEqual(data["env"]["CODEX_HOME"], str(home))
+                self.assertEqual((home / "auth.json").resolve(), auth)
+                effective = tomllib.loads((home / "config.toml").read_text())
+                self.assertEqual(effective["approval_policy"], "never")
+                self.assertFalse(effective["permissions"]["octopus-readonly"]["network"]["enabled"])
+
+    def test_readonly_rejects_missing_auth_regardless_of_cli_version(self):
+        self.prepare_readonly().unlink()
+        for version in ("codex-cli 0.163.0", "codex-cli 0.168.0", "codex-cli 9.0.0"):
+            with self.subTest(version=version):
+                result = self.run_host("CODEX_READ_ONLY=true", environment={"TEST_CODEX_VERSION": version})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.capture.exists())
 
     def test_mcp_credential_references_cannot_reintroduce_codex_or_model_overrides(self):
         auth = self.prepare_readonly()
