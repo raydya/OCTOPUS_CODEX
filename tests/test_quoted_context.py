@@ -160,6 +160,64 @@ class QuotedContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("hidden", text)
         self.api.download_image.assert_not_called()
 
+    async def test_alert_with_feedback_and_silence_forms_preserves_only_alert_text(self):
+        fields = (("服务", "opt-inspection-service"), ("错误速率", "22.000000000000004"),
+                  ("时间", "2026-11-16 14:21:20"), ("等级", "Critical"))
+        elements = [{"tag": "column_set", "columns": [
+            {"tag": "column", "elements": [{"tag": "markdown", "content": text}]}
+            for text in field]} for field in fields]
+        elements.append({"tag": "markdown", "content": "告警触发阈值 2 req/s"})
+        for name in ("feedback", "silence"):
+            elements.append({"tag": "form", "name": name, "value": {"text": "hidden-form"},
+                "elements": [{"tag": "column_set", "columns": [
+                    {"tag": "column", "elements": [{"tag": "select_static",
+                        "initial_option": "hidden-option", "options": [
+                            {"text": {"tag": "plain_text", "content": "hidden-option-label"},
+                             "value": "hidden-choice"}]}]},
+                    {"tag": "column", "elements": [{"tag": "input", "default_value": "hidden-default",
+                        "placeholder": {"tag": "plain_text", "content": "hidden-placeholder"}}]},
+                    {"tag": "column", "elements": [{"tag": "button", "form_action_type": "submit",
+                        "text": {"tag": "plain_text", "content": "hidden-submit-label"},
+                        "behaviors": [{"type": "callback", "value": {"text": "hidden-callback"}}]}]},
+                ]}]})
+        elements.append({"tag": "markdown", "content": "2026-11-16 14:21:20 触发"})
+        self.response(quoted(content={"header": {"title": {"tag": "plain_text", "content": "错误请求速率过高"}},
+                                      "elements": elements}))
+        context = await self.messenger.fetch_quoted_context(trigger())
+        self.assertEqual(context.text, "\n".join(["错误请求速率过高",
+            *(text for field in fields for text in field), "告警触发阈值 2 req/s", "2026-11-16 14:21:20 触发"]))
+        self.assertNotIn("hidden", context.text)
+        self.assertFalse(context.has_unread_images)
+        self.api.download_image.assert_not_called()
+        self.api.send.assert_not_called()
+        self.api.update.assert_not_called()
+
+    async def test_form_keeps_visible_children_and_allows_empty_control_containers(self):
+        self.response(quoted(content={"elements": [
+            {"tag": "form", "elements": [
+                {"tag": "markdown", "content": "告警详情"},
+                {"tag": "img", "img_key": "img_evidence"}]},
+            {"tag": "form", "elements": []},
+        ]}))
+        context = await self.messenger.fetch_quoted_context(trigger())
+        self.assertEqual(context.text, "告警详情\n[引用图片未读取]")
+        self.assertTrue(context.has_unread_images)
+        self.api.download_image.assert_not_called()
+
+    async def test_form_rejects_invalid_unknown_and_excessively_nested_children(self):
+        nested = {"tag": "markdown", "content": "重要证据"}
+        for _ in range(18):
+            nested = {"tag": "form", "elements": [nested]}
+        for form in ({"tag": "form"}, {"tag": "form", "elements": None},
+                     {"tag": "form", "elements": "bad"},
+                     {"tag": "form", "elements": [{"tag": "unknown", "content": "重要证据"}]}, nested):
+            with self.subTest(form=form):
+                self.response(quoted(content={"elements": [
+                    {"tag": "markdown", "content": "告警详情"}, form]}))
+                await self.assert_unavailable()
+        self.response(quoted(content={"elements": [{"tag": "form", "elements": []}]}))
+        await self.assert_unavailable()
+
     async def test_unknown_empty_and_malformed_content_is_not_silently_dropped(self):
         for kind, content in (
                 ("interactive", {}), ("interactive", {"title": "only title", "elements": "bad"}),

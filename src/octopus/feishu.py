@@ -154,7 +154,8 @@ class _QuotedText:
             if "text" not in value and "fields" not in value:
                 raise ValueError("Missing quoted div text")
             return "\n".join(part for part in parts if part)
-        if tag in ("note", "column"):
+        if tag in ("note", "column", "form"):
+            # Forms can wrap visible evidence; their inputs/actions stay excluded above.
             return self.sequence(value.get("elements"), depth + 1)
         if tag == "column_set":
             return self.sequence(value.get("columns"), depth + 1)
