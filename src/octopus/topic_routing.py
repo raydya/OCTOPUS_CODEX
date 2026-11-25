@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
+from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -59,11 +61,57 @@ class Decision:
 _NEW = re.compile(r"^(?:这是(?:一个)?新问题|另一个问题|换个问题|新问题)[，,:：。\s]*(.*)$", re.S)
 _PREVIOUS = re.compile(r"^(?:接着|继续|回到)(?:上一个|上一|上个)(?:问题|话题|题)[，,:：。\s]*(.*)$", re.S)
 _CLARIFY = "你指的是哪个问题？请回复对应的机器人答案，或补充具体的业务对象和现象。"
+_ROUTER_UNAVAILABLE = "暂时无法自动识别这条消息所属的问题。请直接回复对应的机器人答案，或补充具体的业务对象和现象。"
+_TERM_QUESTION = re.compile(
+    r"(?:你(?:刚才)?(?:说|提到)的\s*)?[“「`\"]?([\w][\w .+-]{3,47}?)[”」`\"]?\s*"
+    r"(?:具体\s*)?(?:是指什么|指的是什么|指什么|是什么意思|是什么含义)\s*[？?,，]?\s*"
+    r"(?:(?:是\s*)?[A-Za-z][A-Za-z0-9_.+-]{0,23}\s*[吗么])?[？?。]?"
+)
+_ANSWER_WINDOW_MS = 10 * 60_000
+
+
+@dataclass(frozen=True)
+class _DeliveredAnswer:
+    scope: str
+    actor: str
+    topic: str
+    timestamp: int
+    text: str
 
 
 class TopicRouter:
     def __init__(self, store: Any, codex: Any, messenger: Any, workspace: str):
         self.store, self.codex, self.messenger, self.workspace = store, codex, messenger, workspace
+        self._answers: deque[_DeliveredAnswer] = deque(maxlen=128)
+
+    def remember_answer(self, scope: str, message: IncomingMessage, topic: str, text: str) -> None:
+        if message.chat_type == "p2p":
+            now = time.time_ns() // 1_000_000
+            while self._answers and self._answers[0].timestamp < now - _ANSWER_WINDOW_MS:
+                self._answers.popleft()
+            self._answers.append(_DeliveredAnswer(scope, message.sender_id, topic, now, text))
+
+    def _asks_about_answer(self, message: IncomingMessage, scope: str, current: str) -> bool:
+        match = _TERM_QUESTION.fullmatch(message.text.strip())
+        if not match:
+            return False
+        cutoff = time.time_ns() // 1_000_000 - _ANSWER_WINDOW_MS
+        # A full cache might have evicted another recent answer containing the term.
+        if len(self._answers) == self._answers.maxlen and self._answers[0].timestamp >= cutoff:
+            return False
+        answers = [answer for answer in self._answers if answer.timestamp >= cutoff
+                   and answer.scope == scope and answer.actor == message.sender_id]
+        if (not answers or answers[-1].topic != current
+                or not 0 <= message.created_at - answers[-1].timestamp <= _ANSWER_WINDOW_MS):
+            return False
+        term = match[1].strip()
+        if len(term) < 4:
+            return False
+        # An ASCII word such as "network" must not match an unrelated identifier like "networking".
+        pattern = re.compile((r"(?<![A-Za-z0-9_])" if term[0].isascii() else "") + re.escape(term)
+                             + (r"(?![A-Za-z0-9_])" if term[-1].isascii() else ""))
+        return (pattern.search(answers[-1].text) is not None
+                and not any(answer.topic != current and pattern.search(answer.text) for answer in answers))
 
     async def _context(self, message: IncomingMessage, scope: str) -> tuple[list[Context], str | None]:
         contexts: list[Context] = []
@@ -156,7 +204,13 @@ class TopicRouter:
                                  for c in contexts],
         }
         try:
-            result = await self.codex.classify_topic(self.workspace, payload, images=images)
+            if (message.chat_type == "p2p" and not reference_id and not pending and not images and not message.image_keys
+                    and current in by_id and not explicit_new and not previous
+                    and self._asks_about_answer(message, scope, current)):
+                result = {"action": "continue", "topic_id": current, "context_ids": [],
+                          "reason": "term_in_delivered_answer"}
+            else:
+                result = await self.codex.classify_topic(self.workspace, payload, images=images)
             action, target = result["action"], result["topic_id"]
             if action not in {"new", "continue", "resume", "clarify"}:
                 raise ValueError("Unknown routing decision")
@@ -172,7 +226,7 @@ class TopicRouter:
             # failure. A recently used topic is not sufficient evidence.
             action, target = ("continue", reply_topic) if reply_topic in by_id and not explicit_new else ("clarify", None)
             result = {"action": action, "topic_id": target, "title": "", "summary": "",
-                      "reason": "router_unavailable", "clarification": _CLARIFY,
+                      "reason": "router_unavailable", "clarification": _ROUTER_UNAVAILABLE,
                       "context_ids": [reference_id] if reference_id in {c.id for c in contexts} else [],
                       "use_pending": False}
         if explicit_new and text and (correction or (explicit_new[1] and action != "clarify")):

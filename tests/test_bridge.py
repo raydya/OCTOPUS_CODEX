@@ -12,6 +12,7 @@ from unittest.mock import patch
 from PIL import Image
 
 from octopus.bridge import Bridge
+from octopus.codex import ActiveTurnError, ThreadHistoryUnavailableError
 from octopus.config import Config
 from octopus.contracts import CardAction, CodexEvent, IncomingMessage, Question, View
 from octopus.store import INTERRUPTED_ERROR, Job, Session
@@ -133,6 +134,17 @@ class MemoryStore:
         if job.state == "running":
             self.jobs[identifier] = replace(job, state="done" if error is None else "failed", error=error)
             self.changed.set()
+
+    async def release_unsubmitted_job(self, identifier, reason, *, cancelled=False, empty_thread=None):
+        job = self.jobs[identifier]
+        if job.state != "running":
+            return False
+        self.jobs[identifier] = replace(job, state="failed" if cancelled else "queued", error=reason if cancelled else None)
+        session = self.sessions[job.session_key]
+        self.sessions[job.session_key] = replace(session, blocked_reason=session.blocked_reason if cancelled else reason,
+            thread_id=None if session.thread_id == empty_thread else session.thread_id)
+        self.changed.set()
+        return True
 
     async def cancel_queued(self, key: str) -> int:
         pending = [job for job in self.jobs.values() if job.session_key == key and job.state == "queued"]
@@ -340,6 +352,7 @@ class FakeCodex:
         self.questions: list[tuple[str | int, dict[str, list[str]]]] = []
         self.answered: asyncio.Queue[tuple[str | int, dict[str, list[str]]]] = asyncio.Queue()
         self.resumes: list[str] = []
+        self.resume_error: Exception | None = None
         self.remote_active_turns: dict[str, str] = {}
         self.active_turn_queries: list[str] = []
         self.active_turn_error: Exception | None = None
@@ -362,6 +375,10 @@ class FakeCodex:
 
     async def resume_thread(self, thread_id: str, cwd: str) -> None:
         self.resumes.append(thread_id)
+        if self.resume_error is not None:
+            raise self.resume_error
+        if turn_id := self.remote_active_turns.get(thread_id):
+            raise ActiveTurnError(thread_id, turn_id)
 
     async def active_turn(self, thread_id: str) -> str | None:
         self.active_turn_queries.append(thread_id)
@@ -570,6 +587,100 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         second = await self.codex.next_turn()
         self.assertEqual(second.text, "new pending")
 
+    async def test_resume_keeps_continuation_queued_until_timed_out_turn_has_stopped(self):
+        self.config = replace(self.config, task_timeout=.05)
+        # The host acknowledges the interrupt before the turn actually stops.
+        async def acknowledge_interrupt(thread_id, turn_id):
+            self.codex.interrupted.put_nowait((thread_id, turn_id))
+        self.codex.interrupt = acknowledge_interrupt
+        bridge = await self.start()
+        with self.assertLogs("octopus.bridge", level="ERROR"):
+            old = await self.begin()
+            self.assertEqual(await asyncio.wait_for(self.codex.interrupted.get(), 2), (old.thread, old.id))
+            await self.messenger.wait_record(lambda r: r.reply_to == "input" and r.view.kind == "error")
+        await asyncio.wait_for(bridge.idle.wait(), 2)
+        bridge.config = replace(bridge.config, task_timeout=60)
+        await bridge.receive(message("follow", "继续"))
+        await self.messenger.wait_record(lambda r: r.reply_to == "follow")
+        await bridge.receive(message("too-soon", "/resume"))
+        notice = await self.messenger.wait_record(lambda r: r.reply_to == "too-soon")
+        self.assertIn("仍在执行", notice.view.title)
+        self.assertEqual(self.store.jobs["follow"].state, "queued")
+        self.assertEqual(len(self.codex.turns), 1)
+        self.assertIsNotNone(self.store.sessions["oc_shared:ou_alice"].blocked_reason)
+        self.codex.complete(old)
+        await bridge.receive(message("ready", "/resume"))
+        restored = await self.messenger.wait_record(lambda r: r.reply_to == "ready")
+        self.assertIn("1 条", restored.view.text)
+        resumed = await self.codex.next_turn()
+        self.assertEqual((resumed.thread, resumed.text), (old.thread, "继续"))
+        self.codex.complete(resumed)
+        await self.store.wait_state("follow", "done")
+        self.assertEqual(self.store.jobs["input"].state, "failed")
+
+    async def test_resume_preserves_pause_when_host_state_is_unavailable(self):
+        key = "oc_shared:ou_alice"
+        await self.store.session(key, "oc_shared", "ou_alice")
+        await self.store.set_thread(key, "old-thread")
+        await self.store.set_blocked(key, "check previous execution")
+        await self.store.enqueue(key, message("pending"))
+        self.codex.resume_error = ConnectionError("internal details")
+        bridge = await self.start()
+        await bridge.receive(message("unverified", "/resume"))
+        notice = await self.messenger.wait_record(lambda r: r.reply_to == "unverified")
+        self.assertIn("无法确认", notice.view.title)
+        self.assertNotIn("internal details", notice.view.text)
+        self.assertEqual(self.store.jobs["pending"].state, "queued")
+        self.assertEqual(self.store.sessions[key].blocked_reason, "check previous execution")
+        self.assertIn(key, bridge.blocked)
+        self.assertEqual(self.codex.turns, [])
+
+    async def test_resume_missing_history_preserves_thread_and_continuation(self):
+        key = "oc_shared:ou_alice"
+        await self.store.session(key, "oc_shared", "ou_alice")
+        await self.store.set_thread(key, "old-thread")
+        await self.store.set_blocked(key, "check previous execution")
+        await self.store.enqueue(key, message("pending", "继续"))
+        self.codex.resume_error = ThreadHistoryUnavailableError("internal history path")
+        bridge = await self.start()
+        await bridge.receive(message("missing", "/resume"))
+        notice = await self.messenger.wait_record(lambda r: r.reply_to == "missing")
+        self.assertIn("历史", notice.view.title)
+        self.assertIn("/stop", notice.view.text)
+        self.assertIn("/new", notice.view.text)
+        self.assertIn("原问题", notice.view.text)
+        self.assertNotIn("internal history path", notice.view.text)
+        self.assertEqual(self.store.sessions[key].thread_id, "old-thread")
+        self.assertIn(key, bridge.blocked)
+        self.assertEqual(self.store.jobs["pending"].state, "queued")
+        self.assertEqual(self.codex.turns, [])
+
+    async def test_resume_empty_queue_explains_how_to_continue(self):
+        key = "oc_shared:ou_alice"
+        await self.store.session(key, "oc_shared", "ou_alice")
+        await self.store.set_blocked(key, "check previous execution")
+        bridge = await self.start()
+        await bridge.receive(message("empty", "/resume"))
+        notice = await self.messenger.wait_record(lambda r: r.reply_to == "empty")
+        self.assertIn("没有排队消息", notice.view.text)
+        self.assertIn("继续", notice.view.text)
+        self.assertIsNone(self.store.sessions[key].blocked_reason)
+        self.assertEqual(self.codex.turns, [])
+
+    async def test_resume_during_normal_work_leaves_queue_running(self):
+        bridge = await self.start()
+        current = await self.begin()
+        await bridge.receive(message("pending", "下一个问题"))
+        await bridge.receive(message("already-running", "/resume"))
+        notice = await self.messenger.wait_record(lambda r: r.reply_to == "already-running")
+        self.assertIn("正在执行", notice.view.text)
+        self.assertEqual(self.codex.resumes, [])
+        self.assertEqual(self.store.jobs["pending"].state, "queued")
+        self.codex.complete(current)
+        following = await self.codex.next_turn()
+        self.assertEqual((following.thread, following.text), (current.thread, "下一个问题"))
+        self.codex.complete(following)
+
     async def test_failed_result_delivery_does_not_erase_success_and_last_can_retry(self):
         bridge = await self.start()
         turn = await self.begin()
@@ -585,6 +696,88 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         recovered = await self.messenger.wait_record(lambda record: record.reply_to == "last")
         self.assertEqual(recovered.view.text, "successful complete result")
         self.assertEqual(len(self.codex.turns), 1)
+
+    async def test_thread_setup_timeout_preserves_original_job_for_explicit_resume(self):
+        bridge = await self.start()
+        create = self.codex.create_thread
+        async def unavailable(cwd):
+            raise TimeoutError("private RPC detail")
+        self.codex.create_thread = unavailable
+        await bridge.receive(message("original", "original question"))
+        notice = await self.messenger.wait_record(lambda r: r.reply_to == "original" and r.view.kind == "error")
+        self.assertIn("未提交", notice.view.text)
+        self.assertNotIn("已请求停止", notice.view.text)
+        self.assertNotIn("private", notice.view.text)
+        self.assertEqual(self.store.jobs["original"].state, "queued")
+        self.assertEqual(self.codex.interrupts, [])
+        await asyncio.wait_for(bridge.idle.wait(), 2)
+        self.codex.create_thread = create
+        await bridge.receive(message("restart", "/resume"))
+        turn = await self.codex.next_turn()
+        self.assertEqual(turn.text, "original question")
+        self.codex.complete(turn)
+        await self.store.wait_state("original", "done")
+
+    async def test_unacknowledged_turn_start_is_never_requeued_or_reported_as_task_deadline(self):
+        bridge = await self.start()
+        async def lost_reply(thread_id, text):
+            raise TimeoutError("private RPC detail")
+        self.codex.start_turn = lost_reply
+        await bridge.receive(message("uncertain"))
+        notice = await self.messenger.wait_record(lambda r: r.reply_to == "uncertain" and r.view.kind == "error")
+        self.assertNotIn("已请求停止", notice.view.text)
+        self.assertIn("确认", notice.view.text)
+        self.assertEqual(self.store.jobs["uncertain"].state, "failed")
+        self.assertEqual(self.store.sessions["oc_shared:ou_alice"].thread_id, "thread-1")
+        self.assertTrue(self.store.sessions["oc_shared:ou_alice"].blocked_reason)
+        self.assertEqual(self.codex.interrupts, [])
+
+    async def test_first_turn_preflight_failure_retries_frozen_question_before_followup(self):
+        from octopus.codex import TurnPreparationError
+        bridge = await self.start()
+        key = "oc_shared:ou_alice"
+        start_turn = self.codex.start_turn
+        async def unavailable(thread_id, text):
+            raise TurnPreparationError("private tool details")
+        self.codex.start_turn = unavailable
+        await self.store.session(key, "oc_shared", "ou_alice")
+        await self.store.restrict_session_data(key)
+        await bridge.receive(message("original", "check the original record"))
+        notice = await self.messenger.wait_record(lambda r: r.reply_to == "original")
+        self.assertIn("未提交", notice.view.text)
+        self.assertIsNone(self.store.sessions[key].thread_id)
+        self.assertTrue(self.store.sessions[key].data_context_restricted)
+        self.assertEqual(self.store.jobs["original"].state, "queued")
+        await bridge.receive(message("follow", "继续"))
+        await self.messenger.wait_record(lambda r: r.reply_to == "follow")
+        self.codex.start_turn = start_turn
+        await bridge.receive(message("resume", "/resume"))
+        original = await self.codex.next_turn()
+        self.assertEqual((original.thread, original.text), ("thread-2", "check the original record"))
+        self.codex.complete(original)
+        following = await self.codex.next_turn()
+        self.assertEqual((following.thread, following.text), (original.thread, "继续"))
+        self.codex.complete(following)
+        await self.store.wait_state("follow", "done")
+
+    async def test_stop_while_saving_new_thread_cancels_before_first_submission(self):
+        bridge = await self.start()
+        writing, release = asyncio.Event(), asyncio.Event()
+        set_thread = self.store.set_thread
+        async def delayed_save(key, thread_id):
+            writing.set()
+            await release.wait()
+            await set_thread(key, thread_id)
+        self.store.set_thread = delayed_save
+        await bridge.receive(message("input"))
+        await asyncio.wait_for(writing.wait(), 2)
+        await bridge.receive(message("stop", "/stop"))
+        await self.messenger.wait_record(lambda r: r.reply_to == "stop")
+        release.set()
+        await self.store.wait_state("input", "failed")
+        self.assertEqual(self.codex.turns, [])
+        self.assertIsNone(self.store.sessions["oc_shared:ou_alice"].thread_id)
+        self.assertIsNone(self.store.sessions["oc_shared:ou_alice"].blocked_reason)
 
     async def test_acknowledgement_precedes_codex_without_delaying_inbox_acceptance(self):
         release = asyncio.Event()

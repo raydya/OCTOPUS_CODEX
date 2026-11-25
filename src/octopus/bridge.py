@@ -9,6 +9,7 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from .codex import ActiveTurnError, ThreadHistoryUnavailableError, TurnPreparationError
 from .config import Config
 from .contracts import (Button, CardAction, CodexClient, CodexEvent, IncomingMessage,
                         Messenger, QuotedContext, ReferenceContextError, View)
@@ -489,10 +490,37 @@ class Bridge:
                 self.blocked.discard(key)
                 await self._notice(message, "已开启新会话", "下一条消息将创建新的 Codex 会话。")
         elif command == "/resume":
+            if key not in self.blocked:
+                status = "当前任务正在执行，排队消息会依次处理。" if key in self.busy else "队列可以正常处理消息。"
+                await self._notice(message, "队列未暂停", status)
+                return
+            if key in self.busy:
+                await self._notice(message, "正在处理上次任务", "排队消息已保留，请稍后再 /resume。")
+                return
+            previous = await self.store.get_session(key)
+            if previous and previous.thread_id:
+                try:
+                    await self.codex.resume_thread(previous.thread_id, self.config.workspace)
+                except ActiveTurnError:
+                    await self._notice(message, "上次任务仍在执行",
+                        "排队消息已保留。请等上次任务结束后再 /resume。若要停止任务并取消排队消息，可使用 /stop。")
+                    return
+                except ThreadHistoryUnavailableError:
+                    next_step = "用 /new 开启新问题"
+                    if not self.router and await self.store.pending_count(key):
+                        next_step = "先用 /stop 取消排队消息，再用 /new 开启新会话"
+                    await self._notice(message, "无法恢复原会话历史",
+                        f"排队消息已保留。恢复 Codex 历史后可再 /resume。也可以{next_step}，重新发送原问题并附上引用的消息或图片。")
+                    return
+                except Exception:
+                    await self._notice(message, "无法确认上次任务状态", "队列保持暂停，排队消息已保留。请稍后再 /resume。")
+                    return
+            queued = await self.store.pending_count(key)
             await self.store.set_blocked(key, None)
             self.blocked.discard(key)
             self.wakeup.set()
-            await self._notice(message, "已恢复队列", "将继续原会话；若 Codex 仍有任务运行，会暂停并提示处理。")
+            status = f"将依次处理 {queued} 条排队消息。" if queued else "当前没有排队消息。要接着上次的问题，可以发送“继续”。"
+            await self._notice(message, "已恢复队列", status)
         elif command == "/stop":
             if self.router:
                 cancelled = await self.store.cancel_pending_routes(scope, message.sender_id)
@@ -968,6 +996,8 @@ class Bridge:
 
     async def _run_job(self, job: Any) -> None:
         active: Active | None = None
+        new_thread: str | None = None
+        deadline: asyncio.Timeout | None = None
         persisted_result = False
         try:
             # Recheck durable jobs accepted before a policy change, before any
@@ -1013,28 +1043,37 @@ class Bridge:
                 return
             session = await self.store.get_session(job.session_key)
             context_data_allowed &= not session.data_context_restricted
-            if session.thread_id:
-                thread_id = session.thread_id
-                await self.codex.resume_thread(thread_id, self.config.workspace)
-            else:
-                thread_id = await self.codex.create_thread(self.config.workspace)
-                await self.store.set_thread(job.session_key, thread_id)
+            try:
+                if session.thread_id:
+                    thread_id = session.thread_id
+                    await self.codex.resume_thread(thread_id, self.config.workspace)
+                else:
+                    thread_id = new_thread = await self.codex.create_thread(self.config.workspace)
+            except (ActiveTurnError, ThreadHistoryUnavailableError):
+                raise
+            except Exception as exc:
+                raise TurnPreparationError("Codex 会话准备失败") from exc
+            if new_thread:
+                # A lost turn/start reply must leave a durable mapping for /stop.
+                await self.store.set_thread(job.session_key, new_thread)
             active = Active(job, thread_id, asyncio.get_running_loop().create_future(),
                             data_checks_allowed=not bool(job.message.image_keys) and context_data_allowed,
                             question=question)
             self.active[thread_id] = active
-            if job.session_key in self._stop_starting or not await self._authorized(job.message):
-                active.done.set_result(CodexEvent("completed", thread_id=thread_id, status="interrupted"))
+            if not await self._authorized(job.message) or active.stopping or job.session_key in self._stop_starting:
+                await self.store.release_unsubmitted_job(job.id, "任务已取消或成员已停用", cancelled=True,
+                                                         empty_thread=new_thread)
+                return
+            if images:
+                active.turn_id = await self.codex.start_turn(thread_id, prompt, images=images)
             else:
-                if images:
-                    active.turn_id = await self.codex.start_turn(thread_id, prompt, images=images)
-                else:
-                    active.turn_id = await self.codex.start_turn(thread_id, prompt)
-                images = ()
-                active.turn_ready.set()
-                if active.stopping:
-                    await self.codex.interrupt(thread_id, active.turn_id)
-            result = await asyncio.wait_for(asyncio.shield(active.done), self.config.task_timeout)
+                active.turn_id = await self.codex.start_turn(thread_id, prompt)
+            images = ()
+            active.turn_ready.set()
+            if active.stopping:
+                await self.codex.interrupt(thread_id, active.turn_id)
+            async with asyncio.timeout(self.config.task_timeout) as deadline:
+                result = await asyncio.shield(active.done)
             text = result.text or active.text or "（没有文字输出）"
             if result.status != "completed":
                 text = f"任务{'已停止' if result.status == 'interrupted' else '未完成'}。\n{result.error}\n\n{text}"
@@ -1049,10 +1088,28 @@ class Bridge:
             await self._clear_tickets(active)
             await self._send_parts(job.message, "" if result.status == "completed" else "任务已结束",
                                    text, kind="result" if result.status == "completed" else "error",
-                                   session_key=job.session_key)
+                                   session_key=job.session_key, business_result=True)
         except asyncio.CancelledError:
             # Leave durable running state for restart recovery; never auto-replay it.
             raise
+        except (ActiveTurnError, ThreadHistoryUnavailableError, TurnPreparationError) as exc:
+            if isinstance(exc, ActiveTurnError):
+                reason = "上次任务仍在执行。本条消息尚未提交，已保留在队列中。请等上次任务结束后 /resume。"
+            elif isinstance(exc, ThreadHistoryUnavailableError):
+                reason = "Codex 无法读取原会话历史。本条消息尚未提交，队列已暂停。用 /resume 查看恢复方式。"
+            else:
+                reason = "Codex 启动准备失败，本条消息尚未提交，已保留在队列中。请稍后用 /resume 恢复。"
+            log.warning("Codex 任务尚未提交 (%s)", type(exc.__cause__ or exc).__name__)
+            async with self._state_lock:
+                cancelled = (job.session_key in self._stop_starting or bool(active and active.stopping)
+                             or not await self._authorized(job.message))
+                released = await self.store.release_unsubmitted_job(
+                    job.id, "任务已取消或成员已停用" if cancelled else reason, cancelled=cancelled,
+                    empty_thread=new_thread if isinstance(exc, TurnPreparationError) else None)
+                if not released or cancelled:
+                    return
+                self.blocked.add(job.session_key)
+            await self._notice(job.message, "队列已暂停", reason, "error")
         except (ImageInputError, GroupContextError, ReferenceContextError, RoutingInputError) as exc:
             # Input/context validation fails before a model turn is sent.
             # Keep the existing conversation usable for a corrected next message.
@@ -1076,12 +1133,15 @@ class Bridge:
                 log.error("结果发送失败；完整结果保存在 PostgreSQL，可用 /last 获取")
                 return
             reason = "连接或执行失败，任务结果尚未确认。不会自动重复执行；请检查项目状态后继续。"
-            if isinstance(exc, asyncio.TimeoutError):
-                reason = "任务超过配置的时限，已请求停止。请检查项目状态后继续。"
+            timed_out = isinstance(exc, TimeoutError) and deadline is not None and deadline.expired()
+            if timed_out:
+                reason = "任务超过配置的时限，停止状态尚未确认。请检查任务状态后 /resume。"
             if active:
                 if active.turn_id and self.connected and not active.done.done():
                     try:
                         await self.codex.interrupt(active.thread_id, active.turn_id)
+                        if timed_out:
+                            reason = "任务超过配置的时限，已请求停止。请检查任务状态后 /resume。"
                     except Exception:
                         pass
                 await self._clear_tickets(active)
@@ -1105,8 +1165,12 @@ class Bridge:
             self.wakeup.set()
 
     async def _send_parts(self, message: IncomingMessage, title: str, text: str,
-                          kind: str = "result", *, session_key: str | None = None) -> None:
+                          kind: str = "result", *, session_key: str | None = None, business_result: bool = False) -> None:
         parts = split_text(redact_private_text(redact(text))[:32000] if self.config.read_only else text)
+        remember = self.config.read_only and self.router and session_key and message.chat_type == "p2p"
+        if remember:
+            # A partial delivery or a failed turn cannot establish what the user is referring to.
+            self.router.remember_answer(self._key(message), message, session_key, "")
         for index, part in enumerate(parts):
             if self.config.read_only and not await self._authorized(message):
                 return
@@ -1115,6 +1179,8 @@ class Bridge:
             sent_id = await self.messenger.send(message.chat_id, view, message.id)
             if self.router and session_key and await self.store.topic_by_key(self._key(message), session_key):
                 await self.store.map_topic_message(self._key(message), session_key, sent_id)
+        if remember and business_result and kind == "result":
+            self.router.remember_answer(self._key(message), message, session_key, "".join(parts))
 
     async def _block(self, key: str, reason: str) -> None:
         self.blocked.add(key)

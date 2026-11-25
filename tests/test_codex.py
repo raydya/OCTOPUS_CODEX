@@ -10,7 +10,10 @@ import tomllib
 import unittest
 from unittest.mock import AsyncMock
 
-from octopus.codex import ActiveTurnError, AppServerClient, readonly_thread_config
+from octopus.codex import (
+    ActiveTurnError, AppServerClient, ThreadHistoryUnavailableError,
+    TurnPreparationError, readonly_thread_config,
+)
 from octopus.contracts import CodexEvent
 from octopus.images import MAX_IMAGES, MAX_TOTAL_IMAGE_BYTES, ImageInputError
 
@@ -278,10 +281,62 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
             "config/read", "config/mcpServer/reload", "mcpServerStatus/list", "skills/list", "turn/start",
         ])
         self.assertEqual(client._request.await_args_list[2].args[1], {
-            "threadId": "old-thread", "serverName": "docs",
+            "threadId": "old-thread", "serverName": "docs", "detail": "toolsAndAuthOnly",
         })
         self.assertEqual(client._request.call_args.args[1]["threadId"], "old-thread")
         self.assertEqual(client._request.call_args.args[1]["approvalPolicy"], "never")
+
+    async def test_optional_catalog_timeout_can_start_but_required_timeout_stays_pre_submission(self):
+        for required in (False, True):
+            with self.subTest(required=required):
+                client = self.client()
+                config = self.config()
+                config["mcp_servers"] = {"docs": {"default_tools_approval_mode": "writes",
+                                                 "required": required}}
+                response = self.config_response(config)
+                client._request.return_value = response
+                await client._attest_read_only()
+                client.active_turn = AsyncMock(return_value=None)
+                client._request.side_effect = [response, {}, TimeoutError("catalog"), {}, {"turn": {"id": "turn"}}]
+                if required:
+                    with self.assertRaises(TurnPreparationError):
+                        await client.start_turn("thread-safe", "继续")
+                else:
+                    self.assertEqual(await client.start_turn("thread-safe", "继续"), "turn")
+                sends = [call for call in client._request.await_args_list if call.args[0] == "turn/start"]
+                self.assertEqual(len(sends), 0 if required else 1)
+
+    async def test_resume_recognizes_only_matching_history_errors(self):
+        for code, detail, matches in (
+            (-32600, "no rollout found for thread id thread-safe", True),
+            (-32600, "no rollout found for thread id another-thread", False),
+            (-32603, "no rollout found for thread id thread-safe", False),
+            (-32601, "list_turns is not supported yet", True),
+            (-32601, "unrecognized operation", False),
+        ):
+            with self.subTest(code=code, detail=detail):
+                client = AppServerClient()
+                client._ready = True
+
+                async def respond(message):
+                    await client._receive({"id": message["id"], "error": {"code": code, "message": detail}})
+
+                client._write = respond
+                with self.assertRaises(RuntimeError) as raised:
+                    await client.resume_thread("thread-safe", self.cwd)
+                self.assertEqual(isinstance(raised.exception, ThreadHistoryUnavailableError), matches)
+                if matches:
+                    self.assertNotIn("thread-safe", str(raised.exception))
+
+    async def test_resume_rejects_unknown_or_errored_status(self):
+        client = self.client()
+        await client._attest_read_only()
+        for status in ({}, {"type": "systemError"}):
+            with self.subTest(status=status):
+                client._request.return_value = self.thread_response() | {"thread": {"id": "thread-safe",
+                                                                                   "status": status}}
+                with self.assertRaises(RuntimeError):
+                    await client.resume_thread("thread-safe", self.cwd)
 
     async def test_missing_or_invalid_host_instructions_cannot_reuse_attested_policy(self):
         missing = object()
@@ -300,11 +355,28 @@ class ReadonlyAppServerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(client._read_only_cwd)
                 self.assertIsNone(client._read_only_developer_instructions)
                 client._request.reset_mock()
-                with self.assertRaises(ValueError):
+                with self.assertRaises(RuntimeError):
                     await client.create_thread(self.cwd)
-                with self.assertRaises(ValueError):
+                with self.assertRaises(RuntimeError):
                     await client.resume_thread("thread-safe", self.cwd)
-                client._request.assert_not_awaited()
+                self.assertEqual([call.args[0] for call in client._request.await_args_list],
+                                 ["config/read", "config/read"])
+
+    async def test_transient_attestation_timeout_can_restore_permissions_on_next_thread_request(self):
+        for method in ("thread/start", "thread/resume"):
+            with self.subTest(method=method):
+                client = self.client()
+                await client._attest_read_only()
+                client._request.side_effect = [TimeoutError(), self.config_response(), self.thread_response()]
+                with self.assertRaises(TimeoutError):
+                    await client._attest_read_only()
+                self.assertIsNone(client._read_only_cwd)
+                client._request.reset_mock()
+                if method == "thread/start":
+                    await client.create_thread(self.cwd)
+                else:
+                    await client.resume_thread("thread-safe", self.cwd)
+                self.assertEqual([call.args[0] for call in client._request.await_args_list], ["config/read", method])
 
     async def test_unpublished_tool_setting_uses_highest_enabled_config_layer(self):
         disabled = {"tools": {"experimental_request_user_input": {"enabled": False}}}

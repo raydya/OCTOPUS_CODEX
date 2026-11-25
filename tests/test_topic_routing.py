@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from octopus.contracts import QuotedContext, ReferenceContextError
 from octopus.topic_routing import RoutingInputError, TopicRouter
@@ -88,10 +88,48 @@ class TopicRoutingTests(unittest.IsolatedAsyncioTestCase):
         decision = await self.router.decide(message("without_ref", "继续查"), self.scope)
         self.assertEqual(decision.action, "clarify")
         self.assertNotIn("private transport", decision.clarification)
+        self.assertIn("暂时无法自动识别", decision.clarification)
         await self.store.map_topic_message(self.scope, old, "answer")
         self.quote("answer", "订单支付超时")
         decision = await self.router.decide(replace(message("with_ref", "继续查"), parent_id="answer"), self.scope)
         self.assertEqual((decision.action, decision.topic_id), ("continue", old))
+
+    async def test_only_unambiguous_term_in_latest_private_answer_can_bypass_classifier(self):
+        other, current = await self.topic(), await self.topic()
+        item = message("follow", "只读查询工具是指什么 dms吗")
+        self.codex.classify_topic.side_effect = TimeoutError()
+        with patch("octopus.topic_routing.time.time_ns", return_value=item.created_at * 1_000_000):
+            self.router.remember_answer(self.scope, item, current, "本轮只读查询工具启动失败，networking unavailable")
+            for body in (item.text, "你刚才说的“只读查询工具”具体指什么，是 DMS 吗？"):
+                with self.subTest(body=body):
+                    self.assertEqual((await self.router.decide(replace(item, text=body), self.scope)).topic_id, current)
+            for body in ("它是指什么", "只读查询工具", "network是什么意思",
+                         "只读查询工具是指什么，请帮我查订单吗"):
+                with self.subTest(body=body):
+                    self.assertEqual((await self.router.decide(replace(item, text=body), self.scope)).action, "clarify")
+            earlier = replace(item, created_at=item.created_at - 1)
+            self.assertEqual((await self.router.decide(earlier, self.scope)).action, "clarify")
+            self.router.remember_answer(self.scope, item, other, "上一条独立问题也有只读查询工具")
+            self.assertEqual((await self.router.decide(item, self.scope)).action, "clarify")
+            self.router.remember_answer(self.scope, item, current, "只读查询工具可用")
+            self.assertEqual((await self.router.decide(item, self.scope)).action, "clarify")
+
+    async def test_private_delivered_term_honors_expiry_actor_scope_and_pending_clarification(self):
+        key = await self.topic()
+        item = message("follow", "只读查询工具是指什么 dms吗")
+        self.codex.classify_topic.side_effect = TimeoutError()
+        with patch("octopus.topic_routing.time.time_ns", return_value=item.created_at * 1_000_000):
+            self.router.remember_answer("foreign-scope", item, key, "只读查询工具")
+            self.router.remember_answer(self.scope, replace(item, sender_id="ou_other"), key, "只读查询工具")
+            self.router.remember_answer(self.scope, replace(item, chat_type="group"), key, "只读查询工具")
+            self.assertEqual((await self.router.decide(item, self.scope)).action, "clarify")
+            self.router.remember_answer(self.scope, item, key, "只读查询工具")
+            self.store.get_topic_pending = AsyncMock(return_value={"question": "另一条待澄清问题"})
+            self.assertEqual((await self.router.decide(item, self.scope)).action, "clarify")
+        self.store.get_topic_pending.return_value = None
+        later = replace(item, created_at=item.created_at + 11 * 60_000)
+        with patch("octopus.topic_routing.time.time_ns", return_value=later.created_at * 1_000_000):
+            self.assertEqual((await self.router.decide(later, self.scope)).action, "clarify")
 
     async def test_explicit_new_overrides_classifier_continue(self):
         old = await self.topic()

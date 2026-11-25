@@ -3,6 +3,7 @@
 .env.*
 .secrets
 .data
+/tmp/
 .venv
 venv
 __pycache__

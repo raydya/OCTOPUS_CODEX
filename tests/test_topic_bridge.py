@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import unittest
 from dataclasses import replace
 from unittest.mock import AsyncMock
@@ -81,6 +82,49 @@ class TopicBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(three.thread, one.thread)
         self.assertEqual(await self.store.current_topic(scope, "ou_charlie"), key_a)
         await self.complete(follow, three)
+
+    async def test_definition_of_delivered_answer_term_continues_during_classifier_outage(self):
+        original = message("rcs", "变量 2020 能否用于这个检查点？")
+        first = await self.begin(original)
+        await self.complete(original, first, "本轮只读查询工具启动失败，未能核验变量定义。")
+        await asyncio.wait_for(self.bridge.idle.wait(), 2)
+        self.codex.classify_topic.reset_mock()
+        self.codex.classify_topic.side_effect = TimeoutError()
+        follow = replace(message("term", "只读查询工具是指什么 dms吗"), created_at=time.time_ns() // 1_000_000)
+        await self.bridge.receive(follow)
+        await until(self.store.changed, lambda: follow.id in self.store.routes or self.store.jobs[follow.id].state == "done")
+        self.assertIn(follow.id, self.store.routes)
+        turn = await self.codex.next_turn()
+        self.assertEqual(turn.thread, first.thread)
+        self.assertIn(follow.text, turn.text)
+        self.assertNotIn("未能核验变量定义", turn.text)
+        self.codex.classify_topic.assert_not_awaited()
+        await self.complete(follow, turn)
+
+    async def test_partial_answer_and_last_replay_do_not_establish_implicit_topic(self):
+        original = message("original", "检查变量")
+        first = await self.begin(original)
+        await self.complete(original, first, "只读查询工具启动失败。")
+        await asyncio.wait_for(self.bridge.idle.wait(), 2)
+        key, scope = self.store.jobs[original.id].session_key, self.bridge._key(original)
+        self.codex.classify_topic.side_effect = TimeoutError()
+        follow = message("term", "只读查询工具是指什么 dms吗")
+        await self.command("last", "/last")
+        decision = await self.bridge.router.decide(replace(follow, created_at=time.time_ns() // 1_000_000), scope)
+        self.assertEqual(decision.action, "clarify")
+        send, calls = self.messenger.send, 0
+        async def fail_second(*args):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise ConnectionError("second part failed")
+            return await send(*args)
+        self.messenger.send = fail_second
+        with self.assertRaises(ConnectionError):
+            await self.bridge._send_parts(original, "", "只读查询工具" + "文" * 7000,
+                                          session_key=key, business_result=True)
+        decision = await self.bridge.router.decide(replace(follow, created_at=time.time_ns() // 1_000_000), scope)
+        self.assertEqual(decision.action, "clarify")
 
     async def test_clarification_followup_includes_original_question_without_starting_first_turn(self):
         ambiguous = message("ambiguous", "它为什么失败")

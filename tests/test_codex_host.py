@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import unittest
 
@@ -66,6 +67,7 @@ class CodexHostTests(unittest.TestCase):
         self.env = {
             "PATH": str(executable_dir) + os.pathsep + os.defpath,
             "HOME": str(self.directory),
+            "TMPDIR": str(self.directory),
             "TEST_CODEX_CAPTURE": str(self.capture),
         }
 
@@ -393,6 +395,94 @@ class CodexHostTests(unittest.TestCase):
                 effective = tomllib.loads((home / "config.toml").read_text())
                 self.assertEqual(effective["approval_policy"], "never")
                 self.assertFalse(effective["permissions"]["octopus-readonly"]["network"]["enabled"])
+
+    def install_cask(self, version, *, hold=False):
+        package = self.directory / "Caskroom" / "codex" / version
+        (package / "bin").mkdir(parents=True)
+        (package / "codex-path").mkdir()
+        (package / "codex-resources").mkdir()
+        (package / "codex-resources" / "marker").write_text(version)
+        (package / "codex-package.json").write_text(json.dumps({
+            "layoutVersion": 1, "variant": "codex", "version": version, "entrypoint": "bin/codex",
+            "execServer": "bin/codex-exec-server", "resourcesDir": "codex-resources", "pathDir": "codex-path",
+        }))
+        for helper in ("bin/codex-code-mode-host", "bin/codex-exec-server", "codex-path/rg"):
+            (package / helper).write_text(f"#!/bin/sh\necho {version}\n")
+            (package / helper).chmod(0o755)
+        entrypoint = package / "bin" / "codex"
+        entrypoint.write_text(f"""#!{sys.executable}
+import json, subprocess, sys
+from pathlib import Path
+root = Path(__file__).resolve().parent.parent
+if {hold!r}:
+    child = subprocess.Popen(['/bin/sleep', '15'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, close_fds=False)
+    Path({str(self.directory / 'ready')!r}).write_text(str(child.pid))
+    sys.stdin.readline()
+versions = [subprocess.check_output([root / helper], text=True).strip()
+            for helper in ('bin/codex-code-mode-host', 'bin/codex-exec-server', 'codex-path/rg')]
+versions.append((root / 'codex-resources' / 'marker').read_text())
+Path({str(self.capture)!r}).write_text(json.dumps({{'versions': versions, 'package': str(root)}}))
+""")
+        entrypoint.chmod(0o755)
+        link = self.directory / "bin" / "codex"
+        link.unlink()
+        link.symlink_to(entrypoint)
+        return package
+
+    def test_running_readonly_host_retains_cask_across_upgrade_until_restart(self):
+        self.prepare_readonly()
+        settings = "CODEX_READ_ONLY=true"
+        (self.project / ".env").write_text(settings)
+        old = self.install_cask("1.0.0", hold=True)
+        with subprocess.Popen(["/bin/bash", str(self.script)], cwd=self.directory, env=self.env,
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True) as active:
+            try:
+                deadline = time.monotonic() + 5
+                ready = self.directory / "ready"
+                while not ready.exists() and active.poll() is None and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertTrue(ready.exists())
+                helper_pid = int(ready.read_text())
+                self.addCleanup(self.terminate_helper, helper_pid)
+                current = self.install_cask("2.0.0")
+                shutil.rmtree(old)
+                self.assertNotEqual(self.run_host(settings).returncode, 0)
+                other = self.captured(self.run_host(settings, environment={"CODEX_PORT": "4510"}))
+                self.assertEqual(other["versions"], ["2.0.0"] * 4)
+                _, stderr = active.communicate("\n", timeout=5)
+                self.assertEqual(active.returncode, 0, stderr)
+                first = json.loads(self.capture.read_text())
+                self.assertEqual(first["versions"], ["1.0.0"] * 4)
+            finally:
+                active.kill()
+        os.kill(helper_pid, 0)  # A child kept its inherited descriptors after the old host exited.
+        after = self.captured(self.run_host(settings))
+        self.assertEqual(after["versions"], ["2.0.0"] * 4)
+        self.assertNotEqual(after["package"], str(current))
+        self.assertNotEqual(after["package"], other["package"])
+        self.assertEqual(self.captured(self.run_host())["package"], str(current))
+
+    def test_incomplete_cask_keeps_previous_complete_runtime(self):
+        self.prepare_readonly()
+        settings = "CODEX_READ_ONLY=true"
+        self.install_cask("1.0.0")
+        prior = Path(self.captured(self.run_host(settings))["package"])
+        broken = self.install_cask("2.0.0")
+        (broken / "bin" / "codex-code-mode-host").unlink()
+        self.assertNotEqual(self.run_host(settings).returncode, 0)
+        self.assertFalse(self.capture.exists())
+        self.assertEqual((prior / "codex-resources" / "marker").read_text(), "1.0.0")
+        self.install_cask("2.1.0")
+        self.assertEqual(self.captured(self.run_host(settings))["versions"], ["2.1.0"] * 4)
+
+    @staticmethod
+    def terminate_helper(pid):
+        try:
+            os.kill(pid, 15)
+        except ProcessLookupError:
+            pass
 
     def test_readonly_rejects_missing_auth_regardless_of_cli_version(self):
         self.prepare_readonly().unlink()

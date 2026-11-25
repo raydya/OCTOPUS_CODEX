@@ -355,6 +355,28 @@ class Store(AccessStore, TopicStore):
                 ("done" if error is None else "failed", error, _now(), id),
             )
 
+    async def release_unsubmitted_job(self, id: str, reason: str, *, cancelled: bool = False,
+                                     empty_thread: str | None = None) -> bool:
+        """Cancel or park an unsubmitted message and release its provisional thread in one transaction."""
+        async with self._lock, self._db.transaction():
+            now = _now()
+            cursor = await self._db.execute(
+                """UPDATE jobs SET state = %s, error = %s, updated_at = %s
+                   WHERE id = %s AND state = 'running' RETURNING session_key""",
+                ("failed" if cancelled else "queued", reason if cancelled else None, now, id),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return False
+            # Only discard a thread created for this attempt, before its first
+            # turn/start. Preserve restrictions attached to the Feishu topic.
+            await self._db.execute(
+                """UPDATE sessions SET blocked_reason = CASE WHEN %s THEN blocked_reason ELSE %s END, updated_at = %s,
+                       thread_id = NULLIF(thread_id, %s) WHERE key = %s""",
+                (cancelled, reason, now, empty_thread, row["session_key"]),
+            )
+            return True
+
     async def cancel_queued(self, session_key: str) -> int:
         async with self._lock:
             cursor = await self._db.execute(

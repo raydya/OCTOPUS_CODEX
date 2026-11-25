@@ -102,6 +102,29 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         await reopened.finish_job("running")
         self.assertEqual(await self.job_states(), [("running", "failed", INTERRUPTED_ERROR), ("queued", "queued", None)])
 
+    async def test_unsubmitted_job_keeps_fifo_and_restrictions_across_restart(self) -> None:
+        await self.store.set_thread("session", "empty-thread")
+        await self.store.restrict_session_data("session")
+        for identifier in ("original", "follow"):
+            await self.store.enqueue("session", message(identifier))
+        await self.store.start_job("original")
+        self.assertTrue(await self.store.release_unsubmitted_job("original", "prepare failed", empty_thread="empty-thread"))
+        await self.store.close()
+        reopened = await self.open()
+        self.assertEqual(await reopened.recover_interrupted(), [])
+        session = await reopened.get_session("session")
+        self.assertIsNone(session.thread_id)
+        self.assertTrue(session.data_context_restricted)
+        self.assertEqual(session.blocked_reason, "prepare failed")
+        self.assertFalse(await reopened.start_job("original"))
+        self.assertEqual([job.id for job in await reopened.next_jobs()], ["original", "follow"])
+        await reopened.set_blocked("session", None)
+        self.assertTrue(await reopened.start_job("original"))
+        await reopened.set_thread("session", "existing-thread")
+        await reopened.release_unsubmitted_job("original", "host busy")
+        self.assertEqual((await reopened.get_session("session")).thread_id, "existing-thread")
+        self.assertFalse(await reopened.release_unsubmitted_job("original", "stale", empty_thread="existing-thread"))
+
     async def test_app_binding_and_persistent_sessions_and_owners(self) -> None:
         await self.store.set_thread("session", "thread-id")
         await self.store.add_owner("ou-owner")

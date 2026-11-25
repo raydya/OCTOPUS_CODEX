@@ -268,6 +268,21 @@ class ActiveTurnError(RuntimeError):
         super().__init__(f"此 Codex 会话仍有任务运行{detail}，新消息尚未提交。请先查看状态或明确停止原任务。")
 
 
+class TurnPreparationError(RuntimeError):
+    """A preflight failed before any turn/start request was issued."""
+
+
+class ThreadHistoryUnavailableError(RuntimeError):
+    """The host could not restore the thread's history."""
+
+
+class _RpcError(RuntimeError):
+    def __init__(self, error: Any):
+        self.code = _object(error).get("code")
+        self.message = _error(error)
+        super().__init__(f"Codex：{self.message}")
+
+
 class AppServerClient:
     """Own a subprocess; never attach to or stop the desktop app's daemon.
 
@@ -461,18 +476,18 @@ class AppServerClient:
             raise RuntimeError("Codex 初始化期间连接中断")
         self._ready = True
 
-    async def _attest_read_only(self) -> None:
-        """Refuse a personal or drifted host before any colleague thread loads."""
+    async def _attest_read_only(self) -> dict[str, bool]:
+        """Verify host policy and return enabled MCP servers with their required flags."""
         try:
             result = _object(await self._request("config/read", {"includeLayers": True}, require_ready=False))
-            self._apply_read_only_attestation(result)
+            return self._apply_read_only_attestation(result)
         except Exception:
             self._read_only_cwd = None
             self._read_only_developer_instructions = None
             self._read_only_mcp_servers = ()
             raise
 
-    def _apply_read_only_attestation(self, result: dict[str, Any]) -> None:
+    def _apply_read_only_attestation(self, result: dict[str, Any]) -> dict[str, bool]:
         # Keep the last verified snapshot usable by concurrent threads while
         # config/read is in flight. Validation and replacement have no awaits.
         config = _object(result.get("config"))
@@ -515,10 +530,12 @@ class AppServerClient:
         # application context below also updates model-visible restored history.
         self._read_only_cwd = roots[0]
         self._read_only_developer_instructions = instructions
-        self._read_only_mcp_servers = tuple(
-            name for name, server in _object(config.get("mcp_servers")).items()
+        servers = {
+            name: server.get("required", False) for name, server in _object(config.get("mcp_servers")).items()
             if server.get("enabled") is not False
-        )
+        }
+        self._read_only_mcp_servers = tuple(servers)
+        return servers
 
     def _thread_permissions(self, cwd: str) -> dict[str, Any]:
         if not self.read_only:
@@ -532,6 +549,13 @@ class AppServerClient:
                 "permissions": READ_ONLY_PROFILE, "approvalPolicy": "never",
                 "approvalsReviewer": "user", "config": readonly_thread_config(),
                 "developerInstructions": self._read_only_developer_instructions}
+
+    async def _business_thread_permissions(self, cwd: str) -> dict[str, Any]:
+        if self.read_only and self._ready and self._read_only_cwd is None:
+            # A failed config/read invalidates the cached policy. Recheck before
+            # creating or restoring a thread on the still-connected transport.
+            await self._attest_read_only()
+        return self._thread_permissions(cwd)
 
     def _readonly_environments(self) -> list[dict[str, Any]]:
         if not self._read_only_cwd:
@@ -661,6 +685,7 @@ class AppServerClient:
                     await self._write({"id": request_id, "method": method, "params": params})
                     return await future
             except TimeoutError as error:
+                logger.warning("Codex RPC %s 超时", method)
                 raise TimeoutError(f"Codex {method} 请求超时；执行状态未知，请检查状态，不要自动重试任务。") from error
         finally:
             self._pending.pop(request_id, None)
@@ -671,7 +696,7 @@ class AppServerClient:
 
     async def create_thread(self, cwd: str) -> str:
         params: dict[str, Any] = {
-            **self._thread_permissions(cwd), "ephemeral": False,
+            **await self._business_thread_permissions(cwd), "ephemeral": False,
         }
         if self.read_only:
             params["environments"] = self._readonly_environments()
@@ -781,19 +806,29 @@ class AppServerClient:
 
     async def resume_thread(self, thread_id: str, cwd: str) -> None:
         params: dict[str, Any] = {
-            **self._thread_permissions(cwd), "threadId": thread_id, "excludeTurns": True,
+            **await self._business_thread_permissions(cwd), "threadId": thread_id, "excludeTurns": True,
         }
         if self.model:
             params["model"] = self.model
-        result = _object(await self._request("thread/resume", params))
+        try:
+            result = _object(await self._request("thread/resume", params))
+        except _RpcError as error:
+            if error.code == -32600 and error.message == f"no rollout found for thread id {thread_id}":
+                raise ThreadHistoryUnavailableError("Codex 找不到这个会话的历史记录。") from None
+            if error.code == -32601 and error.message == "list_turns is not supported yet":
+                raise ThreadHistoryUnavailableError("Codex 当前无法读取这个会话的历史记录。") from None
+            raise
         self._check_thread_permissions(result)
         thread = _object(result.get("thread"))
-        if _object(thread.get("status")).get("type") == "active":
+        status = _object(thread.get("status")).get("type")
+        if status == "active":
             try:
                 turn_id = await self._find_active_turn(thread_id, thread)
             except Exception:
                 turn_id = None
             raise ActiveTurnError(thread_id, turn_id)
+        if status not in {"idle", "notLoaded"}:
+            raise RuntimeError("无法确认 Codex 会话处于空闲状态，未提交新任务")
 
     async def _find_active_turn(self, thread_id: str, thread: dict[str, Any]) -> str | None:
         for entry in thread.get("turns") or []:
@@ -829,6 +864,29 @@ class AppServerClient:
 
     async def start_turn(self, thread_id: str, text: str, images: tuple[str, ...] = ()) -> str:
         image_inputs = _image_inputs(images)
+        try:
+            params = await self._prepare_turn(thread_id, text, image_inputs)
+        except ActiveTurnError:
+            raise
+        except Exception as error:
+            raise TurnPreparationError("Codex 任务准备失败，本次消息尚未提交。") from error
+        result = _object(await self._request("turn/start", params))
+        turn_id = _string(_object(result.get("turn")).get("id"))
+        if not turn_id:
+            raise RuntimeError("Codex turn/start 响应缺少 turn.id；请检查任务状态，勿自动重试")
+        return turn_id
+
+    async def _wait_for_mcp_catalog(self, thread_id: str, name: str, required: bool) -> None:
+        try:
+            await self._request("mcpServerStatus/list", {
+                "threadId": thread_id, "serverName": name, "detail": "toolsAndAuthOnly",
+            })
+        except TimeoutError:
+            if required:
+                raise
+            logger.warning("可选 MCP 服务 %s 的工具目录等待超时", name)
+
+    async def _prepare_turn(self, thread_id: str, text: str, image_inputs: list[dict[str, str]]) -> dict[str, Any]:
         # turn/start may steer an existing turn. Never use it as an implicit queue.
         active_turn_id = await self.active_turn(thread_id)
         if active_turn_id:
@@ -845,11 +903,10 @@ class AppServerClient:
                 # Reload uses host configuration, so attest it before activating
                 # any new server. Native reload updates restored thread catalogs;
                 # listing metadata waits for their optional startup to finish.
-                await self._attest_read_only()
+                servers = await self._attest_read_only()
                 await self._request("config/mcpServer/reload", {})
-                await asyncio.gather(*(self._request("mcpServerStatus/list", {
-                    "threadId": thread_id, "serverName": name,
-                }) for name in self._read_only_mcp_servers))
+                await asyncio.gather(*(self._wait_for_mcp_catalog(thread_id, name, required)
+                                       for name, required in servers.items()))
             instructions = self._read_only_developer_instructions
             if not isinstance(instructions, str) or not instructions.strip():
                 raise RuntimeError("Codex 只读回答规则尚未校验，拒绝开始任务")
@@ -869,11 +926,7 @@ class AppServerClient:
             # Use native discovery to refresh it without replacing the thread
             # or copying skill bodies into the application's instructions.
             await self._request("skills/list", {"cwds": [self._read_only_cwd], "forceReload": True})
-        result = _object(await self._request("turn/start", params))
-        turn_id = _string(_object(result.get("turn")).get("id"))
-        if not turn_id:
-            raise RuntimeError("Codex turn/start 响应缺少 turn.id；请检查任务状态，勿自动重试")
-        return turn_id
+        return params
 
     async def interrupt(self, thread_id: str, turn_id: str) -> None:
         await self._request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
@@ -912,7 +965,7 @@ class AppServerClient:
             if future is None or future.done():
                 return
             if "error" in message:
-                future.set_exception(RuntimeError(f"Codex：{_error(message['error'])}"))
+                future.set_exception(_RpcError(message["error"]))
             elif "result" in message:
                 future.set_result(message["result"])
             else:

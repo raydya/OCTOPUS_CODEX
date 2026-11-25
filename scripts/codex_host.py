@@ -1,6 +1,8 @@
 """Launch the host Codex server with project-local settings, without shell eval."""
 from __future__ import annotations
 
+import errno
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -25,6 +27,58 @@ def _private_directory(path: Path) -> None:
         raise ValueError("Read-only runtime directories must not be symlinks")
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     path.chmod(0o700)
+
+
+def _link_or_copy(source: str, destination: str) -> None:
+    try:
+        os.link(os.path.realpath(source), destination)
+    except OSError as exc:
+        if exc.errno not in {errno.EXDEV, errno.EPERM, errno.EACCES, errno.ENOTSUP, errno.EMLINK}:
+            raise
+        shutil.copy2(source, destination)
+
+
+def _retain_cask_runtime(executable: Path, port: int) -> Path:
+    """Keep the running CLI and its sibling tools together when Homebrew unlinks its old cask."""
+    entrypoint = executable.resolve()
+    package = entrypoint.parent.parent
+    manifest = package / "codex-package.json"
+    if (entrypoint != package / "bin" / "codex" or package.parent.name != "codex"
+            or package.parent.parent.name != "Caskroom" or not manifest.is_file()):
+        return executable
+    metadata = json.loads(manifest.read_text(encoding="utf-8"))
+    if (metadata.get("layoutVersion") != 1 or metadata.get("variant") != "codex"
+            or metadata.get("entrypoint") != "bin/codex" or metadata.get("version") != package.name):
+        return executable
+
+    data = PROJECT_ROOT / ".data"
+    root = data / "codex-readonly"
+    runtime = root / f"runtime-{port}"
+    for directory in (data, root, runtime):
+        _private_directory(directory)
+    lock = os.open(runtime / "lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        # A POSIX record lock survives exec but belongs solely to this process.
+        # An MCP helper that outlives the app-server cannot keep it locked.
+        fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        staging = runtime / "staging"
+        retained = runtime / "package"
+        if staging.exists():
+            shutil.rmtree(staging)
+        original = package.stat()
+        shutil.copytree(package, staging, copy_function=_link_or_copy)
+        helpers = ("bin/codex", "bin/codex-code-mode-host", "bin/codex-exec-server")
+        if (not os.path.samestat(original, package.stat())
+                or any(not (staging / name).is_file() or not os.access(staging / name, os.X_OK) for name in helpers)):
+            raise ValueError("Homebrew Codex package changed or is missing a runtime executable")
+        if retained.exists():
+            shutil.rmtree(retained)
+        staging.rename(retained)
+        os.set_inheritable(lock, True)
+        return retained / "bin" / "codex"
+    except BaseException:
+        os.close(lock)
+        raise
 
 
 def _source_link(path: Path, source: Path, *, directory: bool = False) -> None:
@@ -213,8 +267,10 @@ def launch() -> None:
     overrides = [] if read_only == "true" else diagnostics_overrides(env.get(
         "CODEX_DIAGNOSTICS_ENABLED", settings.get("CODEX_DIAGNOSTICS_ENABLED", "false"),
     ))
-    if not shutil.which("codex", path=env.get("PATH")):
+    selected = shutil.which("codex", path=env.get("PATH"))
+    if not selected:
         raise ValueError("The codex executable is not available on PATH")
+    executable = Path(selected).absolute()
 
     proxy = env.get("CODEX_PROXY_URL", settings.get("CODEX_PROXY_URL", ""))
     if proxy:
@@ -244,11 +300,12 @@ def launch() -> None:
     if proxy:
         print("Codex host: project proxy enabled; local connections bypass proxy.", flush=True)
     if read_only == "true":
+        executable = _retain_cask_runtime(executable, int(port))
         env["CODEX_WORKSPACE"] = env.get("CODEX_WORKSPACE", settings.get("CODEX_WORKSPACE", ""))
         env = readonly_environment(env)
         print("Codex host: native read-only tools enabled with isolated configuration.", flush=True)
-    os.execvpe("codex", [
-        "codex", "app-server", "--listen", f"ws://127.0.0.1:{int(port)}",
+    os.execve(executable, [
+        str(executable), "app-server", "--listen", f"ws://127.0.0.1:{int(port)}",
         "--ws-auth", "capability-token", "--ws-token-file", str(token_path),
         *overrides,
     ], env)
