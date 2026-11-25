@@ -605,8 +605,10 @@ class Store(AccessStore, TopicStore):
                         return False
                 cursor = await self._db.execute(
                     """INSERT INTO controls (id, message_json, state, created_at, updated_at)
-                       VALUES (%s, %s, 'queued', %s, %s) ON CONFLICT (id) DO NOTHING""",
-                    (message.id, Jsonb(asdict(message)), now, now),
+                       SELECT %s, %s, 'queued', %s, %s
+                       WHERE NOT EXISTS (SELECT 1 FROM jobs WHERE id = %s)
+                       ON CONFLICT (id) DO NOTHING""",
+                    (message.id, Jsonb(asdict(message)), now, now, message.id),
                 )
                 return cursor.rowcount == 1
 

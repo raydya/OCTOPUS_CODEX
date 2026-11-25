@@ -365,6 +365,17 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "会话不存在"):
             await reopened.set_blocked("unknown", "reason")
 
+    async def test_redelivered_business_message_cannot_become_a_new_control_after_upgrade(self) -> None:
+        old = replace(message("redelivered"), text="重新发起tls授权")
+        await self.store.ensure_member(old.sender_id, "admin")
+        await self.store.enqueue("session", old)
+        await self.store.start_job(old.id)
+        await self.store.finish_job(old.id)
+
+        command = replace(old, text="/tls-auth")
+        self.assertFalse(await self.store.enqueue_control(command, max_pending=5))
+        self.assertTrue(await self.store.enqueue_control(replace(command, id="fresh"), max_pending=5))
+
     async def test_control_queue_persists_deduplicates_and_claims_atomically(self) -> None:
         controls = [replace(message(id), text=text) for id, text in [("z", "/stop"), ("a", "/resume"), ("m", "/new")]]
         for control in controls:

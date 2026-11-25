@@ -154,6 +154,9 @@ CODEX_PORT=4502 bash scripts/codex-host.sh
 `lark-cli`、`ve` 使用宿主机 PATH 中的现有安装；本项目不安装独立 CLI。
 火山云 CLI 由用户维护，可运行 `npm install -g @volcengine/cli@latest` 更新，再运行 `ve version` 确认版本。
 `ve` 与 TLS 子工具 `volclog` 各自管理登录状态；只完成 `ve login` 不代表 TLS 认证已恢复。
+管理员可以随时在与机器人的私聊里发送 `/tls_auth`、`/tls-auth` 或“重新发起TLS授权”，即使当前查询身份仍然有效。
+点击私聊卡片的“开始授权”，再打开火山引擎官方页面确认。机器人验证查询权限后会更新同一张卡片。
+这次授权更新的是所有已获准成员共用的查询身份。
 TLS 查询返回固定错误码 `tls_auth_required` 时，桥接暂停该次查询，在原对话提示等待授权，
 并向启用的管理员私聊发送“开始授权 / 取消”卡片（提问者是管理员时优先只通知本人）。
 管理员确认更新共享 TLS 查询身份后，宿主机运行现有 `ve volclog login --no-browser`，
@@ -260,6 +263,7 @@ docker compose up -d --force-recreate bridge
 | `/stop` | 停止任务，取消本会话排队消息 |
 | `/resume` | 检查中断任务后，解除会话暂停 |
 | `/last` | 重新发送最近一次执行结果 |
+| `/tls_auth`、`/tls-auth` 或“重新发起TLS授权” | 管理员在私聊中主动更新共享 TLS 查询身份 |
 | `/members` | 管理员私聊列出成员 |
 | `/member-add ou_…` | 管理员添加普通成员；不会自动恢复已停用成员 |
 | `/member-disable ou_…` | 管理员停用成员，取消其排队并停止运行任务 |
@@ -270,6 +274,14 @@ docker compose up -d --force-recreate bridge
 | `/access-deny 申请编号` | 管理员拒绝申请 |
 | `/access-test` | 管理员给自己发送测试申请卡片，验证通知和按钮；不改变成员权限 |
 | `/answer 编号 答案` | 回答单个问题 |
+
+要让 `/tls_auth` 出现在飞书私聊输入框的 `/` 指令面板，先为该机器人开通应用身份权限 `application:app_slash_command:write` 并发布版本。使用绑定到该应用的 CLI 身份运行一次：
+
+```sh
+lark-cli application +slash-command-create --as bot --command tls_auth --description '发起 TLS 查询授权（仅限管理员私聊）'
+```
+
+注册成功后，客户端通常需要约 5 分钟刷新提示。[飞书斜杠指令说明](https://open.feishu.cn/document/mcp_open_tools/agent-best-practices/agent-supports-slash-commands)
 
 多个问题请按照卡片提示，用 JSON 回答每个问题 ID。问题默认十五分钟过期，超时停止任务。只读模式一律拒绝命令/文件/扩展权限请求。
 配对用户只能操作自己的会话和审批卡，旧编号不能重用。

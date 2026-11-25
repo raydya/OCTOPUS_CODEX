@@ -107,10 +107,16 @@ class ProviderAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.tasks.append(task)
         return task
 
-    async def action(self, actor="ou_alice"):
+    def manual(self, actor="ou_alice", kind="p2p"):
+        message = IncomingMessage("om_manual", "oc_manual", actor, "/tls-auth", kind, 1)
+        task = asyncio.create_task(self.auth.request_manual(message))
+        self.tasks.append(task)
+        return task
+
+    async def action(self, actor="ou_alice", chat_id="oc_admin_private"):
         await self.until(lambda: any(r[0] == actor for r in self.messenger.private))
         record = next(r for r in self.messenger.private if r[0] == actor)
-        return CardAction(record[1].actions[0].ticket_id, "accept", actor, "oc_admin_private", record[2])
+        return CardAction(record[1].actions[0].ticket_id, "accept", actor, chat_id, record[2])
 
     async def pending(self, actor="ou_alice", kind="p2p"):
         task = self.begin(actor, kind)
@@ -156,6 +162,111 @@ class ProviderAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([r[0] for r in self.messenger.private], ["ou_alice"])
         self.queries.state = "succeeded"
         self.assertTrue(await task)
+
+    async def test_manual_login_invites_only_requester_verifies_and_clears_card(self):
+        task = self.manual()
+        action = await self.action(chat_id="oc_manual")
+        self.assertEqual([actor for actor, _, _ in self.messenger.private], ["ou_alice"])
+        self.assertFalse(self.messenger.notices)
+        self.assertIn("共享 TLS 查询身份", self.messenger.private[0][1].text)
+        self.assertFalse(self.queries.calls)
+        await self.auth.receive_action(replace(action, sender_id="ou_bob"))
+        await self.auth.receive_action(replace(action, chat_id="oc_other"))
+        self.assertFalse(self.auth._flow.decision)
+        self.assertFalse(self.queries.calls)
+        await self.auth.receive_action(action)
+        await self.until(lambda: bool(self.messenger.updates))
+        self.assertEqual(self.messenger.updates[-1][0], action.message_id)
+        self.assertIn(self.queries.url, self.messenger.updates[-1][1].text)
+        self.assertFalse(task.done())
+        self.queries.state = "succeeded"
+        self.assertTrue(await task)
+        self.assertEqual(self.count("start"), 1)
+        result = self.messenger.updates[-1][1]
+        self.assertIn("授权已完成", result.text)
+        self.assertEqual(self.store.audits[-1][3], "succeeded")
+        self.assertFalse(result.actions)
+        self.assertNotIn(self.queries.url, result.text)
+        all_cards = self.messenger.private + self.messenger.updates
+        for claim in ("登录已失效", "继续查询", "原任务", "自动继续"):
+            self.assertNotIn(claim, str(all_cards))
+
+    async def test_manual_success_requires_a_displayed_device_link(self):
+        self.queries.url = None
+        for actor, initial in (("ou_alice", "succeeded"), ("ou_bob", "pending")):
+            with self.subTest(initial=initial):
+                self.queries.state = initial
+                task = self.manual(actor)
+                await self.auth.receive_action(await self.action(actor, "oc_manual"))
+                if initial == "pending":
+                    await self.until(lambda: self.count("status") > 0)
+                    self.queries.state = "succeeded"
+                self.assertFalse(await task)
+                result = self.messenger.updates[-1][1]
+                self.assertNotIn("授权已完成", result.text)
+                self.assertIn("/tls-auth", result.text)
+                self.assertIn("/tls_auth", result.text)
+                self.assertIn("重新发起 TLS 授权", result.text)
+                self.assertEqual(self.store.audits[-1][3], "no_device_prompt")
+                self.assertEqual(self.count("cancel"), 0)
+        self.assertTrue(all(not view.actions for _, view in self.messenger.updates))
+
+    async def test_recovery_accepts_verified_identity_without_a_device_prompt(self):
+        self.queries.state = "succeeded"
+        self.queries.url = None
+        task = self.begin()
+        await self.auth.receive_action(await self.action())
+        self.assertTrue(await task)
+        self.assertEqual(self.store.audits[-1][3], "succeeded")
+
+    async def test_manual_requires_current_admin_in_private_chat(self):
+        self.store.people["ou_bob"]["enabled"] = False
+        for actor, kind in (("ou_alice", "group"), ("ou_member", "p2p"), ("ou_bob", "p2p")):
+            with self.subTest(actor=actor, kind=kind):
+                self.assertFalse(await self.manual(actor, kind))
+                self.assertIn("管理员", self.messenger.notices[-1][1].text)
+                self.assertIn("私聊", self.messenger.notices[-1][1].text)
+        self.assertFalse(self.messenger.private)
+        self.assertFalse(self.queries.calls)
+
+    async def test_manual_revocation_during_host_start_withholds_device_link(self):
+        self.queries.start_gate.clear()
+        task = self.manual()
+        await self.auth.receive_action(await self.action(chat_id="oc_manual"))
+        await self.queries.start_entered.wait()
+        self.store.people["ou_alice"]["role"] = "member"
+        self.queries.start_gate.set()
+        self.assertFalse(await task)
+        self.assertEqual(self.count("cancel"), 1)
+        self.assertNotIn(self.queries.url, str(self.messenger.updates))
+        self.assertNotIn("本次查询", self.messenger.updates[-1][1].text)
+
+    async def test_manual_and_recovery_share_one_active_login(self):
+        active, _ = await self.pending()
+        self.assertFalse(await self.manual("ou_bob"))
+        self.assertIn("已有 TLS 授权", self.messenger.notices[-1][1].text)
+        self.assertNotIn("查询", self.messenger.notices[-1][1].text)
+        self.assertEqual(len(self.messenger.private), 1)
+        self.assertEqual(self.count("cancel"), 0)
+        self.queries.state = "succeeded"
+        self.assertTrue(await active)
+        manual = self.manual("ou_bob")
+        action = await self.action("ou_bob", "oc_manual")
+        self.assertFalse(await self.begin("ou_member", "group"))
+        await self.auth.receive_action(replace(action, decision="decline"))
+        self.assertFalse(await manual)
+        self.assertEqual(self.count("start"), 1)
+        self.assertIn("已取消", self.messenger.updates[-1][1].text)
+
+    async def test_manual_card_delivery_failure_gives_safe_private_notice(self):
+        self.messenger.send_user = AsyncMock(side_effect=RuntimeError("private-delivery-detail"))
+        self.assertFalse(await self.manual())
+        chat, view, reply = self.messenger.notices[-1]
+        self.assertEqual((chat, reply), ("oc_manual", "om_manual"))
+        self.assertIn("卡片", view.text)
+        self.assertNotIn("登录已失效", view.text)
+        self.assertNotIn("private-delivery-detail", view.text)
+        self.assertFalse(self.queries.calls)
 
     async def test_real_query_client_accepts_opaque_request_ids_and_binds_responses(self):
         client = QueryClient.__new__(QueryClient)

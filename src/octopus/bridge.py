@@ -29,6 +29,12 @@ POLICY_MIGRATION_REASON = "查询策略已更新，旧会话排队任务已取�
 PRIVACY_REFUSAL = "无法查询或提供个人隐私数据。请改为不含个人标识的业务规则、状态或汇总问题。"
 _BUSINESS_DATA_TOOLS = frozenset({"code_evidence", "code_read", "business_data_checks", "business_data_check"})
 _CONTEXT_FIELDS = frozenset({"context", "actor", "job_id", "thread_id", "turn_id", "question", "policy_version"})
+_TLS_AUTH_REQUEST = re.compile(
+    r"(?:(?:请(?:帮我)?|帮我)\s*)?(?:(?:重新\s*)?(?:发起|开始)\s*TLS\s*授权"
+    r"|重新\s*TLS\s*授权|重新授权\s*TLS|TLS\s*重新授权)[。！!]?", re.IGNORECASE,
+)
+_TLS_AUTH_COMMANDS = frozenset({"/tls-auth", "/tls_auth"})
+_TLS_AUTH_HELP = "管理员可在私聊中发送“重新发起 TLS 授权”、/tls_auth 或 /tls-auth，获取授权确认卡。"
 
 
 class GroupContextError(ValueError):
@@ -276,13 +282,20 @@ class Bridge:
             await self._audit(message.sender_id, "privacy.request", decision="deny", job_id=message.id)
             self._background(self._notice(message, "无法提供此类数据", PRIVACY_REFUSAL))
             return
+        text = message.text.strip()
+        plain_text = not message.image_keys and not message.attachment_error
+        if (self.provider_authorization and message.chat_type == "p2p" and plain_text
+                and _TLS_AUTH_REQUEST.fullmatch(text)):
+            text = "/tls-auth"
+            message = replace(message, text=text)
         if self._support_group(message):
             await self.store.session(key, message.chat_id, message.sender_id, topic_id=message.topic_id)
         else:
             await self.store.session(key, message.chat_id, message.sender_id)
-        if message.text.strip().startswith("/") and not message.image_keys and not message.attachment_error:
+        command = text.split(maxsplit=1)[0].lower() if text.startswith("/") else ""
+        if command and (plain_text or (command in _TLS_AUTH_COMMANDS and self.provider_authorization)):
             if self.config.read_only:
-                limit = 4000 if message.text.strip().split()[0].lower() == "/answer" else 512
+                limit = 4000 if command == "/answer" else 512
                 if len(message.text) > limit:
                     self._background(self._notice(message, "命令过长", f"此命令最多{limit}字。"))
                     return
@@ -290,7 +303,6 @@ class Bridge:
                 if now - self._control_times.get(message.sender_id, -10) < 0.5:
                     return
                 self._control_times[message.sender_id] = now
-            if self.config.read_only:
                 queued = await self.store.enqueue_control(message, max_pending=5,
                                                            allow_groups=self.config.allow_groups)
             else:
@@ -410,6 +422,12 @@ class Bridge:
     async def _command(self, message: IncomingMessage) -> None:
         parts = message.text.strip().split(maxsplit=2)
         command, scope = parts[0].lower(), self._key(message)
+        if self.provider_authorization and command in _TLS_AUTH_COMMANDS:
+            if len(parts) != 1 or message.image_keys or message.attachment_error:
+                await self._notice(message, "TLS 授权用法", "请管理员在私聊中单独发送 /tls_auth 或 /tls-auth。")
+            else:
+                await self.provider_authorization.request_manual(message)
+            return
         key = scope
         if self.router:
             reference = message.parent_id or (message.root_id if message.chat_type == "p2p" else "")
@@ -441,7 +459,8 @@ class Bridge:
                 "可以说“另一个问题：……”或“接着上一题”纠正归属。\n"
                 "/topics 查看主题；/switch 编号切换；/new 开启新问题；/status 查看当前主题状态；/last 查看最近结果。\n"
                 "/stop 停止当前主题；/resume 恢复暂停队列。群内停止、恢复仅限管理员，追问仍需 @机器人。\n"
-                "各用户私聊、不同群和飞书话题相互隔离。只读查询和个人隐私限制保持生效。")
+                "各用户私聊、不同群和飞书话题相互隔离。只读查询和个人隐私限制保持生效。"
+                + ("\n" + _TLS_AUTH_HELP if self.provider_authorization and message.chat_type == "p2p" else ""))
         elif self.access and command in ACCESS_COMMANDS:
             await self._notice(message, "", await self.access.command(message))
         elif self.config.read_only and command in {"/members", "/member-add", "/member-disable", "/member-enable"}:
@@ -462,6 +481,7 @@ class Bridge:
                 help_text += "\n管理员：/members、/member-add ou_…、/member-disable ou_…、/member-enable ou_…"
                 help_text += "\n权限申请：未授权用户发送“申请权限”或 /apply；管理员用 /access-requests 查看待办，或点击申请通知的通过/拒绝按钮。"
                 help_text += "\n管理员自测：/access-test 给自己发送测试申请卡片，不改变任何成员权限。"
+                help_text += "\n" + _TLS_AUTH_HELP
             await self._notice(message, "Codex 使用说明", help_text)
         elif command == "/status":
             session = await self.store.get_session(key)
@@ -846,18 +866,23 @@ class Bridge:
 
     async def _run_control(self, message: IncomingMessage) -> None:
         async def execute() -> None:
-            async with self._state_lock:
-                if await self._authorized(message):
-                    await self._command(message)
-                    await self._audit(message.sender_id, "command", message.text.split()[0], job_id=message.id)
+            if await self._authorized(message):
+                await self._command(message)
+                await self._audit(message.sender_id, "command", message.text.split()[0], job_id=message.id)
         try:
+            command = message.text.split(maxsplit=1)[0].lower()
             # Selecting a topic must serialize with routing; status and stop
             # must remain responsive while an image/classifier is pending.
-            if self.router and message.text.strip().split()[0].lower() in {"/new", "/switch"}:
-                async with self._scope_lock(self._key(message)):
+            if self.provider_authorization and command in _TLS_AUTH_COMMANDS:
+                # The provider owns its single in-flight authorization. Waiting
+                # for an administrator must not hold the business scheduler's lock.
+                await execute()
+            elif self.router and command in {"/new", "/switch"}:
+                async with self._scope_lock(self._key(message)), self._state_lock:
                     await execute()
             else:
-                await execute()
+                async with self._state_lock:
+                    await execute()
         except asyncio.CancelledError:
             raise
         except Exception as exc:

@@ -19,12 +19,14 @@ POLL_SECONDS = 2
 AUTH_PREFIX = "provider-auth:"
 _SCOPE = "重新登录并更新本机共享 TLS 查询身份，所有已获准成员共用其现有权限。"
 _TERMINAL = {
-    "succeeded": "TLS 授权已完成，仍有效的原任务将继续查询。",
-    "failed": "TLS 授权未完成，本次查询没有重试。",
-    "expired": "TLS 授权等待已到期，本次查询没有重试。",
-    "cancelled": "TLS 授权已取消，本次查询没有重试。",
-    "forbidden": "任务或管理员权限已失效，本次查询没有重试。",
-    "busy": "已有 TLS 授权正在处理，本次查询没有重试。",
+    "succeeded": "TLS 授权已完成，共享查询身份已通过验证。",
+    "failed": "TLS 授权未完成。",
+    "expired": "TLS 授权等待已到期。",
+    "cancelled": "TLS 授权已取消。",
+    "forbidden": "此授权请求已失效。",
+    "busy": "已有 TLS 授权正在处理。",
+    "no_device_prompt": "当前 TLS 查询身份已通过验证。本次授权卡片未显示新的设备链接，无法确认已重新授权。"
+                        "请在私聊中发送“重新发起 TLS 授权”、/tls_auth 或 /tls-auth 重试。若仍无链接，请联系宿主机管理员。",
 }
 
 
@@ -34,6 +36,7 @@ class _Flow:
     allowed: Callable[[], Awaitable[bool]]
     done: asyncio.Future[bool]
     deadline: float
+    manual: bool
     request_id: str = field(default_factory=lambda: secrets.token_hex(16))
     cards: dict[str, str] = field(default_factory=dict)
     actor: str = ""
@@ -78,15 +81,33 @@ class ProviderAuthorization:
                 if monotonic() >= flow.deadline else "forbidden")
 
     async def recover(self, message: IncomingMessage, *, still_allowed: Callable[[], Awaitable[bool]]) -> bool:
-        if self._closed or not await still_allowed():
+        return await self._authorize(message, still_allowed, manual=False)
+
+    async def request_manual(self, message: IncomingMessage) -> bool:
+        async def permitted() -> bool:
+            return message.chat_type == "p2p" and await self._admin(message.sender_id)
+
+        return await self._authorize(message, permitted, manual=True)
+
+    async def _authorize(self, message: IncomingMessage, still_allowed: Callable[[], Awaitable[bool]],
+                         *, manual: bool) -> bool:
+        if self._closed:
+            return False
+        allowed = await still_allowed()
+        if self._closed:
+            return False
+        if not allowed:
+            if manual:
+                await self.messenger.send(message.chat_id,
+                    View("info", "", "请由管理员在与机器人的私聊中发起 TLS 授权。"), message.id)
             return False
         # No await between checking and reserving: two callers cannot both win.
         if self._flow is not None:
-            await self.messenger.send(message.chat_id,
-                View("info", "", "已有 TLS 授权正在处理，请等待管理员完成后再查询。"), message.id)
+            busy = _TERMINAL["busy"] if manual else "已有 TLS 授权正在处理，请等待管理员完成后再查询。"
+            await self.messenger.send(message.chat_id, View("info", "", busy), message.id)
             return False
         flow = _Flow(message, still_allowed, asyncio.get_running_loop().create_future(),
-                     monotonic() + AUTHORIZATION_WAIT_SECONDS)
+                     monotonic() + AUTHORIZATION_WAIT_SECONDS, manual)
         self._flow = flow
         flow.task = asyncio.create_task(self._run(flow))
         try:
@@ -105,6 +126,7 @@ class ProviderAuthorization:
         flow = self._flow
         if (self._closed or flow is None or action.ticket_id != flow.ticket_id
                 or not action.chat_id or not action.message_id
+                or (flow.manual and action.chat_id != flow.message.chat_id)
                 or action.message_id != flow.cards.get(action.sender_id)
                 or action.decision not in {"accept", "decline"}):
             return
@@ -165,26 +187,29 @@ class ProviderAuthorization:
         text = _SCOPE + "\n\n[打开火山引擎官方授权页面](" + url + ")"
         if code:
             text += "\n授权码：`" + code + "`"
-        return text + "\n\n请在官方页面确认；无需把密码或令牌发到聊天中。完成后会自动继续，最多等待 5 分钟。"
+        return text + "\n\n请在官方页面确认，无需在聊天中提供密码或令牌。此卡片最多等待 5 分钟。"
 
     async def _invite(self, flow: _Flow) -> bool:
-        members = await self.store.members()
-        admins = [m["open_id"] for m in members if m.get("enabled") and m.get("role") == "admin"]
-        if flow.message.sender_id in admins:
+        if flow.manual:
             admins = [flow.message.sender_id]
-        if not admins:
+        else:
+            members = await self.store.members()
+            admins = [m["open_id"] for m in members if m.get("enabled") and m.get("role") == "admin"]
+            if flow.message.sender_id in admins:
+                admins = [flow.message.sender_id]
+            if not admins:
+                await self.messenger.send(flow.message.chat_id,
+                    View("info", "", "TLS 登录已失效，目前没有可处理授权的管理员。"), flow.message.id)
+                return False
             await self.messenger.send(flow.message.chat_id,
-                View("info", "", "TLS 登录已失效，目前没有可处理授权的管理员。"), flow.message.id)
-            return False
-        await self.messenger.send(flow.message.chat_id,
-            View("info", "", "TLS 登录已失效，已请求管理员在与机器人的私聊中授权；完成后继续本次查询。"),
-            flow.message.id)
+                View("info", "", "TLS 登录已失效，已请求管理员在与机器人的私聊中授权；完成后继续本次查询。"),
+                flow.message.id)
         for actor in admins:
             if not await self._valid(flow):
                 return False
             if not await self._admin(actor):
                 continue
-            view = View("approval", "TLS 查询需要授权", _SCOPE + "\n\n"
+            view = View("approval", "更新 TLS 查询身份" if flow.manual else "TLS 查询需要授权", _SCOPE + "\n\n"
                 "点击“开始授权”获取官方登录入口。5 分钟内有效；服务重启后需重新发起。",
                 [Button("开始授权", flow.ticket_id, "accept"), Button("取消", flow.ticket_id, "decline")])
             try:
@@ -195,10 +220,14 @@ class ProviderAuthorization:
                 raise
             except Exception:
                 log.warning("TLS 授权请求卡片暂未送达")
+        if flow.manual and not flow.cards and await self._valid(flow):
+            await self.messenger.send(flow.message.chat_id,
+                View("info", "", "TLS 授权卡片未能送达，请稍后重试。"), flow.message.id)
         return bool(flow.cards)
 
     async def _run(self, flow: _Flow) -> None:
         state = "failed"
+        displayed = None
         try:
             async with asyncio.timeout(AUTHORIZATION_WAIT_SECONDS):
                 if not await self._invite(flow):
@@ -222,7 +251,6 @@ class ProviderAuthorization:
                 # still attempt cancellation with the same opaque request ID.
                 flow.requested = True
                 result = await self._call(flow, "start")
-                displayed = None
                 while True:
                     if not await self._valid(flow):
                         state = self._invalid_state(flow)
@@ -259,14 +287,18 @@ class ProviderAuthorization:
                 try:
                     if not await self._valid(flow):
                         state = self._invalid_state(flow)
+                    elif flow.manual and displayed is None:
+                        state = "no_device_prompt"
                 except Exception:
                     state = "forbidden"
-            if flow.requested and state != "succeeded":
+            if flow.requested and state not in {"succeeded", "no_device_prompt"}:
                 try:
                     await asyncio.wait_for(self.queries.auth_cancel("tls", flow.actor, flow.request_id), 5)
                 except Exception:
                     log.warning("TLS 授权取消状态尚未确认")
             text = _TERMINAL.get(state, _TERMINAL["failed"])
+            if not flow.manual:
+                text += "仍有效的原任务将继续查询。" if state == "succeeded" else "本次查询没有重试。"
             # Remove URLs and codes even if an administrator was revoked.
             async def clear_card(card: str) -> None:
                 try:
