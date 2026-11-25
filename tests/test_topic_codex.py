@@ -19,7 +19,7 @@ RESULT = {
 
 class TopicCodexTests(unittest.IsolatedAsyncioTestCase):
     def client(self):
-        client = AppServerClient(model='business-model', reasoning_effort='xhigh')
+        client = AppServerClient(model='business-model', reasoning_effort='ultra')
         client._ready = True
         client._transport = object()
         client._write = AsyncMock()
@@ -63,7 +63,7 @@ class TopicCodexTests(unittest.IsolatedAsyncioTestCase):
             'id': f'turn-{thread_id}', 'status': status, 'items': [item] if snapshot else [],
         }})
 
-    async def test_isolated_ephemeral_low_effort_uses_same_model_and_no_business_policy(self):
+    async def test_isolated_classifier_uses_same_model_with_default_effort_and_no_business_policy(self):
         client = self.client()
         task = asyncio.create_task(client.classify_topic('/workspace', {'topics': [{'id': 'payment'}]}))
         await self.wait_turns(1)
@@ -84,12 +84,13 @@ class TopicCodexTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config['features.code_mode']['excluded_tool_namespaces'], ['functions', 'clock'])
         self.assertEqual(config['features.code_mode']['direct_only_tool_namespaces'], [])
         self.assertEqual(config['project_doc_max_bytes'], 0)
+        self.assertNotIn('model_reasoning_effort', config)
         turn = self.responses['private-1']
-        self.assertEqual(turn['effort'], 'low')
+        self.assertNotIn('effort', turn)
         self.assertEqual(turn['environments'], [])
         self.assertEqual(turn['outputSchema'], TOPIC_ROUTING_SCHEMA)
         self.assertNotIn('additionalContext', turn)
-        self.assertEqual(client.reasoning_effort, 'xhigh')
+        self.assertEqual(client.reasoning_effort, 'ultra')
         self.complete(client, 'private-1')
         self.assertEqual(await task, RESULT)
         client._request.assert_awaited_with('thread/unsubscribe', {'threadId': 'private-1'})

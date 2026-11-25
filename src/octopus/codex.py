@@ -114,7 +114,6 @@ def _topic_thread_config(mcp_servers: tuple[str, ...]) -> dict[str, Any]:
         "include_apps_instructions": False, "include_collaboration_mode_instructions": False,
         "include_environment_context": False,
         "project_doc_max_bytes": 0,
-        "model_reasoning_effort": "low",
         "mcp_servers": {name: {"enabled": False} for name in mcp_servers},
     }
 
@@ -774,7 +773,7 @@ class AppServerClient:
                         or any(not isinstance(server, dict) or server.get("tools") != {} for server in servers)):
                     raise RuntimeError("Codex 主题判断工具隔离校验失败")
                 response = _object(await self._request("turn/start", {
-                    "threadId": thread_id, "effort": "low", "environments": [],
+                    "threadId": thread_id, "environments": [],
                     "approvalPolicy": "never", "runtimeWorkspaceRoots": [],
                     "input": [{"type": "text", "text": encoded, "text_elements": []}, *image_inputs],
                     "outputSchema": TOPIC_ROUTING_SCHEMA,
