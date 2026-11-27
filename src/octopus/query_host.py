@@ -29,7 +29,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .code_reader import CodeReader, redact
-from .dms import DmsBroker
+from .dms import DmsAuthRequired, DmsBroker
 from .privacy import privacy_request_denied, redact_private_text
 from .provider_auth import ProviderAuth
 
@@ -216,6 +216,9 @@ def run_cli(argv: list[str], *, tls: bool = False, timeout: Optional[float] = No
     except OSError:
         raise QueryError("query provider could not start") from None
     output = bytearray()
+    # Only this fixed CLI invocation can signal an expired DMS OAuth grant.
+    dms = argv[:6] == ["aliyun", "--profile", "company-cli-user", "--region", "cn-hangzhou", "dms-enterprise"]
+    dms_error = bytearray()
     total = 0
     selector = selectors.DefaultSelector()
     try:
@@ -236,11 +239,18 @@ def run_cli(argv: list[str], *, tls: bool = False, timeout: Optional[float] = No
                     raise QueryError("query response exceeded the limit; narrow the query")
                 if key.fileobj is process.stdout:
                     output.extend(chunk)
+                elif dms and len(dms_error) < 8192:
+                    dms_error.extend(chunk[:8192 - len(dms_error)])
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise QueryError("query provider timed out; narrow the query")
         process.wait(timeout=remaining)
         if process.returncode != 0:
+            if dms and re.search(
+                rb"^(?:ERROR:[ \t]*)?failed to refresh token, status code: 400, error: invalid_grant\b",
+                dms_error, re.IGNORECASE | re.MULTILINE,
+            ):
+                raise DmsAuthRequired()
             if tls:
                 # volclog emits its structured failure envelope before exiting
                 # nonzero. Preserve its safe classification across the broker.
@@ -307,7 +317,7 @@ class QueryHost:
         self._grafana_config = grafana_config
         self._opener = build_opener(_NoRedirect())
         self.dms = DmsBroker(dms_policy_path, self.reader, runner)
-        self.authorization = ProviderAuth()
+        self.authorization = ProviderAuth(dms_verify=self.dms.verify_authorization)
 
     def close(self) -> None:
         self.authorization.close()
@@ -592,11 +602,11 @@ class QueryHandler(BaseHTTPRequestHandler):
             request = _json(raw)
             if self.path in auth_operations:
                 if (type(request) is not dict or set(request) != {"provider", "actor", "request_id"}
-                        or request["provider"] != "tls"):
+                        or request["provider"] not in ("tls", "dms")):
                     raise ValueError("invalid authorization operation")
                 actor, request_id = _identifier(request["actor"]), _identifier(request["request_id"])
                 result = getattr(self.server.host.authorization, auth_operations[self.path])(
-                    "tls", actor, request_id)
+                    request["provider"], actor, request_id)
                 self._send(200, result)
                 return
             if (type(request) is not dict or not {"tool", "arguments"} <= request.keys()
@@ -608,6 +618,9 @@ class QueryHandler(BaseHTTPRequestHandler):
             else:
                 result = self.server.host.execute(request["tool"], request["arguments"])
             self._send(200, result)
+        except DmsAuthRequired:
+            self._send(502, {"ok": False, "error_code": "dms_auth_required",
+                             "error": "DMS OAuth login must be renewed"})
         except (ValueError, TypeError, FileNotFoundError, RecursionError):
             self._send(400, {"ok": False, "error": "invalid or forbidden query arguments"})
         except QueryError as exc:

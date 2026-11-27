@@ -10,6 +10,8 @@ from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import Request, build_opener, ProxyHandler, HTTPRedirectHandler
 
+from .provider_auth import dms_verification_url
+
 
 def _spec(name: str, description: str, properties: dict, required: list[str]) -> dict:
     return {"type": "function", "name": name, "description": description,
@@ -79,12 +81,14 @@ _RESPONSE_TOO_LARGE = "查询结果超过大小上限；请缩小查询范围后
 
 def _query_failure(status: int | None = None, result: Any = None) -> dict[str, Any]:
     # Only interpret a known machine code; provider messages may contain secrets.
-    if (status in (None, 502) and isinstance(result, dict) and result.get("ok") is False
-            and result.get("error_code") == "tls_auth_required"):
-        return {"ok": False, "error_code": "tls_auth_required",
-                "error": "TLS 查询身份已失效，需要管理员重新授权；本次未获取日志。"}
-    else:
-        message = _HTTP_ERRORS.get(status, "查询服务请求失败；本次未获取查询结果。")
+    if status in (None, 502) and isinstance(result, dict) and result.get("ok") is False:
+        if result.get("error_code") == "tls_auth_required":
+            return {"ok": False, "error_code": "tls_auth_required",
+                    "error": "TLS 查询身份已失效，需要管理员重新授权；本次未获取日志。"}
+        if result.get("error_code") == "dms_auth_required":
+            return {"ok": False, "error_code": "dms_auth_required",
+                    "error": "DMS 登录已失效，需要管理员重新授权。本次未获取业务数据。"}
+    message = _HTTP_ERRORS.get(status, "查询服务请求失败；本次未获取查询结果。")
     return {"ok": False, "error": message}
 
 
@@ -154,8 +158,8 @@ class QueryClient:
 
     def _authorization_request(self, operation: str, provider: str, actor: str, request_id: str) -> dict:
         """Private control plane: never expose these methods as model tools."""
-        failure = {"provider": "tls", "request_id": request_id, "state": "failed"}
-        if (operation not in {"start", "status", "cancel"} or provider != "tls"
+        failure = {"provider": provider, "request_id": request_id, "state": "failed"}
+        if (operation not in {"start", "status", "cancel"} or provider not in ("tls", "dms")
                 or any(not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value)
                        for value in (actor, request_id))):
             raise ValueError("Invalid authorization request")
@@ -180,7 +184,9 @@ class QueryClient:
                 clean["expires_in"] = result["expires_in"]
             if result["state"] == "pending":
                 url = result.get("verification_url")
-                if url is not None:
+                if provider == "dms" and url is not None:
+                    clean["verification_url"] = dms_verification_url(url)
+                elif url is not None:
                     parsed = urlsplit(url)
                     if (not isinstance(url, str) or len(url) > 4096 or any(ord(c) <= 32 for c in url)
                             or parsed.scheme != "https" or parsed.hostname != "signin.volcengine.com"
@@ -190,7 +196,7 @@ class QueryClient:
                     clean["verification_url"] = url
                 code = result.get("user_code")
                 if code is not None:
-                    if not isinstance(code, str) or not re.fullmatch(r"[A-Za-z0-9-]{4,32}", code):
+                    if provider != "tls" or not isinstance(code, str) or not re.fullmatch(r"[A-Za-z0-9-]{4,32}", code):
                         return failure
                     clean["user_code"] = code
             return clean

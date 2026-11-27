@@ -29,12 +29,15 @@ POLICY_MIGRATION_REASON = "查询策略已更新，旧会话排队任务已取�
 PRIVACY_REFUSAL = "无法查询或提供个人隐私数据。请改为不含个人标识的业务规则、状态或汇总问题。"
 _BUSINESS_DATA_TOOLS = frozenset({"code_evidence", "code_read", "business_data_checks", "business_data_check"})
 _CONTEXT_FIELDS = frozenset({"context", "actor", "job_id", "thread_id", "turn_id", "question", "policy_version"})
-_TLS_AUTH_REQUEST = re.compile(
-    r"(?:(?:请(?:帮我)?|帮我)\s*)?(?:(?:重新\s*)?(?:发起|开始)\s*TLS\s*授权"
-    r"|重新\s*TLS\s*授权|重新授权\s*TLS|TLS\s*重新授权)[。！!]?", re.IGNORECASE,
-)
-_TLS_AUTH_COMMANDS = frozenset({"/tls-auth", "/tls_auth"})
-_TLS_AUTH_HELP = "管理员可在私聊中发送“重新发起 TLS 授权”、/tls_auth 或 /tls-auth，获取授权确认卡。"
+_AUTH_COMMANDS = {"/tls-auth": "tls", "/tls_auth": "tls", "/dms-auth": "dms", "/dms_auth": "dms"}
+_AUTH_REQUESTS = {provider: re.compile(
+    rf"(?:(?:请(?:帮我)?|帮我)\s*)?(?:(?:重新\s*)?(?:发起|开始)\s*{provider}\s*授权"
+    rf"|重新\s*{provider}\s*授权|重新授权\s*{provider}|{provider}\s*重新授权)[。！!]?", re.IGNORECASE,
+) for provider in ("tls", "dms")}
+_AUTH_HELP = ("管理员可在私聊中发送“重新发起 TLS 授权”、/tls_auth 或 /tls-auth，获取 TLS 授权确认卡。"
+              "\n更新 DMS 查询身份请发送 /dms_auth。")
+_QUERY_PROVIDERS = {"tls_topics": "tls", "tls_search": "tls",
+                    "business_data_checks": "dms", "business_data_check": "dms"}
 
 
 class GroupContextError(ValueError):
@@ -88,7 +91,7 @@ class Active:
     data_checks_allowed: bool = True
     turn_ready: asyncio.Event = field(default_factory=asyncio.Event)
     question: str | None = None
-    tls_authorization_attempted: bool = False
+    authorization_attempts: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -284,16 +287,18 @@ class Bridge:
             return
         text = message.text.strip()
         plain_text = not message.image_keys and not message.attachment_error
-        if (self.provider_authorization and message.chat_type == "p2p" and plain_text
-                and _TLS_AUTH_REQUEST.fullmatch(text)):
-            text = "/tls-auth"
-            message = replace(message, text=text)
+        if self.provider_authorization and message.chat_type == "p2p" and plain_text:
+            for provider, pattern in _AUTH_REQUESTS.items():
+                if pattern.fullmatch(text):
+                    text = f"/{provider}-auth"
+                    message = replace(message, text=text)
+                    break
         if self._support_group(message):
             await self.store.session(key, message.chat_id, message.sender_id, topic_id=message.topic_id)
         else:
             await self.store.session(key, message.chat_id, message.sender_id)
         command = text.split(maxsplit=1)[0].lower() if text.startswith("/") else ""
-        if command and (plain_text or (command in _TLS_AUTH_COMMANDS and self.provider_authorization)):
+        if command and (plain_text or (command in _AUTH_COMMANDS and self.provider_authorization)):
             if self.config.read_only:
                 limit = 4000 if command == "/answer" else 512
                 if len(message.text) > limit:
@@ -422,11 +427,13 @@ class Bridge:
     async def _command(self, message: IncomingMessage) -> None:
         parts = message.text.strip().split(maxsplit=2)
         command, scope = parts[0].lower(), self._key(message)
-        if self.provider_authorization and command in _TLS_AUTH_COMMANDS:
+        if self.provider_authorization and command in _AUTH_COMMANDS:
+            provider = _AUTH_COMMANDS[command]
             if len(parts) != 1 or message.image_keys or message.attachment_error:
-                await self._notice(message, "TLS 授权用法", "请管理员在私聊中单独发送 /tls_auth 或 /tls-auth。")
+                await self._notice(message, f"{provider.upper()} 授权用法",
+                                   f"请管理员在私聊中单独发送 /{provider}_auth 或 /{provider}-auth。")
             else:
-                await self.provider_authorization.request_manual(message)
+                await self.provider_authorization.request_manual(message, provider=provider)
             return
         key = scope
         if self.router:
@@ -460,7 +467,7 @@ class Bridge:
                 "/topics 查看主题；/switch 编号切换；/new 开启新问题；/status 查看当前主题状态；/last 查看最近结果。\n"
                 "/stop 停止当前主题；/resume 恢复暂停队列。群内停止、恢复仅限管理员，追问仍需 @机器人。\n"
                 "各用户私聊、不同群和飞书话题相互隔离。只读查询和个人隐私限制保持生效。"
-                + ("\n" + _TLS_AUTH_HELP if self.provider_authorization and message.chat_type == "p2p" else ""))
+                + ("\n" + _AUTH_HELP if self.provider_authorization and message.chat_type == "p2p" else ""))
         elif self.access and command in ACCESS_COMMANDS:
             await self._notice(message, "", await self.access.command(message))
         elif self.config.read_only and command in {"/members", "/member-add", "/member-disable", "/member-enable"}:
@@ -481,7 +488,7 @@ class Bridge:
                 help_text += "\n管理员：/members、/member-add ou_…、/member-disable ou_…、/member-enable ou_…"
                 help_text += "\n权限申请：未授权用户发送“申请权限”或 /apply；管理员用 /access-requests 查看待办，或点击申请通知的通过/拒绝按钮。"
                 help_text += "\n管理员自测：/access-test 给自己发送测试申请卡片，不改变任何成员权限。"
-                help_text += "\n" + _TLS_AUTH_HELP
+                help_text += "\n" + _AUTH_HELP
             await self._notice(message, "Codex 使用说明", help_text)
         elif command == "/status":
             session = await self.store.get_session(key)
@@ -695,29 +702,33 @@ class Bridge:
                    "turn_id": turn_id, "question": question,
                    "policy_version": READ_ONLY_POLICY}
         result = await self.queries.call(tool, arguments, context=context)
-        if (tool in {"tls_topics", "tls_search"} and result.get("ok") is False
-                and result.get("error_code") == "tls_auth_required" and self.provider_authorization
-                and not active.tls_authorization_attempted):
-            active.tls_authorization_attempted = True
+        provider = _QUERY_PROVIDERS.get(tool)
+        if (provider and result.get("ok") is False and result.get("error_code") == f"{provider}_auth_required"
+                and self.provider_authorization and provider not in active.authorization_attempts):
+            active.authorization_attempts.add(provider)
+            name = provider.upper()
 
             async def still_allowed() -> bool:
                 authorized = await self._authorized(active.job.message)
                 return (authorized and not self.closed and self.connected and not active.stopping
-                        and not active.done.done() and self.active.get(thread_id) is active)
+                        and not active.done.done() and self.active.get(thread_id) is active
+                        and active.turn_id == turn_id and (provider != "dms" or active.data_checks_allowed))
 
             if await still_allowed():
-                active.activity = "等待管理员重新授权 TLS"
-                await self._audit(actor, "provider.auth.request", "tls", "requested", active.job.id)
-                restored = await self.provider_authorization.recover(active.job.message, still_allowed=still_allowed)
-                await self._audit(actor, "provider.auth.result", "tls", "success" if restored else "unavailable",
+                active.activity = f"等待管理员重新授权 {name}"
+                await self._audit(actor, "provider.auth.request", provider, "requested", active.job.id)
+                restored = await self.provider_authorization.recover(
+                    active.job.message, still_allowed=still_allowed, provider=provider)
+                await self._audit(actor, "provider.auth.result", provider, "success" if restored else "unavailable",
                                   active.job.id)
                 if restored and await still_allowed():
-                    active.activity = "TLS 已授权，重新查询"
+                    active.activity = f"{name} 已授权，重新查询"
                     # Replay only this read, with its original trusted context.
                     # Auth recovery is bounded to one attempt per model turn.
                     result = await self.queries.call(tool, arguments, context=context)
                 else:
-                    result = {"ok": False, "error": "TLS 授权未完成或当前任务已停止；本次未获取日志。"}
+                    source = "日志" if provider == "tls" else "数据库查询结果"
+                    result = {"ok": False, "error": f"{name} 授权未完成或当前任务已停止；本次未获取{source}。"}
         if (active.stopping or active.done.done() or self.active.get(thread_id) is not active
                 or not await self._authorized(active.job.message)
                 or (tool in _BUSINESS_DATA_TOOLS and not active.data_checks_allowed)):
@@ -873,7 +884,7 @@ class Bridge:
             command = message.text.split(maxsplit=1)[0].lower()
             # Selecting a topic must serialize with routing; status and stop
             # must remain responsive while an image/classifier is pending.
-            if self.provider_authorization and command in _TLS_AUTH_COMMANDS:
+            if self.provider_authorization and command in _AUTH_COMMANDS:
                 # The provider owns its single in-flight authorization. Waiting
                 # for an administrator must not hold the business scheduler's lock.
                 await execute()

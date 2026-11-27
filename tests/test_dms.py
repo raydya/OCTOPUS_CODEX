@@ -10,7 +10,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from octopus.code_reader import CodeReader
-from octopus.dms import DmsBroker, DmsDenied, _code_relations, _column, source_digest
+from octopus.dms import DmsAuthRequired, DmsBroker, DmsDenied, _code_relations, _column, source_digest
 
 
 class Provider:
@@ -394,6 +394,28 @@ class DmsTests(unittest.TestCase):
         self.assertEqual(results.count("ok"), 2)
         self.assertEqual(results.count("denied"), 6)
         self.assertEqual(len(self.provider.executed), 2)
+
+    def test_failed_oauth_resolution_preserves_last_query_slot_for_retry(self):
+        evidence, entry = self.catalog()
+        self.check(evidence, entry)
+        with mock.patch.object(self.broker, "runner", side_effect=DmsAuthRequired()):
+            with self.assertRaises(DmsAuthRequired):
+                self.check(evidence, entry)
+        self.check(evidence, entry)
+        with self.assertRaises(DmsDenied):
+            self.check(evidence, entry)
+        self.assertEqual(len(self.provider.executed), 2)
+
+    def test_login_probe_uses_only_the_existing_tenant_table_catalog(self):
+        self.assertTrue(self.broker.verify_authorization())
+        self.assertEqual(len(self.provider.calls), 1)
+        args = self.provider.calls[0]
+        self.assertEqual(args[6], "search-table")
+        self.assertEqual(args[args.index("--page-size") + 1], "1")
+        self.assertEqual(self.provider.executed, [])
+        with mock.patch.object(self.broker, "runner", return_value={"Success": False}):
+            with self.assertRaises(DmsDenied):
+                self.broker.verify_authorization()
 
     def test_task_budget_cannot_reset_by_reading_new_evidence(self):
         for _ in range(2):

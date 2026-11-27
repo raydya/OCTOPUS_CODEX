@@ -8,7 +8,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from octopus.provider_auth import ProviderAuth, _verification_url
+from octopus.provider_auth import ProviderAuth, _default_aliyun_profile, _restore_aliyun_profile, _verification_url, dms_verification_url
 
 
 URL = "https://signin.volcengine.com/authorize/device?user_code=ABCD-EFGH"
@@ -20,10 +20,15 @@ PROMPT = ("Open the following URL to authorize this device:\n"
 SUCCESS = json.dumps({"provider": "console-login", "profile": "default", "region": "cn-beijing",
                       "endpoint": "https://tls-cn-beijing.volces.com", "expires_at": "2030-01-01T00:00:00Z",
                       "masked_access_key": "****"})
+DMS_URL = ("https://signin.aliyun.com/oauth2/v1/auth?response_type=code&client_id=4038181954557748008"
+           "&redirect_uri=http%3A%2F%2F127.0.0.1%3A12345%2Fcli%2Fcallback&state=azAZ0123456789XY"
+           "&code_challenge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&code_challenge_method=S256")
+DMS_PROMPT = "Please open the following URL in your browser to authorize:\n" + DMS_URL + "\n"
+DMS_SAVED = "Saving profile[company-cli-user] ...Done."
 
 
 class ProviderAuthTests(unittest.TestCase):
-    def service(self, script: str, *, runner=None, clock=time.monotonic):
+    def service(self, script: str, *, runner=None, clock=time.monotonic, dms_verify=None):
         calls = []
         children = []
 
@@ -34,14 +39,14 @@ class ProviderAuthTests(unittest.TestCase):
             return child
 
         runner = runner or Mock(return_value={"status": "success", "data": {}})
-        auth = ProviderAuth(popen=spawn, runner=runner, clock=clock)
+        auth = ProviderAuth(popen=spawn, runner=runner, clock=clock, dms_verify=dms_verify)
         self.addCleanup(auth.close)
         return auth, calls, children, runner
 
-    def wait_state(self, auth, states, *, actor="admin", request_id="request1"):
+    def wait_state(self, auth, states, *, actor="admin", request_id="request1", provider="tls"):
         deadline = time.monotonic() + 4
         while time.monotonic() < deadline:
-            result = auth.status("tls", actor, request_id)
+            result = auth.status(provider, actor, request_id)
             if result["state"] in states:
                 return result
             time.sleep(0.01)
@@ -199,3 +204,106 @@ class ProviderAuthTests(unittest.TestCase):
         self.assertEqual(_verification_url(URL), URL)
         self.assertEqual(_verification_url("https://signin.volcengine.com:443/device"),
                          "https://signin.volcengine.com:443/device")
+
+    def dms_service(self, script, *, verifier=None, clock=time.monotonic, original="company-cli-user"):
+        self.enterContext(patch("octopus.provider_auth.shutil.which", return_value="/opt/mock/aliyun"))
+        self.enterContext(patch("octopus.provider_auth._default_aliyun_profile", return_value=original))
+        return self.service(script, clock=clock, dms_verify=verifier or Mock(return_value=True))
+
+    def test_dms_cli_owns_callback_and_success_requires_production_read(self):
+        verify = Mock(return_value=True)
+        auth, calls, _, _ = self.dms_service(
+            f"print({DMS_PROMPT!r});time.sleep(.3);print({DMS_SAVED!r})", verifier=verify)
+        auth.start("dms", "admin", "request1")
+        challenge = self.wait_state(auth, {"pending"}, provider="dms")
+        self.assertEqual(challenge["verification_url"], DMS_URL)
+        self.assertNotIn("user_code", challenge)
+        self.assertEqual(auth.start("dms", "admin", "request1")["verification_url"], DMS_URL)
+        self.assertEqual(auth.status("tls", "admin", "request1")["state"], "forbidden")
+        self.assertEqual(auth.cancel("tls", "admin", "request1")["state"], "forbidden")
+        self.assertEqual(auth.status("dms", "other", "request1")["state"], "forbidden")
+        self.assertEqual(auth.start("tls", "admin", "other")["state"], "busy")
+        self.assertEqual(self.wait_state(auth, {"succeeded"}, provider="dms"),
+                         {"provider": "dms", "request_id": "request1", "state": "succeeded"})
+        verify.assert_called_once_with()
+        self.assertEqual(len(calls), 1)
+        argv, kwargs = calls[0]
+        self.assertEqual(argv, ["/opt/mock/aliyun", "configure", "--mode", "OAuth", "--oauth-site-type", "CN",
+                                "--profile", "company-cli-user"])
+        self.assertEqual(kwargs["env"]["PATH"], os.devnull)
+        self.assertNotIn("VE_CALLER_TYPE", kwargs["env"])
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
+        self.assertFalse(kwargs["shell"])
+
+    def test_dms_does_not_report_existing_credentials_or_skipped_verification_as_success(self):
+        auth, calls, _, _ = self.service("raise AssertionError('should not spawn')")
+        self.assertEqual(auth.start("dms", "admin", "request1")["state"], "unavailable")
+        self.assertEqual(calls, [])
+        for prompt, saved, code, allowed, should_verify in (
+                ("", DMS_SAVED, 0, True, False),
+                (DMS_PROMPT, "secret from CLI", 0, True, False),
+                (DMS_PROMPT, DMS_SAVED, 1, True, False),
+                (DMS_PROMPT, DMS_SAVED, 0, False, True),
+                (DMS_PROMPT.replace("signin.aliyun.com", "untrusted.example"), DMS_SAVED, 0, True, False)):
+            with self.subTest(prompt=bool(prompt), saved=saved == DMS_SAVED, code=code, allowed=allowed):
+                verifier = Mock(return_value=allowed)
+                script = f"print({prompt!r});print({saved!r});sys.exit({code})"
+                auth, _, _, _ = self.dms_service(script, verifier=verifier)
+                auth.start("dms", "admin", "request1")
+                result = self.wait_state(auth, {"failed"}, provider="dms")
+                self.assertNotIn("secret", str(result))
+                self.assertNotIn("verification_url", result)
+                self.assertEqual(verifier.call_count, int(should_verify))
+
+    def test_dms_cancel_and_expiry_stop_cli_and_discard_private_challenge(self):
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                now = [1.0]
+                verifier = Mock()
+                auth, _, children, _ = self.dms_service(f"print({DMS_PROMPT!r});time.sleep(50)",
+                                                       clock=lambda: now[0], verifier=verifier)
+                auth.start("dms", "admin", "request1")
+                self.wait_state(auth, {"pending"}, provider="dms")
+                if cancel:
+                    auth.cancel("dms", "admin", "request1")
+                else:
+                    now[0] += 301
+                terminal = self.wait_state(auth, {"cancelled" if cancel else "expired"}, provider="dms")
+                self.assertNotIn("verification_url", terminal)
+                children[0].wait(timeout=2)
+                verifier.assert_not_called()
+
+    def test_dms_verifier_exception_and_failed_cli_still_restore_default(self):
+        for verifier, exit_code in ((Mock(side_effect=ValueError("private")), 0), (Mock(), 1)):
+            with self.subTest(exit_code=exit_code), patch("octopus.provider_auth._restore_aliyun_profile") as restore:
+                script = f"print({DMS_PROMPT!r});print({DMS_SAVED!r});sys.exit({exit_code})"
+                auth, _, _, _ = self.dms_service(script, verifier=verifier, original="original")
+                auth.start("dms", "admin", "request1")
+                result = self.wait_state(auth, {"failed"}, provider="dms")
+                self.assertNotIn("private", str(result))
+                restore.assert_called_once()
+                self.assertEqual(restore.call_args.args[2], "original")
+
+    def test_aliyun_default_profile_uses_only_name_and_preserves_concurrent_selection(self):
+        with patch("octopus.provider_auth.subprocess.run") as run:
+            run.return_value.stdout = b"Profile | Credential | Valid\nother * | sensitive | Valid\n"
+            self.assertEqual(_default_aliyun_profile("/cli", {}), "other")
+            _restore_aliyun_profile("/cli", {}, "original")
+            self.assertTrue(all(call.args[0] == ["/cli", "configure", "list"] for call in run.call_args_list))
+            run.return_value.stdout = b"company-cli-user * | ignored | Valid\n"
+            _restore_aliyun_profile("/cli", {}, "original")
+            self.assertEqual(run.call_args.args[0], ["/cli", "configure", "switch", "--profile", "original"])
+            run.return_value.stdout += b"another * | ignored | Valid\n"
+            with self.assertRaises(ValueError):
+                _default_aliyun_profile("/cli", {})
+
+    def test_dms_challenge_accepts_only_native_cn_pkce_origin_and_fields(self):
+        self.assertEqual(dms_verification_url(DMS_URL), DMS_URL)
+        for url in (DMS_URL.replace("signin.aliyun.com", "evil.com"), DMS_URL.replace("https:", "http:", 1),
+                    DMS_URL + "&code=secret", DMS_URL + "#fragment", DMS_URL.replace("127.0.0.1", "evil.com"),
+                    DMS_URL.replace("12345", "12445"), DMS_URL.replace("S256", "plain"),
+                    DMS_URL.replace("4038181954557748008", "other-client"), DMS_URL.replace("state=", "state=x&state="),
+                    DMS_URL.replace("azAZ", "%0Aaz"), DMS_URL.replace("/auth?", "/auth)foo?")):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                dms_verification_url(url)

@@ -166,7 +166,7 @@ TLS 查询返回固定错误码 `tls_auth_required` 时，桥接暂停该次查�
 取消、成员撤权、任务停止或服务重启后不会自动重试旧任务。并发已有授权时提示等待后重新查询。
 授权入口属于独立的认证控制接口，不向模型注册工具；链接和一次性授权码只在选定管理员的私聊卡片短暂展示，
 结束时清除，原始 CLI 错误和凭证不进入模型、群聊或审计。管理员重新登录更新的是本机共享身份，不修改云端 IAM。
-当前自动续授覆盖受控 TLS 查询；普通 HTTP 502、桥接自身的401/403及原生 MCP 错误不会被误当作 TLS 登录失效。
+受控 TLS 查询以 `tls_auth_required` 识别登录失效。普通 HTTP 502、桥接自身的 401/403 及原生 MCP 错误按原错误处理流程返回。受控 DMS 查询的续授流程见下节。
 需要手动维护时，仍可在宿主机运行 `ve volclog login --no-browser`。
 `tls_topics.query` 搜索项目/主题目录，不搜索日志内容；服务名无匹配时应先查目录，
 选择实际项目中的 `error`、`warn`、`info` 等主题，再通过 `tls_search` 检索服务或错误内容。
@@ -174,6 +174,10 @@ TLS 查询返回固定错误码 `tls_auth_required` 时，桥接暂停该次查�
 参考：[Codex MCP 工具白名单和逐工具授权](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)。
 
 ### DMS 业务数据补证
+
+**更新 DMS 查询登录。** 启用的管理员可私聊机器人发送 `/dms_auth`、`/dms-auth` 或“重新发起 DMS 授权”。点击私聊卡片的“开始授权”，在**运行查询服务的同一台 Mac** 上打开卡片中的阿里云官方登录链接。登录页面会回到该 Mac 上阿里云 CLI 的本地回调地址；在手机或其他电脑上打开时，回调会指向那台设备。请在宿主 Mac 的浏览器里完成登录，切勿将回调地址、授权码或凭据粘贴到飞书。
+
+受控 DMS 查询发现共享登录已过期（`dms_auth_required`）时，也会请管理员在私聊中确认续授。登录完成后，宿主用原 `company-cli-user` 身份发起一次轻量的 DMS 目录查询，验证成功才更新卡片。若由业务查询触发且原任务仍有效，桥接按原参数重试该次只读查询一次。重新登录仅恢复原身份；库、表和字段的访问范围仍由 DMS 授权决定。表权限不足时，请按该表自身的权限流程处理。
 
 应用首先回答业务行为和代码逻辑，日志、指标、文档及数据库作为证据来源。只有问题需要核验生产数据时，才调用 `business_data_checks` / `business_data_check`。用户指定 DMS、粘贴 SQL、要求跳过代码不能获得数据库执行权限；索取姓名、联系方式、证件、地址、个人或设备标识等信息的请求会被拒绝，也不能改用日志或文档获取。
 
@@ -264,6 +268,7 @@ docker compose up -d --force-recreate bridge
 | `/resume` | 检查中断任务后，解除会话暂停 |
 | `/last` | 重新发送最近一次执行结果 |
 | `/tls_auth`、`/tls-auth` 或“重新发起TLS授权” | 管理员在私聊中主动更新共享 TLS 查询身份 |
+| `/dms_auth`、`/dms-auth` 或“重新发起 DMS 授权” | 管理员在私聊中主动更新共享 DMS 查询身份，须在查询宿主 Mac 上完成登录 |
 | `/members` | 管理员私聊列出成员 |
 | `/member-add ou_…` | 管理员添加普通成员；不会自动恢复已停用成员 |
 | `/member-disable ou_…` | 管理员停用成员，取消其排队并停止运行任务 |
@@ -275,13 +280,14 @@ docker compose up -d --force-recreate bridge
 | `/access-test` | 管理员给自己发送测试申请卡片，验证通知和按钮；不改变成员权限 |
 | `/answer 编号 答案` | 回答单个问题 |
 
-要让 `/tls_auth` 出现在飞书私聊输入框的 `/` 指令面板，先为该机器人开通应用身份权限 `application:app_slash_command:write` 并发布版本。使用绑定到该应用的 CLI 身份运行一次：
+要让 `/tls_auth`、`/dms_auth` 出现在飞书输入框的 `/` 指令面板，先为该机器人开通应用身份权限 `application:app_slash_command:write` 并发布版本。运行 `lark-cli whoami --as bot`，确认返回的 `appId` 与部署使用的 `FEISHU_APP_ID` 一致。在绑定到该机器人的 CLI 环境中，按需注册尚未添加的指令。
 
 ```sh
 lark-cli application +slash-command-create --as bot --command tls_auth --description '发起 TLS 查询授权（仅限管理员私聊）'
+lark-cli application +slash-command-create --as bot --command dms_auth --description '发起 DMS 查询授权（仅限管理员私聊）'
 ```
 
-注册成功后，客户端通常需要约 5 分钟刷新提示。[飞书斜杠指令说明](https://open.feishu.cn/document/mcp_open_tools/agent-best-practices/agent-supports-slash-commands)
+已开通 `application:app_slash_command:read` 的应用可运行 `lark-cli application +slash-command-list --as bot` 核对已注册指令。注册成功后，客户端通常需要约 5 分钟刷新提示；管理员也可以直接在私聊中输入完整命令。[飞书斜杠指令说明](https://open.feishu.cn/document/mcp_open_tools/agent-best-practices/agent-supports-slash-commands)
 
 多个问题请按照卡片提示，用 JSON 回答每个问题 ID。问题默认十五分钟过期，超时停止任务。只读模式一律拒绝命令/文件/扩展权限请求。
 配对用户只能操作自己的会话和审批卡，旧编号不能重用。

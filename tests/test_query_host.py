@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 
+from octopus.dms import DmsAuthRequired
 from octopus.query_host import (
     MAX_RESPONSE_BYTES, QueryError, QueryHost, QueryHTTPServer,
     _json, _NoRedirect, bounded_result, read_token, run_cli,
@@ -332,6 +333,25 @@ class QueryHostTests(unittest.TestCase):
             self.assertIsNone(caught.exception.code)
             self.assertNotIn("private", str(caught.exception))
 
+    def test_dms_refresh_rejection_only_classifies_cli_stderr(self):
+        argv = ["aliyun", "--profile", "company-cli-user", "--region", "cn-hangzhou", "dms-enterprise",
+                "search-table"]
+        executable = self.directory / "aliyun"
+        oauth_error = "ERROR: failed to refresh token, status code: 400, error: invalid_grant, description: private"
+        for stream, message, expected in (
+            (2, oauth_error, DmsAuthRequired),
+            (1, oauth_error, QueryError),
+            (2, "Forbidden.RAM: private", QueryError),
+            (2, "could not connect: private", QueryError),
+        ):
+            with self.subTest(stream=stream, message=message):
+                executable.write_text(f"#!/bin/sh\necho '{message}' >&{stream}\nexit 3\n")
+                executable.chmod(0o700)
+                with patch("octopus.query_host.shutil.which", return_value=str(executable)):
+                    with self.assertRaises(expected) as error:
+                        run_cli(argv)
+                self.assertNotIn("private", str(error.exception))
+
     def test_tls_subprocess_metadata_and_no_token_inherited(self):
         program = "import json,os;print(json.dumps({k:os.environ.get(k) for k in ['VE_CALLER_TYPE','VE_CALLER_NAME','VE_SKILL_NAME','QUERY_SECRET']}))"
         with patch.dict(os.environ, {"QUERY_SECRET": "must-not-be-inherited"}):
@@ -433,17 +453,27 @@ class QueryHTTPTests(unittest.TestCase):
         self.assertEqual(data, {"ok": False, "error": "TLS authentication failed",
                                 "error_code": "tls_auth_required"})
 
+    def test_dms_refresh_failure_crosses_http_boundary_with_no_provider_details(self):
+        self.host.execute.side_effect = DmsAuthRequired("private token diagnostic")
+        status, data = self.authorized(body=json.dumps({"tool": "business_data_checks", "arguments": {}}))
+        self.assertEqual(status, 502)
+        self.assertEqual(data["error_code"], "dms_auth_required")
+        self.assertNotIn("private", str(data))
+
     def test_authorization_requires_private_auth_and_fixed_control_envelope(self):
         body = json.dumps({"provider": "tls", "actor": "admin", "request_id": "request1"})
         self.assertEqual(self.request(path="/v1/auth/start", body=body)[0], 401)
         self.assertEqual(self.authorized(path="/v1/auth/start", body=body,
                                         headers={"Origin": "https://evil.test"})[0], 403)
         self.host.authorization.start.assert_not_called()
-        for name in ("start", "status", "cancel"):
-            handler = getattr(self.host.authorization, name)
-            handler.return_value = {"provider": "tls", "request_id": "request1", "state": "starting"}
-            self.assertEqual(self.authorized(path="/v1/auth/" + name, body=body)[0], 200)
-            handler.assert_called_once_with("tls", "admin", "request1")
+        for provider in ("tls", "dms"):
+            body = json.dumps({"provider": provider, "actor": "admin", "request_id": "request1"})
+            for name in ("start", "status", "cancel"):
+                handler = getattr(self.host.authorization, name)
+                handler.reset_mock()
+                handler.return_value = {"provider": provider, "request_id": "request1", "state": "starting"}
+                self.assertEqual(self.authorized(path="/v1/auth/" + name, body=body)[0], 200)
+                handler.assert_called_once_with(provider, "admin", "request1")
         self.host.execute.assert_not_called()
 
     def test_authorization_rejects_model_arguments_and_arbitrary_commands(self):

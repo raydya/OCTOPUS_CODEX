@@ -47,6 +47,10 @@ class DmsDenied(ValueError):
     """Only fixed, non-sensitive diagnostics leave this module."""
 
 
+class DmsAuthRequired(Exception):
+    """The CLI could not refresh its OAuth grant before sending the DMS request."""
+
+
 def _deny(message="DMS business check is not authorized"):
     raise DmsDenied(message)
 
@@ -484,11 +488,23 @@ class DmsBroker:
         budget["remaining"] -= 1
         try:
             result = self.runner(argv, timeout=min(remaining, 45 if action == "ExecuteScript" else 15))
+        except DmsAuthRequired:
+            raise
         except Exception:
             _deny("DMS provider is unavailable or unauthorized")
         if type(result) is not dict or result.get("Success") is not True:
             _deny("DMS provider is unavailable or unauthorized")
         return result
+
+    @_bounded_operation
+    def verify_authorization(self):
+        policy, _ = self._policy()
+        response = self._api(policy, "SearchTable", **{
+            "env-type": "product", "search-range": "HAS_PERMSSION", "search-target": "SINGLE_TABLE",
+            "search-key": "octopus_auth_probe", "page-number": 1, "page-size": 1,
+        })
+        # A successful empty catalog also establishes that DMS accepted this login.
+        return type(response.get("TotalCount")) is int and response["TotalCount"] >= 0
 
     def _pages(self, policy, action, outer, item, maximum=10, **params):
         rows = []
@@ -836,13 +852,21 @@ class DmsBroker:
             if count >= MAX_CHECKS_PER_TASK or task not in self._task_counts and len(self._task_counts) >= MAX_TASKS:
                 _deny("this task's database query budget is exhausted")
             self._task_counts[task] = count + 1
-        metadata = self._metadata(policy, selected["target"])
-        if metadata != selected["columns"]:
-            _deny("database column policy changed; rediscover the catalog")
-        self._query(columns, time_column, mode, query["filters"], metadata)
-        self._eligible(context, evidence_id)
-        response = self._api(policy, "ExecuteScript", **{"db-id": selected["target"]["database_id"], "logic": "false",
-                             "script": self._sql(selected["target"]["table"], query, start, end, _dialect(selected["target"]["db_type"]), selected["target"]["table_schema"])})
+        try:
+            metadata = self._metadata(policy, selected["target"])
+            if metadata != selected["columns"]:
+                _deny("database column policy changed; rediscover the catalog")
+            self._query(columns, time_column, mode, query["filters"], metadata)
+            self._eligible(context, evidence_id)
+            response = self._api(policy, "ExecuteScript", **{"db-id": selected["target"]["database_id"], "logic": "false",
+                                 "script": self._sql(selected["target"]["table"], query, start, end, _dialect(selected["target"]["db_type"]), selected["target"]["table_schema"])})
+        except DmsAuthRequired:
+            # Credential resolution failed before SQL submission. Keep the slot for the authorized retry.
+            with self._lock:
+                self._task_counts[task] -= 1
+                if self._task_counts[task] == 0:
+                    del self._task_counts[task]
+            raise
         self._eligible(context, evidence_id)
         rows, suppressed = self._rows(response, query, metadata)
         return {"check_id": check_id, "db_name": selected["target"]["db_name"], "table": selected["target"]["table"],

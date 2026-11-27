@@ -14,6 +14,11 @@ from octopus.provider_authorization import ProviderAuthorization
 from octopus.queries import QueryClient
 
 
+DMS_URL = ("https://signin.aliyun.com/oauth2/v1/auth?response_type=code"
+           "&client_id=4038181954557748008&redirect_uri=http%3A%2F%2F127.0.0.1%3A12345%2Fcli%2Fcallback"
+           "&state=azAZ0123456789XY&code_challenge=" + "A" * 43 + "&code_challenge_method=S256")
+
+
 class Store:
     def __init__(self):
         self.people = {
@@ -128,6 +133,23 @@ class ProviderAuthorizationTests(unittest.IsolatedAsyncioTestCase):
     def count(self, operation):
         return sum(call[0] == operation for call in self.queries.calls)
 
+    async def test_dms_group_recovery_confines_login_and_rejects_a_tls_link(self):
+        request = IncomingMessage("om_db", "oc_group", "ou_member", "核对订单状态", "group", 1)
+        task = asyncio.create_task(self.auth.recover(request, provider="dms", still_allowed=self.permitted))
+        self.tasks.append(task)
+        action = await self.action()
+        await self.until(lambda: len(self.messenger.private) == 2)
+        self.assertIn("DMS", self.messenger.notices[0][1].text)
+        self.assertFalse(self.messenger.notices[0][1].actions)
+        await self.auth.receive_action(action)
+        self.assertFalse(await task)
+        self.assertEqual([c[:2] for c in self.queries.calls], [("start", "dms"), ("cancel", "dms")])
+        for _, card in self.messenger.updates:
+            self.assertIn("DMS 授权未完成", card.text)
+            self.assertFalse(card.actions)
+        self.assertNotIn(self.queries.url, str(self.messenger.private + self.messenger.notices + self.messenger.updates))
+        self.assertEqual(self.store.audits[-1][1:4], ("provider.auth", "dms", "failed"))
+
     async def test_success_sends_link_only_to_selected_admin_and_clears_it(self):
         task = self.begin("ou_member", "group")
         action = await self.action()
@@ -172,7 +194,7 @@ class ProviderAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.queries.calls)
         await self.auth.receive_action(replace(action, sender_id="ou_bob"))
         await self.auth.receive_action(replace(action, chat_id="oc_other"))
-        self.assertFalse(self.auth._flow.decision)
+        self.assertFalse(self.auth._flows["tls"].decision)
         self.assertFalse(self.queries.calls)
         await self.auth.receive_action(action)
         await self.until(lambda: bool(self.messenger.updates))
@@ -385,7 +407,7 @@ class ProviderAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.store.member = pending_member
         self.queries.start_gate.set()
         await entered.wait()
-        flow = self.auth._flow
+        flow = self.auth._flows["tls"]
         flow.cancelled = True
         flow.wakeup.set()
         release.set()
@@ -397,8 +419,8 @@ class ProviderAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         task, action = await self.pending()
         restarted = ProviderAuthorization(self.store, self.messenger, self.queries)
         await restarted.receive_action(action)
-        self.auth._flow.deadline = monotonic() - 1
-        self.auth._flow.wakeup.set()
+        self.auth._flows["tls"].deadline = monotonic() - 1
+        self.auth._flows["tls"].wakeup.set()
         self.assertFalse(await task)
         self.assertIn("到期", self.messenger.updates[-1][1].text)
         await self.auth.receive_action(action)
@@ -438,7 +460,7 @@ class ProviderAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_external_task_cancellation_cleans_up_session_and_card(self):
         task, _ = await self.pending()
-        runner = self.auth._flow.task
+        runner = self.auth._flows["tls"].task
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
@@ -451,7 +473,7 @@ class ProviderAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         await self.auth.close()
         self.assertFalse(await task)
         self.assertEqual(self.count("cancel"), 1)
-        self.assertIsNone(self.auth._flow)
+        self.assertNotIn("tls", self.auth._flows)
 
     async def test_close_after_task_cancellation_does_not_interrupt_link_cleanup(self):
         task, _ = await self.pending()

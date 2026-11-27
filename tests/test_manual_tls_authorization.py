@@ -9,7 +9,7 @@ from octopus.config import Config
 from octopus.contracts import CardAction
 from test_bridge import FakeCodex, FakeMessenger, message
 from test_group_bridge import group
-from test_provider_authorization import Queries
+from test_provider_authorization import DMS_URL, Queries
 from test_topic_routing import classification
 from topic_memory import TopicMemoryStore
 
@@ -66,12 +66,45 @@ class ManualTLSAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.codex.turns, [])
         self.assertEqual(self.store.jobs, {})
 
+    async def test_dms_command_can_finish_while_tls_is_waiting_for_approval(self):
+        self.queries.url = DMS_URL
+        tls = message("pending-tls", "/tls_auth")
+        await self.messenger.on_message(tls)
+        tls_card = await self.messenger.wait_record(lambda sent: "TLS" in sent.view.title and sent.view.actions)
+        self.bridge._control_times.clear()
+        dms = message("manual-dms", "/dms_auth")
+        await self.messenger.on_message(dms)
+        dms_card = await self.messenger.wait_record(lambda sent: "DMS" in sent.view.title and sent.view.actions)
+        self.assertEqual(self.queries.calls, [])
+        action = CardAction(dms_card.view.actions[0].ticket_id, "accept", dms.sender_id, dms.chat_id, dms_card.id)
+        await self.messenger.on_action(replace(action, message_id=tls_card.id))
+        self.assertEqual(self.queries.calls, [])
+        await self.messenger.on_action(action)
+        pending = await self.messenger.wait_record(lambda sent: self.queries.url in sent.view.text)
+        self.assertEqual(pending.id, dms_card.id)
+        self.assertIn("Mac", pending.view.text)
+        self.assertNotIn("PRIVATE-CODE", pending.view.text)
+        self.queries.state = "succeeded"
+        terminal = await self.messenger.wait_record(lambda sent: sent.id == dms_card.id and not sent.view.actions)
+        self.assertIn("DMS 授权已完成", terminal.view.text)
+        self.assertNotIn(self.queries.url, terminal.view.text)
+        self.assertTrue(all(call[1] == "dms" for call in self.queries.calls))
+        self.assertEqual(self.store.control_states[tls.id], "running")
+        await self.store.wait_control(dms.id, "done")
+        self.bridge._control_times.clear()
+        await self.messenger.on_message(dms)
+        self.assertEqual(self.messenger.send_user.await_count, 2)
+        self.assertEqual(self.store.jobs, {})
+
     async def test_slash_command_requires_private_admin_and_stays_out_of_business_queue(self):
         for item, expected in (
             (message("member", "/tls-auth", sender="ou_member"), "管理员"),
             (group("group-admin", "/tls-auth", sender="ou_alice"), "私聊"),
+            (message("dms-member", "/dms_auth", sender="ou_member"), "管理员"),
+            (group("dms-group", "/dms_auth", sender="ou_alice"), "私聊"),
         ):
             with self.subTest(item=item.id):
+                self.bridge._control_times.clear()
                 await self.messenger.on_message(item)
                 notice = await self.messenger.wait_record(lambda sent: sent.reply_to == item.id)
                 self.assertIn(expected, notice.view.text)
@@ -118,6 +151,7 @@ class ManualTLSAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/tls_auth", notice.view.text)
         self.assertIn("/tls-auth", notice.view.text)
         self.assertIn("重新发起 TLS 授权", notice.view.text)
+        self.assertIn("/dms_auth", notice.view.text)
 
     async def test_question_mentioning_reauthorization_does_not_initiate_login(self):
         self.codex.classify_topic.return_value = classification()

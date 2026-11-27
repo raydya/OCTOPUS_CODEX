@@ -42,6 +42,11 @@ class QueryClientTests(unittest.IsolatedAsyncioTestCase):
         with patch("octopus.queries.build_opener", return_value=opener):
             self.assertEqual(self.client._request("tls_topics", {}), expected)
 
+    def test_dms_oauth_grant_error_is_distinct_from_bridge_auth(self):
+        error = b'{"ok":false,"error_code":"dms_auth_required","error":"private details"}'
+        self.assertEqual(self.http_failure(502, error)["error_code"], "dms_auth_required")
+        self.assertNotIn("error_code", self.http_failure(401, error))
+
     def test_http_statuses_have_safe_distinct_failures(self):
         cases = {
             400: "查询参数无效或不在允许范围内；本次未执行查询。",
@@ -179,6 +184,25 @@ class QueryClientTests(unittest.IsolatedAsyncioTestCase):
             result = await self.client.auth_cancel("tls", "admin", "request1")
             self.assertEqual(result["state"], "failed")
             self.assertNotIn("private", json.dumps(result))
+
+    async def test_dms_pending_card_accepts_only_the_official_authorization_url(self):
+        url = ("https://signin.aliyun.com/oauth2/v1/auth?response_type=code&client_id=4038181954557748008"
+               "&redirect_uri=http%3A%2F%2F127.0.0.1%3A12345%2Fcli%2Fcallback&state=abcdefghijklmnop"
+               "&code_challenge=" + "a" * 43 + "&code_challenge_method=S256")
+        base = {"provider": "dms", "request_id": "test", "state": "pending", "verification_url": url}
+        for payload, expected in (
+            (base, "pending"),
+            ({**base, "verification_url": url + "&code=private"}, "failed"),
+            ({**base, "provider": "tls"}, "failed"),
+            ({**base, "user_code": "private"}, "failed"),
+        ):
+            opener = Mock()
+            opener.open.return_value = io.BytesIO(json.dumps(payload).encode())
+            with patch("octopus.queries.build_opener", return_value=opener):
+                result = await self.client.auth_status("dms", "admin", "test")
+            self.assertEqual(result["provider"], "dms")
+            self.assertEqual(result["state"], expected)
+            self.assertEqual(result.get("verification_url"), url if expected == "pending" else None)
 
 
 if __name__ == "__main__":
